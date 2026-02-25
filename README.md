@@ -52,24 +52,31 @@ Nova includes a built-in enrollment UI to calibrate the wake-word engine to your
    cd nova_ai
    ```
 
-2. **Install Dependencies**:
+2. **Patch pocket-tts submodule**:
+   The `pocket-tts` submodule defaults to install CPU versions of PyTorch. Run this patch script to force CUDA compatibility before installing dependencies:
+
+   ```bash
+   ./patch_pocket-tts_submodule.sh
+   ```
+
+3. **Install Dependencies**:
 
    ```bash
    uv sync --prerelease=allow
    ```
 
-3. **Start Nova**:
+4. **Start Nova**:
 
    ```bash
    uv run nova/backend/main.py
    ```
 
-4. **Access Dashboard**:
+5. **Access Dashboard**:
    Navigate to `http://localhost:8000` and enable **"ALWAYS LISTENING"**.
 
 ## 🏗 Directory Structure
 
 - `nova/backend/`: FastAPI server, session management, and model loading.
-- `nova/backend/kws/`: Wake-word engine, MLP classifier, and reference samples.
+- `nova/backend/kws/`: Wake-word engine with MLP classifier and speech embedding model.
 - `nova/frontend/`: WebSocket-based dashboard and sequential audio playback logic.
 - `pocket-tts/`: (Submodule) High-performance TTS synthesis.
