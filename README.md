@@ -39,7 +39,7 @@ Nova includes a built-in enrollment UI to calibrate the wake-word engine to your
 ## 📋 Prerequisites
 
 - **OS**: Linux (Ubuntu recommended)
-- **Hardware**: NVIDIA GPU with >= 4GB VRAM (e.g., RTX 3050)
+- **Hardware**: NVIDIA GPU with >= 4GB VRAM
 - **Python**: 3.12+
 - **Tools**: [uv](https://docs.astral.sh/uv/)
 
