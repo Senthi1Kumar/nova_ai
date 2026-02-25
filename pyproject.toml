@@ -30,9 +30,6 @@ dependencies = [
     "nvidia-ml-py",
 ]
 
-[tool.uv.workspace]
-members = ["pocket-tts"]
-
 [tool.uv]
 override-dependencies = [
     "onnxruntime==1.25.0.dev20260224001",
@@ -49,7 +46,7 @@ url = "https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/ORT-Night
 explicit = true
 
 [tool.uv.sources]
-pocket-tts = { workspace = true }
+pocket-tts = { path = "pocket-tts" }
 onnxruntime = { index = "ort-nightly" }
 onnxruntime-gpu = { index = "ort-nightly" }
 torch = { index = "pytorch-cu124" }
