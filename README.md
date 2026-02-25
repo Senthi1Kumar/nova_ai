@@ -45,15 +45,21 @@ Nova includes a built-in enrollment UI to calibrate the wake-word engine to your
 
 ## 🏃 Quick Start
 
-1. **Install Dependencies**:
+1. **Clone the repository**:
+   ```bash
+   git clone --recurse-submodules https://github.com/Senthi1Kumar/nova_ai.git
+   cd nova_ai
+   ```
+
+2. **Install Dependencies**:
    ```bash
    uv sync --prerelease=allow
    ```
-2. **Start Nova**:
+3. **Start Nova**:
    ```bash
-   uv run python nova/backend/main.py
+   python nova/backend/main.py
    ```
-3. **Access Dashboard**:
+4. **Access Dashboard**:
    Navigate to `http://localhost:8000` and enable **"ALWAYS LISTENING"**.
 
 ## 🏗 Directory Structure
