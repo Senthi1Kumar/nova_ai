@@ -1,0 +1,430 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Nova AI - WebSocket Dashboard</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap');
+        body {
+            background-color: #050505;
+            color: #00ffcc;
+            font-family: 'JetBrains Mono', monospace;
+        }
+        .glow { text-shadow: 0 0 10px #00ffcc, 0 0 20px #00ffcc; }
+        .card { background: rgba(20, 20, 20, 0.8); border: 1px solid #00ffcc; box-shadow: 0 0 15px rgba(0, 255, 204, 0.2); }
+        .progress-bar { height: 4px; background: #1a1a1a; position: relative; overflow: hidden; }
+        .progress-fill { height: 100%; background: #00ffcc; transition: width 0.3s ease; }
+        #chat-history { scrollbar-width: thin; scrollbar-color: #00ffcc #050505; display: flex; flex-direction: column; gap: 1rem; }
+        .user-msg { align-self: flex-end; max-width: 80%; text-align: right; }
+        .assistant-msg { align-self: flex-start; max-width: 80%; text-align: left; }
+        .bubble { padding: 0.75rem 1rem; border-radius: 1rem; font-size: 0.9rem; line-height: 1.4; }
+        .user-bubble { background: #00ffcc; color: black; border-bottom-right-radius: 0; }
+        .assistant-bubble { border: 1px solid #00ffcc; border-bottom-left-radius: 0; }
+        .partial { opacity: 0.7; font-style: italic; }
+        .think { opacity: 0.5; font-style: italic; font-size: 0.8rem; display: block; margin-bottom: 0.5rem; }
+    </style>
+</head>
+<body class="p-6 h-screen flex flex-col">
+    <header class="flex justify-between items-center mb-8">
+        <div>
+            <h1 class="text-4xl font-bold glow italic">NOVA AI</h1>
+            <p class="text-sm opacity-70">v1.0</p>
+        </div>
+        <div class="flex gap-6">
+            <div class="text-right">
+                <p class="text-xs opacity-50">STATUS</p>
+                <p id="connection-status" class="text-red-500">OFFLINE</p>
+            </div>
+            <div class="text-right">
+                <p class="text-xs opacity-50">LOCATION</p>
+                <p>Local Machine</p>
+            </div>
+        </div>
+    </header>
+
+    <main class="grid grid-cols-12 gap-6 flex-grow overflow-hidden">
+        <div class="col-span-8 flex flex-col gap-6 overflow-hidden">
+            <div class="card rounded-2xl p-6 flex-grow flex flex-col overflow-hidden">
+                <div id="chat-history" class="flex-grow overflow-y-auto pr-2">
+                    <div class="opacity-50 italic">System initialized. Enable "Always Listening" to start.</div>
+                </div>
+                <div class="h-24 flex items-center justify-center relative mt-4">
+                    <canvas id="visualizer" class="w-full h-full"></canvas>
+                    <div id="listening-indicator" class="hidden absolute flex items-center gap-2 text-[#00ffcc] font-bold">
+                        <span class="relative flex h-3 w-3"><span class="animate-ping absolute inline-flex h-full w-full rounded-full bg-[#00ffcc] opacity-75"></span><span class="relative inline-flex rounded-full h-3 w-3 bg-[#00ffcc]"></span></span>
+                        NOVA IS LISTENING
+                    </div>
+                </div>
+                <div class="flex justify-center mt-4">
+                    <button id="ptt-button" class="w-full py-4 border-2 border-[#00ffcc] rounded-xl font-bold hover:bg-[#00ffcc] hover:text-black transition-all active:scale-95">
+                        HOLD TO SPEAK
+                    </button>
+                </div>
+            </div>
+        </div>
+
+        <div class="col-span-4 flex flex-col gap-6">
+            <div class="card rounded-2xl p-6">
+                <div class="flex justify-between items-center mb-4 border-b border-[#00ffcc] pb-2">
+                    <h2 class="text-xl font-bold">SYSTEM METRICS</h2>
+                    <div class="flex items-center gap-2">
+                        <span class="text-[10px] opacity-50">ALWAYS LISTENING</span>
+                        <label class="relative inline-flex items-center cursor-pointer">
+                            <input type="checkbox" id="always-listening-toggle" class="sr-only peer">
+                            <div class="w-9 h-5 bg-gray-700 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full rtl:peer-checked:after:-translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:start-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-[#00ffcc]"></div>
+                        </label>
+                    </div>
+                </div>
+                <div class="space-y-6">
+                    <div>
+                        <div class="flex justify-between text-sm mb-1"><span>CPU UTILIZATION</span><span id="cpu-val">0%</span></div>
+                        <div class="progress-bar rounded-full"><div id="cpu-bar" class="progress-fill" style="width: 0%"></div></div>
+                    </div>
+                    <div>
+                        <div class="flex justify-between text-sm mb-1"><span>GPU VRAM (4GB)</span><span id="gpu-mem-val">0 MB</span></div>
+                        <div class="progress-bar rounded-full"><div id="gpu-mem-bar" class="progress-fill" style="width: 0%"></div></div>
+                    </div>
+                    <div>
+                        <div class="flex justify-between text-sm mb-1"><span>GPU CORE UTIL</span><span id="gpu-util-val">0%</span></div>
+                        <div class="progress-bar rounded-full"><div id="gpu-util-bar" class="progress-fill" style="width: 0%"></div></div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="card rounded-2xl p-6 flex-grow">
+                <h2 class="text-xl font-bold mb-4 border-b border-[#00ffcc] pb-2">EVALUATION</h2>
+                <div class="space-y-4 text-sm">
+                    <div class="flex justify-between"><span>KWS (LATENCY)</span><span id="kws-latency">-- ms</span></div>
+                    <div class="flex justify-between"><span>STT (Time to First Byte)</span><span id="stt-latency">-- ms</span></div>
+                    <div class="flex justify-between"><span>LLM (Time to First Token)</span><span id="llm-latency">-- ms</span></div>
+                    <div class="flex justify-between"><span>TTS (Time to First Audio)</span><span id="tts-latency">-- ms</span></div>
+                    <div class="flex justify-between text-[#00ffcc] font-bold"><span>END-TO-END</span><span id="e2e-latency">-- ms</span></div>
+                    <div class="pt-4 opacity-50 text-xs">TTS VOICE SELECTION</div>
+                    <select id="voice-select" class="w-full bg-black border border-[#00ffcc] text-[#00ffcc] text-xs p-2 rounded outline-none">
+                        <option value="alba" selected>Alba (Default)</option>
+                        <option value="marius">Marius</option>
+                        <option value="javert">Javert</option>
+                        <option value="jean">Jean</option>
+                        <option value="fantine">Fantine</option>
+                        <option value="cosette">Cosette</option>
+                        <option value="eponine">Eponine</option>
+                        <option value="azelma">Azelma</option>
+                    </select>
+                    <div class="pt-4 opacity-50 text-xs">Say "Nova" to wake up the assistant.</div>
+                </div>
+            </div>
+
+            <div class="card rounded-2xl p-6">
+                <h2 class="text-xl font-bold mb-4 border-b border-[#00ffcc] pb-2">KWS ENROLLMENT</h2>
+                <div class="space-y-3">
+                    <div class="flex flex-col gap-2">
+                        <button id="record-nova-btn" class="bg-transparent border border-[#00ffcc] text-[#00ffcc] py-2 rounded text-xs hover:bg-[#00ffcc] hover:text-black transition-all">RECORD "NOVA" (0/5)</button>
+                        <button id="record-noise-btn" class="bg-transparent border border-[#00ffcc] text-[#00ffcc] py-2 rounded text-xs hover:bg-[#00ffcc] hover:text-black transition-all">RECORD NOISE (0/2)</button>
+                    </div>
+                    <p id="enroll-status" class="text-[10px] opacity-50 italic">Record your own wake word samples for better accuracy.</p>
+                </div>
+            </div>
+        </div>
+    </main>
+
+    <script>
+        let ws;
+        let audioContext;
+        let processor;
+        let input;
+        let isRecordingUI = false;
+        let isThinkingUI = false;
+        let currentAssistantMsgDiv = null;
+        let currentUserMsgDiv = null;
+
+        // Enrollment State
+        let novaCount = 0;
+        let noiseCount = 0;
+        let enrollmentRecorder;
+        let enrollmentChunks = [];
+
+        const recordNovaBtn = document.getElementById('record-nova-btn');
+        const recordNoiseBtn = document.getElementById('record-noise-btn');
+        const enrollStatus = document.getElementById('enroll-status');
+
+        async function recordSample(type, limit, btn, counter) {
+            const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+            const recorder = new MediaRecorder(stream);
+            let chunks = [];
+            
+            btn.textContent = "RECORDING...";
+            btn.classList.add('bg-[#00ffcc]', 'text-black');
+            
+            recorder.ondataavailable = (e) => chunks.push(e.data);
+            recorder.onstop = async () => {
+                const blob = new Blob(chunks, { type: 'audio/wav' });
+                const formData = new FormData();
+                formData.append('file', blob);
+                formData.append('sample_type', type);
+                
+                let idx;
+                if (type === 'nova') { novaCount++; idx = novaCount; }
+                else { noiseCount++; idx = noiseCount; }
+                formData.append('index', idx);
+
+                enrollStatus.textContent = `Uploading ${type}_${idx}...`;
+                await fetch('/enroll/upload', { method: 'POST', body: formData });
+                
+                btn.textContent = `RECORD ${type.toUpperCase()} (${idx}/${limit})`;
+                btn.classList.remove('bg-[#00ffcc]', 'text-black');
+                
+                if (novaCount >= 5 && noiseCount >= 2) {
+                    enrollStatus.textContent = "All samples recorded. Restarting session to re-enroll...";
+                    await fetch('/enroll/re-enroll', { method: 'POST' });
+                }
+                stream.getTracks().forEach(t => t.stop());
+            };
+
+            recorder.start();
+            setTimeout(() => recorder.stop(), 2000); // 2s sample
+        }
+
+        recordNovaBtn.onclick = () => recordSample('nova', 5, recordNovaBtn);
+        recordNoiseBtn.onclick = () => recordSample('noise', 2, recordNoiseBtn);
+
+        const alwaysListeningToggle = document.getElementById('always-listening-toggle');
+        const statusText = document.getElementById('connection-status');
+        const chatHistory = document.getElementById('chat-history');
+        const listeningIndicator = document.getElementById('listening-indicator');
+        const pttButton = document.getElementById('ptt-button');
+        const canvas = document.getElementById('visualizer');
+        const ctx = canvas.getContext('2d');
+        let analyser;
+
+        function drawVisualizer() {
+            if (!analyser) return;
+            requestAnimationFrame(drawVisualizer);
+            const bufferLength = analyser.frequencyBinCount;
+            const dataArray = new Uint8Array(bufferLength);
+            analyser.getByteFrequencyData(dataArray);
+            ctx.fillStyle = '#050505';
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+            const barWidth = (canvas.width / bufferLength) * 2.5;
+            let x = 0;
+            for(let i = 0; i < bufferLength; i++) {
+                const barHeight = dataArray[i] / 2;
+                ctx.fillStyle = isRecordingUI ? '#ff4444' : '#00ffcc';
+                ctx.fillRect(x, canvas.height - barHeight, barWidth, barHeight);
+                x += barWidth + 1;
+            }
+        }
+
+        async function initAudio() {
+            audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
+            const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+            input = audioContext.createMediaStreamSource(stream);
+            analyser = audioContext.createAnalyser();
+            
+            // ScriptProcessor for raw PCM streaming
+            processor = audioContext.createScriptProcessor(4096, 1, 1);
+            
+            processor.onaudioprocess = (e) => {
+                if (ws && ws.readyState === WebSocket.OPEN) {
+                    const inputData = e.inputBuffer.getChannelData(0);
+                    // Convert float32 to int16
+                    const int16Data = new Int16Array(inputData.length);
+                    for (let i = 0; i < inputData.length; i++) {
+                        int16Data[i] = Math.max(-1, Math.min(1, inputData[i])) * 0x7FFF;
+                    }
+                    ws.send(int16Data.buffer);
+                }
+            };
+
+            input.connect(analyser);
+            input.connect(processor);
+            processor.connect(audioContext.destination);
+            drawVisualizer();
+        }
+
+        let audioQueue = [];
+        let isPlaying = false;
+
+        async function playNextInQueue() {
+            if (audioQueue.length === 0) {
+                isPlaying = false;
+                return;
+            }
+            isPlaying = true;
+            const audioData = audioQueue.shift();
+            try {
+                const audioBuffer = await audioContext.decodeAudioData(audioData);
+                const source = audioContext.createBufferSource();
+                source.buffer = audioBuffer;
+                source.connect(audioContext.destination);
+                source.onended = playNextInQueue;
+                source.start();
+            } catch (e) {
+                console.error("Audio decode error:", e);
+                playNextInQueue();
+            }
+        }
+
+        function startConnection() {
+            ws = new WebSocket(`ws://${window.location.host}/ws`);
+            ws.binaryType = 'arraybuffer';
+
+            ws.onopen = () => {
+                statusText.textContent = 'ONLINE';
+                statusText.className = 'text-green-500';
+                listeningIndicator.classList.remove('hidden');
+                initAudio();
+                const voice = document.getElementById('voice-select').value;
+                ws.send(JSON.stringify({ type: 'change_voice', data: voice }));
+            };
+
+            ws.onmessage = async (event) => {
+                if (typeof event.data === 'string') {
+                    const msg = JSON.parse(event.data);
+                    handleJsonMessage(msg);
+                } else {
+                    // Queue incoming TTS audio chunk
+                    audioQueue.push(event.data);
+                    if (!isPlaying) playNextInQueue();
+                }
+            };
+
+            ws.onclose = () => {
+                statusText.textContent = 'OFFLINE';
+                statusText.className = 'text-red-500';
+                listeningIndicator.classList.add('hidden');
+                if (processor) processor.disconnect();
+                if (input) input.disconnect();
+            };
+        }
+
+        function handleJsonMessage(msg) {
+            if (msg.type === 'kws_detected') {
+                document.getElementById('kws-latency').textContent = `${msg.data.latency.toFixed(0)} ms`;
+                startRecordingUI();
+            } else if (msg.type === 'transcript') {
+                finalizeUserTranscript(msg.data);
+                if (msg.latency?.stt_ttfb) document.getElementById('stt-latency').textContent = `${(msg.latency.stt_ttfb * 1000).toFixed(0)} ms`;
+            } else if (msg.type === 'assistant_start') {
+                addAssistantBubble();
+            } else if (msg.type === 'llm_token') {
+                updateAssistantMessage(msg.data);
+                if (msg.latency?.llm_ttft) document.getElementById('llm-latency').textContent = `${(msg.latency.llm_ttft * 1000).toFixed(0)} ms`;
+            } else if (msg.type === 'tts_metrics') {
+                if (msg.data?.ttfa) document.getElementById('tts-latency').textContent = `${(msg.data.ttfa * 1000).toFixed(0)} ms`;
+                if (msg.data?.e2e) document.getElementById('e2e-latency').textContent = `${(msg.data.e2e * 1000).toFixed(0)} ms`;
+            } else if (msg.type === 'recording_stopped') {
+                stopRecordingUI();
+            } else if (msg.type === 'ptt_started') {
+                startRecordingUI();
+            } else if (msg.type === 'interrupted') {
+                if (currentAssistantMsgDiv) currentAssistantMsgDiv.innerHTML += ' <span class="text-red-500">[Interrupted]</span>';
+                startRecordingUI();
+            }
+        }
+
+        function startRecordingUI() {
+            isRecordingUI = true;
+            addUserBubble("");
+        }
+
+        function stopRecordingUI() {
+            isRecordingUI = false;
+        }
+
+        function addUserBubble(text) {
+            const div = document.createElement('div');
+            div.className = 'user-msg';
+            div.innerHTML = `<p class="text-[10px] opacity-50 mb-1">USER</p><div class="bubble user-bubble partial">${text || '...'}</div>`;
+            chatHistory.appendChild(div);
+            currentUserMsgDiv = div.querySelector('.bubble');
+            chatHistory.scrollTop = chatHistory.scrollHeight;
+        }
+
+        function finalizeUserTranscript(text) {
+            if (!currentUserMsgDiv) addUserBubble(text);
+            currentUserMsgDiv.textContent = text || "[No speech detected]";
+            currentUserMsgDiv.classList.remove('partial');
+            chatHistory.scrollTop = chatHistory.scrollHeight;
+        }
+
+        function addAssistantBubble() {
+            const div = document.createElement('div');
+            div.className = 'assistant-msg';
+            div.innerHTML = `<p class="text-[10px] opacity-50 mb-1">ASSISTANT</p><div class="bubble assistant-bubble"></div>`;
+            chatHistory.appendChild(div);
+            currentAssistantMsgDiv = div.querySelector('.bubble');
+            isThinkingUI = false;
+            chatHistory.scrollTop = chatHistory.scrollHeight;
+        }
+
+        function updateAssistantMessage(token) {
+            if (!currentAssistantMsgDiv) return;
+            if (token.includes('<think>')) {
+                isThinkingUI = true;
+                const thinkSpan = document.createElement('span');
+                thinkSpan.className = 'think';
+                thinkSpan.textContent = 'Thinking... ';
+                currentAssistantMsgDiv.appendChild(thinkSpan);
+                return;
+            }
+            if (token.includes('</think>')) {
+                isThinkingUI = false;
+                currentAssistantMsgDiv.appendChild(document.createElement('br'));
+                return;
+            }
+            if (isThinkingUI) {
+                const thinkSpan = currentAssistantMsgDiv.querySelector('.think');
+                if (thinkSpan) thinkSpan.textContent += token;
+            } else {
+                currentAssistantMsgDiv.appendChild(document.createTextNode(token));
+            }
+            chatHistory.scrollTop = chatHistory.scrollHeight;
+        }
+
+        alwaysListeningToggle.onchange = () => {
+            if (alwaysListeningToggle.checked) startConnection();
+            else if (ws) ws.close();
+        };
+
+        function startPTT() {
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({ type: 'start_ptt' }));
+            }
+        }
+
+        function stopPTT() {
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({ type: 'stop_ptt' }));
+            }
+        }
+
+        pttButton.addEventListener('mousedown', startPTT);
+        pttButton.addEventListener('mouseup', stopPTT);
+        pttButton.addEventListener('mouseleave', stopPTT);
+        pttButton.addEventListener('touchstart', (e) => { e.preventDefault(); startPTT(); });
+        pttButton.addEventListener('touchend', (e) => { e.preventDefault(); stopPTT(); });
+
+        document.getElementById('voice-select').onchange = (e) => {
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({ type: 'change_voice', data: e.target.value }));
+            }
+        };
+
+        async function pollMetrics() {
+            try {
+                const res = await fetch('/metrics');
+                const data = await res.json();
+                document.getElementById('cpu-val').textContent = `${data.cpu.toFixed(0)}%`;
+                document.getElementById('cpu-bar').style.width = `${data.cpu}%`;
+                document.getElementById('gpu-mem-val').textContent = `${data.gpu_mem.toFixed(0)} MB`;
+                document.getElementById('gpu-mem-bar').style.width = `${(data.gpu_mem / 4096) * 100}%`;
+                document.getElementById('gpu-util-val').textContent = `${data.gpu_util.toFixed(0)}%`;
+                document.getElementById('gpu-util-bar').style.width = `${data.gpu_util}%`;
+            } catch {}
+        }
+        setInterval(pollMetrics, 2000);
+    </script>
+</body>
+</html>

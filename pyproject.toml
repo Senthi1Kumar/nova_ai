@@ -1,0 +1,57 @@
+[project]
+name = "nova-ai"
+version = "0.1.0"
+description = "Nova AI: Real-time conversational intelligence platform"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi",
+    "uvicorn",
+    "websockets",
+    "faster-whisper>=1.0.0",
+    "transformers",
+    "bitsandbytes",
+    "accelerate",
+    "pynvml",
+    "psutil",
+    "jiwer",
+    "soundfile",
+    "scipy",
+    "python-multipart",
+    "pocket-tts",
+    "pydub",
+    "onnxruntime-gpu",
+    "pyaudio",
+    "torch",
+    "torchaudio",
+    "coloredlogs",
+    "flatbuffers",
+    "protobuf",
+    "nvidia-ml-py",
+]
+
+[tool.uv.workspace]
+members = ["pocket-tts"]
+
+[tool.uv]
+override-dependencies = [
+    "onnxruntime==1.25.0.dev20260224001",
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu124"
+url = "https://download.pytorch.org/whl/cu124"
+explicit = true
+
+[[tool.uv.index]]
+name = "ort-nightly"
+url = "https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/ORT-Nightly/pypi/simple/"
+explicit = true
+
+[tool.uv.sources]
+pocket-tts = { workspace = true }
+onnxruntime = { index = "ort-nightly" }
+onnxruntime-gpu = { index = "ort-nightly" }
+torch = { index = "pytorch-cu124" }
+torchvision = { index = "pytorch-cu124" }
+torchaudio = { index = "pytorch-cu124" }
