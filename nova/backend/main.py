@@ -36,6 +36,7 @@ voice_catalog = {}
 current_voice_name = "alba"
 shared_vad_model = None
 shared_kws_model = None
+active_sessions = set()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -143,6 +144,16 @@ class NovaSession:
         self.e2e_start_time = None
         self.first_response_chunk = True
 
+    def enroll(self):
+        """Re-enroll KWS with current files in refs directory."""
+        refs_dir = os.path.join(os.path.dirname(__file__), "kws", "refs")
+        if os.path.exists(refs_dir):
+            ref_paths = sorted([str(p) for p in Path(refs_dir).glob("nova_*.wav")])
+            noise_paths = sorted([str(p) for p in Path(refs_dir).glob("noise_*.wav")])
+            if ref_paths:
+                self.kws_engine.enroll(ref_paths, noise_paths)
+                logger.info("KWS Re-enrolled for session.")
+
     async def send_json(self, data: dict):
         await self.websocket.send_text(json.dumps(data))
 
@@ -199,7 +210,7 @@ class NovaSession:
             audio_np = np.frombuffer(full_audio, dtype=np.int16).astype(np.float32) / 32768.0
             
             t0 = time.time()
-            segments, _ = stt_model.transcribe(audio_np, beam_size=5, vad_filter=True)
+            segments, _ = stt_model.transcribe(audio_np, beam_size=5, vad_filter=True, language="en")
             transcript = " ".join([s.text for s in segments]).strip()
             ttfb_stt = time.time() - t0
             
@@ -310,6 +321,7 @@ class NovaSession:
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     session = NovaSession(websocket)
+    active_sessions.add(session)
     try:
         while True:
             data = await websocket.receive()
@@ -331,6 +343,9 @@ async def websocket_endpoint(websocket: WebSocket):
                     await session.send_json({"type": "voice_changed", "data": current_voice_name})
     except (WebSocketDisconnect, RuntimeError) as e:
         logger.info(f"WebSocket closed: {e}")
+    finally:
+        if session in active_sessions:
+            active_sessions.remove(session)
 
 app.mount("/static", StaticFiles(directory="nova/frontend"), name="static")
 
@@ -370,10 +385,14 @@ async def trigger_re_enroll():
     global shared_kws_model, shared_vad_model
     refs_dir = Path(__file__).parent / "kws" / "refs"
     
-    # We need to trigger enrollment on the instances or re-create the baseline
-    # For now, let's just confirm the files exist. 
-    # The NovaSession objects will re-enroll on next session start.
-    return {"status": "enrolled", "path": str(refs_dir)}
+    # Trigger re-enrollment for all active sessions
+    for session in active_sessions:
+        try:
+            session.enroll()
+        except Exception as e:
+            logger.error(f"Failed to re-enroll session: {e}")
+            
+    return {"status": "enrolled", "active_sessions": len(active_sessions)}
 
 @app.get("/")
 async def get_index():
