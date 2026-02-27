@@ -24,17 +24,18 @@ Nova is a high-performance, low-latency voice AI assistant designed for EV dashb
 
 Nova tracks four critical latency stages to ensure a seamless "human-like" interaction:
 
-1.  **STT (TTFB - Time to First Byte)**: Time from voice stop to the first transcript appearing. Measures recognition speed.
-2.  **LLM (TTFT - Time to First Token)**: Time from transcript completion to the first generated word. Measures "thinking" delay.
-3.  **TTS (TTFA - Time to First Audio)**: Time from token generation to the first audible chunk being synthesized. Measures voice synthesis delay.
-4.  **END-TO-END (E2E)**: The total duration from the moment the user stops speaking to the moment Nova's voice is heard. **Target: < 1.5s.**
+1. **STT (TTFB - Time to First Byte)**: Time from voice stop to the first transcript appearing. Measures recognition speed.
+2. **LLM (TTFT - Time to First Token)**: Time from transcript completion to the first generated word. Measures "thinking" delay.
+3. **TTS (TTFA - Time to First Audio)**: Time from token generation to the first audible chunk being synthesized. Measures voice synthesis delay.
+4. **END-TO-END (E2E)**: The total duration from the moment the user stops speaking to the moment Nova's voice is heard. **Target: < 1.5s.**
 
 ## 🎙 KWS Enrollment
 
 Nova includes a built-in enrollment UI to calibrate the wake-word engine to your specific voice and environment:
-1.  **Wake Word**: Record 5 samples of you saying "Nova".
-2.  **Noise**: Record 2 samples of your environment (car engine, AC, road noise).
-3.  **Training**: The system automatically trains a PyTorch MLP classifier on top of the Google Speech Embeddings for high-precision rejection of non-wake-word speech.
+
+1. **Wake Word**: Record 5 samples of you saying "Nova".
+2. **Noise**: Record 2 samples of your environment (car engine, AC, road noise).
+3. **Training**: The system automatically trains a PyTorch MLP classifier on top of the Google Speech Embeddings for high-precision rejection of non-wake-word speech.
 
 ## 📋 Prerequisites
 
