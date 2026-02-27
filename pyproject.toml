@@ -52,3 +52,8 @@ onnxruntime-gpu = { index = "ort-nightly" }
 torch = { index = "pytorch-cu124" }
 torchvision = { index = "pytorch-cu124" }
 torchaudio = { index = "pytorch-cu124" }
+
+[dependency-groups]
+dev = [
+    "ruff>=0.15.4",
+]
