@@ -60,10 +60,12 @@ Nova includes a built-in enrollment UI to calibrate the wake-word engine to your
    ./patch_pocket-tts_submodule.sh
    ```
 
-3. **Install Dependencies**:
+3. **Install Dependencies and activate `.venv`**:
 
    ```bash
    uv sync --prerelease=allow
+   source .venv/bin/activate  # for linux
+   .venv\Scripts\activate  # for windows
    ```
 
 4. **Start Nova**:
