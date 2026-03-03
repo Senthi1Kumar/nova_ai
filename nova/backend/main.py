@@ -92,7 +92,8 @@ async def lifespan(app: FastAPI):
         )
 
     # 3. TTS: Pocket-TTS
-    tts_model = TTSModel.load_model()
+    tts_model = TTSModel.load_model().to("cuda" if torch.cuda.is_available() else "cpu")
+    logger.info(f"Pocket-TTS model loaded successfully: {tts_model.device}")
     catalog = [
         "alba",
         "marius",
