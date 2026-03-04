@@ -282,9 +282,9 @@ class EnrollmentManager:
             self.record_sample(path, prompt)
             ref_paths.append(str(path))
 
-        print("\n[CALIBRATION] Now recording 2 samples of ROOM NOISE (Stay silent).")
+        print("\n[CALIBRATION] Now recording 5 samples of ROOM NOISE (Stay silent).")
         noise_paths = []
-        for i in range(2):
+        for i in range(5):
             path = self.ref_dir / f"noise_{i + 1}.wav"
             self.record_sample(path, "Remain silent...", duration=2.0)
             noise_paths.append(str(path))

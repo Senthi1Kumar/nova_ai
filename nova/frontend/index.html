@@ -121,7 +121,7 @@
                 <div class="space-y-3">
                     <div class="flex flex-col gap-2">
                         <button id="record-nova-btn" class="bg-transparent border border-[#00ffcc] text-[#00ffcc] py-2 rounded text-xs hover:bg-[#00ffcc] hover:text-black transition-all">RECORD "NOVA" (0/5)</button>
-                        <button id="record-noise-btn" class="bg-transparent border border-[#00ffcc] text-[#00ffcc] py-2 rounded text-xs hover:bg-[#00ffcc] hover:text-black transition-all">RECORD NOISE (0/2)</button>
+                        <button id="record-noise-btn" class="bg-transparent border border-[#00ffcc] text-[#00ffcc] py-2 rounded text-xs hover:bg-[#00ffcc] hover:text-black transition-all">RECORD NOISE (0/5)</button>
                     </div>
                     <p id="enroll-status" class="text-[10px] opacity-50 italic">Record your own wake word samples for better accuracy.</p>
                 </div>
@@ -175,7 +175,7 @@
                 btn.textContent = `RECORD ${type.toUpperCase()} (${idx}/${limit})`;
                 btn.classList.remove('bg-[#00ffcc]', 'text-black');
                 
-                if (novaCount >= 5 && noiseCount >= 2) {
+                if (novaCount >= 5 && noiseCount >= 5) {
                     enrollStatus.textContent = "All samples recorded. Restarting session to re-enroll...";
                     await fetch('/enroll/re-enroll', { method: 'POST' });
                 }
@@ -187,7 +187,7 @@
         }
 
         recordNovaBtn.onclick = () => recordSample('nova', 5, recordNovaBtn);
-        recordNoiseBtn.onclick = () => recordSample('noise', 2, recordNoiseBtn);
+        recordNoiseBtn.onclick = () => recordSample('noise', 5, recordNoiseBtn);
 
         const alwaysListeningToggle = document.getElementById('always-listening-toggle');
         const statusText = document.getElementById('connection-status');
