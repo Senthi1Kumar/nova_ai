@@ -49,8 +49,11 @@ Nova includes a built-in enrollment UI to calibrate the wake-word engine to your
 1. **Clone the repository**:
 
    ```bash
-   git clone --recurse-submodules https://github.com/Senthi1Kumar/nova_ai.git
+   git clone --recursive https://github.com/Senthi1Kumar/nova_ai.git
    cd nova_ai
+
+   # If you already cloned the repository without --recursive, run this command:
+   git submodule update --init --recursive
    ```
 
 2. **Patch pocket-tts submodule**:
