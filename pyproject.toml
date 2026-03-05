@@ -9,6 +9,7 @@ dependencies = [
     "uvicorn",
     "websockets",
     "faster-whisper>=1.0.0",
+    "qwen-agent",
     "transformers<5.0.0",
     "bitsandbytes",
     "accelerate",
@@ -31,10 +32,10 @@ dependencies = [
     "nvidia-ml-py",
 ]
 
-[tool.uv]
-override-dependencies = [
-    "onnxruntime==1.25.0.dev20260224001",
-]
+# [tool.uv]
+# override-dependencies = [
+#     "onnxruntime==1.25.0.dev20260224001",
+# ]
 
 [[tool.uv.index]]
 name = "pytorch-cu124"
