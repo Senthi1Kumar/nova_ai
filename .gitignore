@@ -14,3 +14,9 @@ nova/backend/kws/refs/*.wav
 
 # Logs
 *.log
+
+# Notebooks
+*.ipynb
+
+# Misc
+*.html
