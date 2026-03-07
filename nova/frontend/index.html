@@ -3,428 +3,556 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Nova AI - WebSocket Dashboard</title>
+    <title>Nova AI — Dashboard</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <style>
         @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap');
+        * { box-sizing: border-box; }
         body {
             background-color: #050505;
             color: #00ffcc;
             font-family: 'JetBrains Mono', monospace;
         }
         .glow { text-shadow: 0 0 10px #00ffcc, 0 0 20px #00ffcc; }
-        .card { background: rgba(20, 20, 20, 0.8); border: 1px solid #00ffcc; box-shadow: 0 0 15px rgba(0, 255, 204, 0.2); }
-        .progress-bar { height: 4px; background: #1a1a1a; position: relative; overflow: hidden; }
-        .progress-fill { height: 100%; background: #00ffcc; transition: width 0.3s ease; }
-        #chat-history { scrollbar-width: thin; scrollbar-color: #00ffcc #050505; display: flex; flex-direction: column; gap: 1rem; }
-        .user-msg { align-self: flex-end; max-width: 80%; text-align: right; }
-        .assistant-msg { align-self: flex-start; max-width: 80%; text-align: left; }
-        .bubble { padding: 0.75rem 1rem; border-radius: 1rem; font-size: 0.9rem; line-height: 1.4; }
-        .user-bubble { background: #00ffcc; color: black; border-bottom-right-radius: 0; }
-        .assistant-bubble { border: 1px solid #00ffcc; border-bottom-left-radius: 0; }
-        .partial { opacity: 0.7; font-style: italic; }
-        .think { opacity: 0.5; font-style: italic; font-size: 0.8rem; display: block; margin-bottom: 0.5rem; }
+        .card {
+            background: rgba(20, 20, 20, 0.85);
+            border: 1px solid #00ffcc33;
+            box-shadow: 0 0 20px rgba(0, 255, 204, 0.08);
+        }
+        .progress-bar { height: 3px; background: #1a1a1a; overflow: hidden; }
+        .progress-fill { height: 100%; background: #00ffcc; transition: width 0.4s ease; }
+        select option { background: #050505; }
+        ::-webkit-scrollbar { width: 4px; }
+        ::-webkit-scrollbar-track { background: #050505; }
+        ::-webkit-scrollbar-thumb { background: #00ffcc44; border-radius: 2px; }
     </style>
 </head>
-<body class="p-6 h-screen flex flex-col">
-    <header class="flex justify-between items-center mb-8">
+<body class="p-5 h-screen flex flex-col gap-4 overflow-hidden">
+
+    <!-- ── Header ── -->
+    <header class="flex justify-between items-center flex-shrink-0">
         <div>
-            <h1 class="text-4xl font-bold glow italic">NOVA AI</h1>
-            <p class="text-sm opacity-70">v1.0</p>
+            <h1 class="text-3xl font-bold glow tracking-widest">NOVA AI</h1>
+            <p class="text-[10px] opacity-40 tracking-widest">EV VOICE ASSISTANT · v1.0</p>
         </div>
-        <div class="flex gap-6">
+        <div class="flex items-center gap-6">
             <div class="text-right">
-                <p class="text-xs opacity-50">STATUS</p>
-                <p id="connection-status" class="text-red-500">OFFLINE</p>
+                <p class="text-[9px] opacity-40 tracking-widest">STATUS</p>
+                <p id="connection-status" class="text-red-500 font-bold text-sm tracking-widest">OFFLINE</p>
             </div>
-            <div class="text-right">
-                <p class="text-xs opacity-50">LOCATION</p>
-                <p>Local Machine</p>
+            <div class="flex items-center gap-2">
+                <span class="text-[9px] opacity-40 tracking-widest">ALWAYS LISTENING</span>
+                <label class="relative inline-flex items-center cursor-pointer">
+                    <input type="checkbox" id="always-listening-toggle" class="sr-only peer">
+                    <div class="w-9 h-5 bg-gray-800 rounded-full peer
+                        peer-checked:after:translate-x-full
+                        after:content-[''] after:absolute after:top-[2px] after:start-[2px]
+                        after:bg-white after:rounded-full after:h-4 after:w-4 after:transition-all
+                        peer-checked:bg-[#00ffcc]">
+                    </div>
+                </label>
             </div>
         </div>
     </header>
 
-    <main class="grid grid-cols-12 gap-6 flex-grow overflow-hidden">
-        <div class="col-span-8 flex flex-col gap-6 overflow-hidden">
-            <div class="card rounded-2xl p-6 flex-grow flex flex-col overflow-hidden">
-                <div id="chat-history" class="flex-grow overflow-y-auto pr-2">
-                    <div class="opacity-50 italic">System initialized. Enable "Always Listening" to start.</div>
+    <!-- ── Main grid: 5 | 4 | 3 ── -->
+    <main class="grid grid-cols-12 gap-4 flex-grow overflow-hidden min-h-0">
+
+        <!-- ── Col 1: Voice core (span 5) ── -->
+        <div class="col-span-5 flex flex-col gap-4 min-h-0">
+
+            <!-- State ring + visualiser + PTT -->
+            <div class="card rounded-2xl p-5 flex flex-col items-center gap-4 flex-grow justify-center min-h-0">
+
+                <!-- State ring -->
+                <div id="state-ring"
+                    class="w-28 h-28 rounded-full border-4 border-[#00ffcc]/20 flex items-center justify-center relative transition-all duration-300 flex-shrink-0">
+                    <div id="state-pulse" class="absolute inset-0 rounded-full"></div>
+                    <span id="state-icon" class="text-4xl z-10 select-none">💤</span>
                 </div>
-                <div class="h-24 flex items-center justify-center relative mt-4">
-                    <canvas id="visualizer" class="w-full h-full"></canvas>
-                    <div id="listening-indicator" class="hidden absolute flex items-center gap-2 text-[#00ffcc] font-bold">
-                        <span class="relative flex h-3 w-3"><span class="animate-ping absolute inline-flex h-full w-full rounded-full bg-[#00ffcc] opacity-75"></span><span class="relative inline-flex rounded-full h-3 w-3 bg-[#00ffcc]"></span></span>
-                        NOVA IS LISTENING
+                <p id="status-text" class="text-xs font-bold tracking-[0.3em] opacity-60">IDLE</p>
+
+                <!-- Visualiser -->
+                <canvas id="visualizer" class="w-full flex-shrink-0" height="52"></canvas>
+
+                <!-- PTT -->
+                <button id="ptt-button"
+                    class="w-full py-3 border border-[#00ffcc] rounded-xl font-bold text-xs
+                           tracking-widest hover:bg-[#00ffcc] hover:text-black transition-all
+                           active:scale-95 flex-shrink-0">
+                    HOLD TO SPEAK
+                </button>
+            </div>
+
+            <!-- KWS Enrollment -->
+            <div class="card rounded-2xl p-4 flex-shrink-0">
+                <h2 class="text-[10px] font-bold tracking-widest opacity-60 mb-3 border-b border-[#00ffcc]/20 pb-2">
+                    KWS ENROLLMENT
+                </h2>
+                <div class="flex gap-2 mb-2">
+                    <button id="record-nova-btn"
+                        class="flex-1 border border-[#00ffcc] text-[#00ffcc] py-2 rounded text-[10px]
+                               tracking-widest hover:bg-[#00ffcc] hover:text-black transition-all">
+                        RECORD "NOVA" (0/5)
+                    </button>
+                    <button id="record-noise-btn"
+                        class="flex-1 border border-[#00ffcc] text-[#00ffcc] py-2 rounded text-[10px]
+                               tracking-widest hover:bg-[#00ffcc] hover:text-black transition-all">
+                        RECORD NOISE (0/5)
+                    </button>
+                </div>
+                <p id="enroll-status" class="text-[9px] opacity-40 italic">
+                    Record 5 wake-word + 5 noise samples for best accuracy.
+                </p>
+            </div>
+        </div>
+
+        <!-- ── Col 2: System metrics + component insights (span 4) ── -->
+        <div class="col-span-4 flex flex-col gap-4 min-h-0">
+
+            <!-- Metrics -->
+            <div class="card rounded-2xl p-5 flex-shrink-0">
+                <h2 class="text-[10px] font-bold tracking-widest opacity-60 mb-4
+                           border-b border-[#00ffcc]/20 pb-2">
+                    SYSTEM METRICS
+                </h2>
+                <div class="space-y-4">
+                    <div>
+                        <div class="flex justify-between text-[10px] mb-1 tracking-wider">
+                            <span class="opacity-60">CPU</span>
+                            <span id="cpu-val">0%</span>
+                        </div>
+                        <div class="progress-bar rounded-full">
+                            <div id="cpu-bar" class="progress-fill" style="width:0%"></div>
+                        </div>
+                    </div>
+                    <div>
+                        <div class="flex justify-between text-[10px] mb-1 tracking-wider">
+                            <span class="opacity-60">GPU VRAM (4 GB)</span>
+                            <span id="gpu-mem-val">0 MB</span>
+                        </div>
+                        <div class="progress-bar rounded-full">
+                            <div id="gpu-mem-bar" class="progress-fill" style="width:0%"></div>
+                        </div>
+                    </div>
+                    <div>
+                        <div class="flex justify-between text-[10px] mb-1 tracking-wider">
+                            <span class="opacity-60">GPU CORE</span>
+                            <span id="gpu-util-val">0%</span>
+                        </div>
+                        <div class="progress-bar rounded-full">
+                            <div id="gpu-util-bar" class="progress-fill" style="width:0%"></div>
+                        </div>
                     </div>
                 </div>
-                <div class="flex justify-center mt-4">
-                    <button id="ptt-button" class="w-full py-4 border-2 border-[#00ffcc] rounded-xl font-bold hover:bg-[#00ffcc] hover:text-black transition-all active:scale-95">
-                        HOLD TO SPEAK
-                    </button>
+            </div>
+
+            <!-- Component insights -->
+            <div class="card rounded-2xl p-5 flex-grow overflow-y-auto min-h-0">
+                <h2 class="text-[10px] font-bold tracking-widest opacity-60 mb-3
+                           border-b border-[#00ffcc]/20 pb-2">
+                    COMPONENT INSIGHTS
+                </h2>
+                <div id="component-container" class="space-y-3 text-[10px]">
+                    <div class="opacity-30">Loading telemetry…</div>
                 </div>
             </div>
         </div>
 
-        <div class="col-span-4 flex flex-col gap-6">
-            <div class="card rounded-2xl p-6">
-                <div class="flex justify-between items-center mb-4 border-b border-[#00ffcc] pb-2">
-                    <h2 class="text-xl font-bold">SYSTEM METRICS</h2>
-                    <div class="flex items-center gap-2">
-                        <span class="text-[10px] opacity-50">ALWAYS LISTENING</span>
-                        <label class="relative inline-flex items-center cursor-pointer">
-                            <input type="checkbox" id="always-listening-toggle" class="sr-only peer">
-                            <div class="w-9 h-5 bg-gray-700 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full rtl:peer-checked:after:-translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:start-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-[#00ffcc]"></div>
-                        </label>
-                    </div>
-                </div>
-                <div class="space-y-6">
-                    <div>
-                        <div class="flex justify-between text-sm mb-1"><span>CPU UTILIZATION</span><span id="cpu-val">0%</span></div>
-                        <div class="progress-bar rounded-full"><div id="cpu-bar" class="progress-fill" style="width: 0%"></div></div>
-                    </div>
-                    <div>
-                        <div class="flex justify-between text-sm mb-1"><span>GPU VRAM (4GB)</span><span id="gpu-mem-val">0 MB</span></div>
-                        <div class="progress-bar rounded-full"><div id="gpu-mem-bar" class="progress-fill" style="width: 0%"></div></div>
-                    </div>
-                    <div>
-                        <div class="flex justify-between text-sm mb-1"><span>GPU CORE UTIL</span><span id="gpu-util-val">0%</span></div>
-                        <div class="progress-bar rounded-full"><div id="gpu-util-bar" class="progress-fill" style="width: 0%"></div></div>
-                    </div>
-                </div>
-            </div>
+        <!-- ── Col 3: Evaluation + voice select + last exchange (span 3) ── -->
+        <div class="col-span-3 flex flex-col gap-4 min-h-0">
 
-            <div class="card rounded-2xl p-6 flex-grow">
-                <h2 class="text-xl font-bold mb-4 border-b border-[#00ffcc] pb-2">EVALUATION</h2>
-                <div class="space-y-4 text-sm">
-                    <div class="flex justify-between"><span>KWS (LATENCY)</span><span id="kws-latency">-- ms</span></div>
-                    <div class="flex justify-between"><span>STT (Time to First Byte)</span><span id="stt-latency">-- ms</span></div>
-                    <div class="flex justify-between"><span>LLM (Time to First Token)</span><span id="llm-latency">-- ms</span></div>
-                    <div class="flex justify-between"><span>TTS (Time to First Audio)</span><span id="tts-latency">-- ms</span></div>
-                    <div class="flex justify-between text-[#00ffcc] font-bold"><span>END-TO-END</span><span id="e2e-latency">-- ms</span></div>
-                    <div class="pt-4 opacity-50 text-xs">TTS VOICE SELECTION</div>
-                    <select id="voice-select" class="w-full bg-black border border-[#00ffcc] text-[#00ffcc] text-xs p-2 rounded outline-none">
-                        <option value="alba" selected>Alba (Default)</option>
-                        <option value="marius">Marius</option>
-                        <option value="javert">Javert</option>
-                        <option value="jean">Jean</option>
-                        <option value="fantine">Fantine</option>
-                        <option value="cosette">Cosette</option>
-                        <option value="eponine">Eponine</option>
-                        <option value="azelma">Azelma</option>
+            <!-- Evaluation -->
+            <div class="card rounded-2xl p-5 flex-grow min-h-0 flex flex-col">
+                <h2 class="text-[10px] font-bold tracking-widest opacity-60 mb-4
+                           border-b border-[#00ffcc]/20 pb-2 flex-shrink-0">
+                    EVALUATION
+                </h2>
+                <div class="space-y-3 text-[10px] flex-grow">
+                    <div class="flex justify-between">
+                        <span class="opacity-50 tracking-wider">KWS LATENCY</span>
+                        <span id="kws-latency">-- ms</span>
+                    </div>
+                    <div class="flex justify-between">
+                        <span class="opacity-50 tracking-wider">STT TTFB</span>
+                        <span id="stt-latency">-- ms</span>
+                    </div>
+                    <div class="flex justify-between pl-3">
+                        <span class="opacity-30 tracking-wider">└ RTF</span>
+                        <span id="stt-rtf" class="opacity-60">-- x</span>
+                    </div>
+                    <div class="flex justify-between">
+                        <span class="opacity-50 tracking-wider">LLM TTFT</span>
+                        <span id="llm-latency">-- ms</span>
+                    </div>
+                    <div class="flex justify-between">
+                        <span class="opacity-50 tracking-wider">TTS TTFA</span>
+                        <span id="tts-latency">-- ms</span>
+                    </div>
+                    <div class="flex justify-between pl-3">
+                        <span class="opacity-30 tracking-wider">└ RTF</span>
+                        <span id="tts-rtf" class="opacity-60">-- x</span>
+                    </div>
+                    <div class="flex justify-between font-bold text-[#00ffcc] pt-2
+                                border-t border-[#00ffcc]/20">
+                        <span class="tracking-wider">END-TO-END</span>
+                        <span id="e2e-latency">-- ms</span>
+                    </div>
+                </div>
+
+                <!-- Voice select -->
+                <div class="mt-4 flex-shrink-0">
+                    <p class="text-[9px] opacity-40 tracking-widest mb-1">TTS VOICE</p>
+                    <select id="voice-select"
+                        class="w-full bg-black border border-[#00ffcc]/40 text-[#00ffcc]
+                               text-[10px] p-2 rounded outline-none tracking-wider">
+                        <option value="alba"    selected>Alba</option>
+                        <option value="marius"  >Marius</option>
+                        <option value="javert"  >Javert</option>
+                        <option value="jean"    >Jean</option>
+                        <option value="fantine" >Fantine</option>
+                        <option value="cosette" >Cosette</option>
+                        <option value="eponine" >Eponine</option>
+                        <option value="azelma"  >Azelma</option>
                     </select>
-                    <div class="pt-4 opacity-50 text-xs">Say "Nova" to wake up the assistant.</div>
                 </div>
             </div>
 
-            <div class="card rounded-2xl p-6">
-                <h2 class="text-xl font-bold mb-4 border-b border-[#00ffcc] pb-2">KWS ENROLLMENT</h2>
-                <div class="space-y-3">
-                    <div class="flex flex-col gap-2">
-                        <button id="record-nova-btn" class="bg-transparent border border-[#00ffcc] text-[#00ffcc] py-2 rounded text-xs hover:bg-[#00ffcc] hover:text-black transition-all">RECORD "NOVA" (0/5)</button>
-                        <button id="record-noise-btn" class="bg-transparent border border-[#00ffcc] text-[#00ffcc] py-2 rounded text-xs hover:bg-[#00ffcc] hover:text-black transition-all">RECORD NOISE (0/5)</button>
-                    </div>
-                    <p id="enroll-status" class="text-[10px] opacity-50 italic">Record your own wake word samples for better accuracy.</p>
-                </div>
+            <!-- Last exchange -->
+            <div class="card rounded-2xl p-4 flex-shrink-0">
+                <p class="text-[9px] opacity-40 tracking-widest mb-2">LAST EXCHANGE</p>
+                <p id="last-user"
+                   class="text-[10px] opacity-50 mb-2 leading-relaxed break-words line-clamp-2">
+                    —
+                </p>
+                <p id="last-assistant"
+                   class="text-[10px] text-[#00ffcc] leading-relaxed break-words line-clamp-3">
+                    —
+                </p>
             </div>
         </div>
     </main>
 
     <script>
-        let ws;
-        let audioContext;
-        let processor;
-        let input;
-        let isRecordingUI = false;
-        let isThinkingUI = false;
-        let currentAssistantMsgDiv = null;
-        let currentUserMsgDiv = null;
+    // ── state ──────────────────────────────────────────────────────────────────
+    let ws, audioContext, processor, input, analyser;
+    let isRecordingUI   = false;
+    let novaCount       = 0;
+    let noiseCount      = 0;
+    let lastAssistantText = '';
 
-        // Enrollment State
-        let novaCount = 0;
-        let noiseCount = 0;
-        let enrollmentRecorder;
-        let enrollmentChunks = [];
+    // ── state-ring helpers ────────────────────────────────────────────────────
+    const stateRing  = document.getElementById('state-ring');
+    const statePulse = document.getElementById('state-pulse');
+    const stateIcon  = document.getElementById('state-icon');
+    const statusText = document.getElementById('status-text');
 
-        const recordNovaBtn = document.getElementById('record-nova-btn');
-        const recordNoiseBtn = document.getElementById('record-noise-btn');
-        const enrollStatus = document.getElementById('enroll-status');
+    const STATE_CFG = {
+        idle:      { icon: '💤', label: 'IDLE',      border: 'border-[#00ffcc]/20', pulse: '' },
+        listening: { icon: '🎙️',  label: 'LISTENING', border: 'border-[#00ffcc]',    pulse: 'animate-ping bg-[#00ffcc]/10' },
+        thinking:  { icon: '🧠', label: 'THINKING',  border: 'border-yellow-400',   pulse: 'animate-pulse bg-yellow-400/10' },
+        speaking:  { icon: '🔊', label: 'SPEAKING',  border: 'border-purple-400',   pulse: 'animate-pulse bg-purple-400/10' },
+    };
 
-        async function recordSample(type, limit, btn, counter) {
-            const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-            const recorder = new MediaRecorder(stream);
-            let chunks = [];
-            
-            btn.textContent = "RECORDING...";
-            btn.classList.add('bg-[#00ffcc]', 'text-black');
-            
-            recorder.ondataavailable = (e) => chunks.push(e.data);
-            recorder.onstop = async () => {
-                const blob = new Blob(chunks, { type: 'audio/wav' });
-                const formData = new FormData();
-                formData.append('file', blob);
-                formData.append('sample_type', type);
-                
-                let idx;
-                if (type === 'nova') { novaCount++; idx = novaCount; }
-                else { noiseCount++; idx = noiseCount; }
-                formData.append('index', idx);
+    function setUIState(state) {
+        const c = STATE_CFG[state] || STATE_CFG.idle;
+        stateIcon.textContent  = c.icon;
+        statusText.textContent = c.label;
+        stateRing.className    =
+            `w-28 h-28 rounded-full border-4 flex items-center justify-center relative ` +
+            `transition-all duration-300 ${c.border}`;
+        statePulse.className   = `absolute inset-0 rounded-full ${c.pulse}`;
+    }
+    setUIState('idle');
 
-                enrollStatus.textContent = `Uploading ${type}_${idx}...`;
-                await fetch('/enroll/upload', { method: 'POST', body: formData });
-                
-                btn.textContent = `RECORD ${type.toUpperCase()} (${idx}/${limit})`;
-                btn.classList.remove('bg-[#00ffcc]', 'text-black');
-                
-                if (novaCount >= 5 && noiseCount >= 5) {
-                    enrollStatus.textContent = "All samples recorded. Restarting session to re-enroll...";
-                    await fetch('/enroll/re-enroll', { method: 'POST' });
-                }
-                stream.getTracks().forEach(t => t.stop());
-            };
+    // ── visualiser ────────────────────────────────────────────────────────────
+    const canvas = document.getElementById('visualizer');
+    const ctx    = canvas.getContext('2d');
 
-            recorder.start();
-            setTimeout(() => recorder.stop(), 2000); // 2s sample
+    function drawVisualizer() {
+        if (!analyser) return;
+        requestAnimationFrame(drawVisualizer);
+        const buf = new Uint8Array(analyser.frequencyBinCount);
+        analyser.getByteFrequencyData(buf);
+        ctx.fillStyle = '#050505';
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        const bw = (canvas.width / buf.length) * 2.5;
+        let x = 0;
+        for (let i = 0; i < buf.length; i++) {
+            const h = buf[i] / 2;
+            ctx.fillStyle = isRecordingUI ? '#ff4444' : '#00ffcc';
+            ctx.fillRect(x, canvas.height - h, bw, h);
+            x += bw + 1;
         }
+    }
 
-        recordNovaBtn.onclick = () => recordSample('nova', 5, recordNovaBtn);
-        recordNoiseBtn.onclick = () => recordSample('noise', 5, recordNoiseBtn);
+    // ── audio init ────────────────────────────────────────────────────────────
+    async function initAudio() {
+        audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        input    = audioContext.createMediaStreamSource(stream);
+        analyser = audioContext.createAnalyser();
+        processor = audioContext.createScriptProcessor(4096, 1, 1);
 
-        const alwaysListeningToggle = document.getElementById('always-listening-toggle');
-        const statusText = document.getElementById('connection-status');
-        const chatHistory = document.getElementById('chat-history');
-        const listeningIndicator = document.getElementById('listening-indicator');
-        const pttButton = document.getElementById('ptt-button');
-        const canvas = document.getElementById('visualizer');
-        const ctx = canvas.getContext('2d');
-        let analyser;
+        processor.onaudioprocess = (e) => {
+            if (ws?.readyState !== WebSocket.OPEN) return;
+            const f32 = e.inputBuffer.getChannelData(0);
+            const i16 = new Int16Array(f32.length);
+            for (let i = 0; i < f32.length; i++)
+                i16[i] = Math.max(-1, Math.min(1, f32[i])) * 0x7FFF;
+            ws.send(i16.buffer);
+        };
 
-        function drawVisualizer() {
-            if (!analyser) return;
-            requestAnimationFrame(drawVisualizer);
-            const bufferLength = analyser.frequencyBinCount;
-            const dataArray = new Uint8Array(bufferLength);
-            analyser.getByteFrequencyData(dataArray);
-            ctx.fillStyle = '#050505';
-            ctx.fillRect(0, 0, canvas.width, canvas.height);
-            const barWidth = (canvas.width / bufferLength) * 2.5;
-            let x = 0;
-            for(let i = 0; i < bufferLength; i++) {
-                const barHeight = dataArray[i] / 2;
-                ctx.fillStyle = isRecordingUI ? '#ff4444' : '#00ffcc';
-                ctx.fillRect(x, canvas.height - barHeight, barWidth, barHeight);
-                x += barWidth + 1;
-            }
-        }
+        input.connect(analyser);
+        input.connect(processor);
+        processor.connect(audioContext.destination);
+        drawVisualizer();
+    }
 
-        async function initAudio() {
-            audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
-            const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-            input = audioContext.createMediaStreamSource(stream);
-            analyser = audioContext.createAnalyser();
-            
-            // ScriptProcessor for raw PCM streaming
-            processor = audioContext.createScriptProcessor(4096, 1, 1);
-            
-            processor.onaudioprocess = (e) => {
-                if (ws && ws.readyState === WebSocket.OPEN) {
-                    const inputData = e.inputBuffer.getChannelData(0);
-                    // Convert float32 to int16
-                    const int16Data = new Int16Array(inputData.length);
-                    for (let i = 0; i < inputData.length; i++) {
-                        int16Data[i] = Math.max(-1, Math.min(1, inputData[i])) * 0x7FFF;
-                    }
-                    ws.send(int16Data.buffer);
-                }
-            };
+    // ── TTS audio queue ───────────────────────────────────────────────────────
+    let audioQueue    = [];
+    let nextStartTime = 0;
 
-            input.connect(analyser);
-            input.connect(processor);
-            processor.connect(audioContext.destination);
-            drawVisualizer();
-        }
+    function stopAllAudio() {
+        // Suspend immediately kills scheduled sources, then resume for next TTS
+        if (!audioContext) return;
+        audioContext.suspend().then(() => {
+            audioQueue    = [];
+            nextStartTime = 0;
+            audioContext.resume();
+        });
+    }
 
-        let audioQueue = [];
-        let isPlaying = false;
-
-        async function playNextInQueue() {
-            if (audioQueue.length === 0) {
-                isPlaying = false;
-                return;
-            }
-            isPlaying = true;
-            const audioData = audioQueue.shift();
+    function processAudioQueue() {
+        while (audioQueue.length > 0) {
+            const data = audioQueue.shift();
             try {
-                const audioBuffer = await audioContext.decodeAudioData(audioData);
-                const source = audioContext.createBufferSource();
-                source.buffer = audioBuffer;
-                source.connect(audioContext.destination);
-                source.onended = playNextInQueue;
-                source.start();
-            } catch (e) {
-                console.error("Audio decode error:", e);
-                playNextInQueue();
-            }
+                const i16 = new Int16Array(data);
+                const f32 = new Float32Array(i16.length);
+                for (let i = 0; i < i16.length; i++) f32[i] = i16[i] / 32768.0;
+                const buf = audioContext.createBuffer(1, f32.length, 24000);
+                buf.getChannelData(0).set(f32);
+                const src = audioContext.createBufferSource();
+                src.buffer = buf;
+                src.connect(audioContext.destination);
+                if (nextStartTime < audioContext.currentTime)
+                    nextStartTime = audioContext.currentTime + 0.05;
+                src.start(nextStartTime);
+                nextStartTime += buf.duration;
+            } catch (e) { console.error('Audio playback error:', e); }
         }
+    }
 
-        function startConnection() {
-            ws = new WebSocket(`ws://${window.location.host}/ws`);
-            ws.binaryType = 'arraybuffer';
+    // ── WebSocket ─────────────────────────────────────────────────────────────
+    function startConnection() {
+        ws = new WebSocket(`ws://${window.location.host}/ws`);
+        ws.binaryType = 'arraybuffer';
 
-            ws.onopen = () => {
-                statusText.textContent = 'ONLINE';
-                statusText.className = 'text-green-500';
-                listeningIndicator.classList.remove('hidden');
-                initAudio();
-                const voice = document.getElementById('voice-select').value;
-                ws.send(JSON.stringify({ type: 'change_voice', data: voice }));
-            };
+        ws.onopen = () => {
+            document.getElementById('connection-status').textContent = 'ONLINE';
+            document.getElementById('connection-status').className =
+                'text-green-400 font-bold text-sm tracking-widest';
+            setUIState('idle');
+            initAudio();
+            ws.send(JSON.stringify({
+                type: 'change_voice',
+                data: document.getElementById('voice-select').value,
+            }));
+        };
 
-            ws.onmessage = async (event) => {
-                if (typeof event.data === 'string') {
-                    const msg = JSON.parse(event.data);
-                    handleJsonMessage(msg);
-                } else {
-                    // Queue incoming TTS audio chunk
-                    audioQueue.push(event.data);
-                    if (!isPlaying) playNextInQueue();
+        ws.onmessage = (e) => {
+            if (typeof e.data === 'string') handleJsonMessage(JSON.parse(e.data));
+            else { audioQueue.push(e.data); processAudioQueue(); }
+        };
+
+        ws.onclose = () => {
+            document.getElementById('connection-status').textContent = 'OFFLINE';
+            document.getElementById('connection-status').className =
+                'text-red-500 font-bold text-sm tracking-widest';
+            setUIState('idle');
+            processor?.disconnect();
+            input?.disconnect();
+        };
+    }
+
+    function handleJsonMessage(msg) {
+        switch (msg.type) {
+
+            case 'kws_detected':
+                document.getElementById('kws-latency').textContent =
+                    `${msg.data.latency.toFixed(0)} ms`;
+                isRecordingUI = true;
+                setUIState('listening');
+                break;
+
+            case 'transcript':
+                if (msg.data) {
+                    document.getElementById('last-user').textContent = '▸ ' + msg.data;
                 }
-            };
+                if (msg.latency?.stt_ttfb)
+                    document.getElementById('stt-latency').textContent =
+                        `${(msg.latency.stt_ttfb * 1000).toFixed(0)} ms`;
+                if (msg.latency?.stt_rtf)
+                    document.getElementById('stt-rtf').textContent =
+                        `${msg.latency.stt_rtf.toFixed(2)}x`;
+                break;
 
-            ws.onclose = () => {
-                statusText.textContent = 'OFFLINE';
-                statusText.className = 'text-red-500';
-                listeningIndicator.classList.add('hidden');
-                if (processor) processor.disconnect();
-                if (input) input.disconnect();
-            };
+            case 'assistant_start':
+                lastAssistantText = '';
+                document.getElementById('last-assistant').textContent = '…';
+                setUIState('thinking');
+                break;
+
+            case 'llm_token':
+                if (!msg.data.includes('<think>') && !msg.data.includes('</think>'))
+                    lastAssistantText += msg.data;
+                document.getElementById('last-assistant').textContent =
+                    lastAssistantText.trim();
+                if (msg.latency?.llm_ttft)
+                    document.getElementById('llm-latency').textContent =
+                        `${(msg.latency.llm_ttft * 1000).toFixed(0)} ms`;
+                break;
+
+            case 'tts_metrics':
+                setUIState('speaking');
+                if (msg.data?.ttfa)
+                    document.getElementById('tts-latency').textContent =
+                        `${(msg.data.ttfa * 1000).toFixed(0)} ms`;
+                if (msg.data?.tts_rtf)
+                    document.getElementById('tts-rtf').textContent =
+                        `${msg.data.tts_rtf.toFixed(2)}x`;
+                if (msg.data?.e2e)
+                    document.getElementById('e2e-latency').textContent =
+                        `${(msg.data.e2e * 1000).toFixed(0)} ms`;
+                break;
+
+            case 'recording_stopped':
+                isRecordingUI = false;
+                setUIState('idle');
+                break;
+
+            case 'ptt_started':
+                isRecordingUI = true;
+                setUIState('listening');
+                break;
+
+            case 'interrupted':
+                stopAllAudio();      // kill queued browser audio immediately
+                isRecordingUI = true;
+                setUIState('listening');
+                break;
         }
+    }
 
-        function handleJsonMessage(msg) {
-            if (msg.type === 'kws_detected') {
-                document.getElementById('kws-latency').textContent = `${msg.data.latency.toFixed(0)} ms`;
-                startRecordingUI();
-            } else if (msg.type === 'transcript') {
-                finalizeUserTranscript(msg.data);
-                if (msg.latency?.stt_ttfb) document.getElementById('stt-latency').textContent = `${(msg.latency.stt_ttfb * 1000).toFixed(0)} ms`;
-            } else if (msg.type === 'assistant_start') {
-                addAssistantBubble();
-            } else if (msg.type === 'llm_token') {
-                updateAssistantMessage(msg.data);
-                if (msg.latency?.llm_ttft) document.getElementById('llm-latency').textContent = `${(msg.latency.llm_ttft * 1000).toFixed(0)} ms`;
-            } else if (msg.type === 'tts_metrics') {
-                if (msg.data?.ttfa) document.getElementById('tts-latency').textContent = `${(msg.data.ttfa * 1000).toFixed(0)} ms`;
-                if (msg.data?.e2e) document.getElementById('e2e-latency').textContent = `${(msg.data.e2e * 1000).toFixed(0)} ms`;
-            } else if (msg.type === 'recording_stopped') {
-                stopRecordingUI();
-            } else if (msg.type === 'ptt_started') {
-                startRecordingUI();
-            } else if (msg.type === 'interrupted') {
-                if (currentAssistantMsgDiv) currentAssistantMsgDiv.innerHTML += ' <span class="text-red-500">[Interrupted]</span>';
-                startRecordingUI();
-            }
-        }
+    // ── controls ──────────────────────────────────────────────────────────────
+    document.getElementById('always-listening-toggle').onchange = (e) => {
+        if (e.target.checked) startConnection();
+        else ws?.close();
+    };
 
-        function startRecordingUI() {
-            isRecordingUI = true;
-            addUserBubble("");
-        }
+    const pttBtn   = document.getElementById('ptt-button');
+    const sendPTT  = (type) =>
+        ws?.readyState === WebSocket.OPEN && ws.send(JSON.stringify({ type }));
 
-        function stopRecordingUI() {
-            isRecordingUI = false;
-        }
+    pttBtn.addEventListener('mousedown',  () => sendPTT('start_ptt'));
+    pttBtn.addEventListener('mouseup',    () => sendPTT('stop_ptt'));
+    pttBtn.addEventListener('mouseleave', () => sendPTT('stop_ptt'));
+    pttBtn.addEventListener('touchstart', (e) => { e.preventDefault(); sendPTT('start_ptt'); });
+    pttBtn.addEventListener('touchend',   (e) => { e.preventDefault(); sendPTT('stop_ptt'); });
 
-        function addUserBubble(text) {
-            const div = document.createElement('div');
-            div.className = 'user-msg';
-            div.innerHTML = `<p class="text-[10px] opacity-50 mb-1">USER</p><div class="bubble user-bubble partial">${text || '...'}</div>`;
-            chatHistory.appendChild(div);
-            currentUserMsgDiv = div.querySelector('.bubble');
-            chatHistory.scrollTop = chatHistory.scrollHeight;
-        }
+    document.getElementById('voice-select').onchange = (e) =>
+        ws?.readyState === WebSocket.OPEN &&
+        ws.send(JSON.stringify({ type: 'change_voice', data: e.target.value }));
 
-        function finalizeUserTranscript(text) {
-            if (!currentUserMsgDiv) addUserBubble(text);
-            currentUserMsgDiv.textContent = text || "[No speech detected]";
-            currentUserMsgDiv.classList.remove('partial');
-            chatHistory.scrollTop = chatHistory.scrollHeight;
-        }
+    // ── enrollment ────────────────────────────────────────────────────────────
+    async function recordSample(type, limit, btn) {
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        const rec    = new MediaRecorder(stream);
+        const chunks = [];
 
-        function addAssistantBubble() {
-            const div = document.createElement('div');
-            div.className = 'assistant-msg';
-            div.innerHTML = `<p class="text-[10px] opacity-50 mb-1">ASSISTANT</p><div class="bubble assistant-bubble"></div>`;
-            chatHistory.appendChild(div);
-            currentAssistantMsgDiv = div.querySelector('.bubble');
-            isThinkingUI = false;
-            chatHistory.scrollTop = chatHistory.scrollHeight;
-        }
+        btn.textContent = 'RECORDING…';
+        btn.classList.add('bg-[#00ffcc]', 'text-black');
 
-        function updateAssistantMessage(token) {
-            if (!currentAssistantMsgDiv) return;
-            if (token.includes('<think>')) {
-                isThinkingUI = true;
-                const thinkSpan = document.createElement('span');
-                thinkSpan.className = 'think';
-                thinkSpan.textContent = 'Thinking... ';
-                currentAssistantMsgDiv.appendChild(thinkSpan);
-                return;
-            }
-            if (token.includes('</think>')) {
-                isThinkingUI = false;
-                currentAssistantMsgDiv.appendChild(document.createElement('br'));
-                return;
-            }
-            if (isThinkingUI) {
-                const thinkSpan = currentAssistantMsgDiv.querySelector('.think');
-                if (thinkSpan) thinkSpan.textContent += token;
+        rec.ondataavailable = (e) => chunks.push(e.data);
+        rec.onstop = async () => {
+            const fd  = new FormData();
+            fd.append('file', new Blob(chunks, { type: 'audio/wav' }));
+            fd.append('sample_type', type);
+            const idx = type === 'nova' ? ++novaCount : ++noiseCount;
+            fd.append('index', idx);
+
+            document.getElementById('enroll-status').textContent =
+                `Uploading ${type}_${idx}…`;
+            await fetch('/enroll/upload', { method: 'POST', body: fd });
+
+            btn.textContent = `RECORD ${type.toUpperCase()} (${idx}/${limit})`;
+            btn.classList.remove('bg-[#00ffcc]', 'text-black');
+
+            if (novaCount >= 5 && noiseCount >= 5) {
+                document.getElementById('enroll-status').textContent =
+                    'Re-enrolling KWS…';
+                await fetch('/enroll/re-enroll', { method: 'POST' });
+                document.getElementById('enroll-status').textContent =
+                    'Enrollment complete ✓';
             } else {
-                currentAssistantMsgDiv.appendChild(document.createTextNode(token));
+                document.getElementById('enroll-status').textContent =
+                    `Saved ${type}_${idx}. ` +
+                    `(nova: ${novaCount}/5, noise: ${noiseCount}/5)`;
             }
-            chatHistory.scrollTop = chatHistory.scrollHeight;
-        }
-
-        alwaysListeningToggle.onchange = () => {
-            if (alwaysListeningToggle.checked) startConnection();
-            else if (ws) ws.close();
+            stream.getTracks().forEach(t => t.stop());
         };
 
-        function startPTT() {
-            if (ws && ws.readyState === WebSocket.OPEN) {
-                ws.send(JSON.stringify({ type: 'start_ptt' }));
+        rec.start();
+        setTimeout(() => rec.stop(), 2000);
+    }
+
+    document.getElementById('record-nova-btn').onclick  = (e) =>
+        recordSample('nova',  5, e.currentTarget);
+    document.getElementById('record-noise-btn').onclick = (e) =>
+        recordSample('noise', 5, e.currentTarget);
+
+    // ── metrics polling ───────────────────────────────────────────────────────
+    async function pollMetrics() {
+        try {
+            const d = await (await fetch('/metrics')).json();
+
+            document.getElementById('cpu-val').textContent      = `${d.cpu.toFixed(0)}%`;
+            document.getElementById('cpu-bar').style.width      = `${d.cpu}%`;
+            document.getElementById('gpu-mem-val').textContent  = `${d.gpu_mem.toFixed(0)} MB`;
+            document.getElementById('gpu-mem-bar').style.width  =
+                `${Math.min((d.gpu_mem / 4096) * 100, 100)}%`;
+            document.getElementById('gpu-util-val').textContent = `${d.gpu_util.toFixed(0)}%`;
+            document.getElementById('gpu-util-bar').style.width = `${d.gpu_util}%`;
+
+            if (d.components) {
+                const c = document.getElementById('component-container');
+                c.innerHTML = '';
+                for (const [k, v] of Object.entries(d.components)) {
+                    let extra = '';
+                    if (v.wer)      extra += `<span class="opacity-50 mr-2">WER ${v.wer}</span>`;
+                    if (v.accuracy) extra += `<span class="opacity-50 mr-2">Acc ${v.accuracy}</span>` +
+                                             `<span class="opacity-50 mr-2">F1 ${v.f1}</span>`;
+                    if (v.far)      extra += `<span class="opacity-50 mr-2">FAR ${v.far}</span>` +
+                                             `<span class="opacity-50 mr-2">FRR ${v.frr}</span>` +
+                                             `<span class="opacity-50">TRR ${v.trr}</span>`;
+                    c.innerHTML += `
+                        <div class="border-l-2 border-[#00ffcc]/40 pl-2 mb-3">
+                            <div class="flex justify-between font-bold text-[#00ffcc] mb-1 tracking-wider">
+                                <span>${k.toUpperCase()} — ${v.name}</span>
+                                <span class="opacity-60">${v.vram_mb} MB</span>
+                            </div>
+                            <div class="flex justify-between">
+                                <div class="flex flex-wrap gap-x-2">${extra}</div>
+                                <span class="opacity-30 ml-2 whitespace-nowrap">
+                                    ${v.load}
+                                </span>
+                            </div>
+                        </div>`;
+                }
             }
-        }
-
-        function stopPTT() {
-            if (ws && ws.readyState === WebSocket.OPEN) {
-                ws.send(JSON.stringify({ type: 'stop_ptt' }));
-            }
-        }
-
-        pttButton.addEventListener('mousedown', startPTT);
-        pttButton.addEventListener('mouseup', stopPTT);
-        pttButton.addEventListener('mouseleave', stopPTT);
-        pttButton.addEventListener('touchstart', (e) => { e.preventDefault(); startPTT(); });
-        pttButton.addEventListener('touchend', (e) => { e.preventDefault(); stopPTT(); });
-
-        document.getElementById('voice-select').onchange = (e) => {
-            if (ws && ws.readyState === WebSocket.OPEN) {
-                ws.send(JSON.stringify({ type: 'change_voice', data: e.target.value }));
-            }
-        };
-
-        async function pollMetrics() {
-            try {
-                const res = await fetch('/metrics');
-                const data = await res.json();
-                document.getElementById('cpu-val').textContent = `${data.cpu.toFixed(0)}%`;
-                document.getElementById('cpu-bar').style.width = `${data.cpu}%`;
-                document.getElementById('gpu-mem-val').textContent = `${data.gpu_mem.toFixed(0)} MB`;
-                document.getElementById('gpu-mem-bar').style.width = `${(data.gpu_mem / 4096) * 100}%`;
-                document.getElementById('gpu-util-val').textContent = `${data.gpu_util.toFixed(0)}%`;
-                document.getElementById('gpu-util-bar').style.width = `${data.gpu_util}%`;
-            } catch {}
-        }
-        setInterval(pollMetrics, 2000);
+        } catch (_) {}
+    }
+    setInterval(pollMetrics, 2000);
     </script>
 </body>
 </html>
