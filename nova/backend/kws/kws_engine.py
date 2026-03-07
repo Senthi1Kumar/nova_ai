@@ -65,8 +65,10 @@ class GoogleEmbeddingModel:
             audio_16k = audio_16k[np.newaxis, :]
         outputs = self.session.run(None, {self.input_name: audio_16k.astype(np.float32)})
         emb = outputs[0]
-        if emb.ndim == 4:   return emb[0, :, 0, :]
-        elif emb.ndim == 3: return emb[0, :, :]
+        if emb.ndim == 4:
+            return emb[0, :, 0, :]
+        elif emb.ndim == 3:
+            return emb[0, :, :]
         return emb
 
 
@@ -82,8 +84,10 @@ def dtw_cosine_distance(seq1: np.ndarray, seq2: np.ndarray) -> float:
     r, c     = dist_mat.shape
     D        = np.full((r, c), np.inf)
     D[0, 0]  = dist_mat[0, 0]
-    for i in range(1, r): D[i, 0] = D[i-1, 0] + dist_mat[i, 0]
-    for j in range(1, c): D[0, j] = D[0, j-1] + dist_mat[0, j]
+    for i in range(1, r): 
+        D[i, 0] = D[i-1, 0] + dist_mat[i, 0]
+    for j in range(1, c): 
+        D[0, j] = D[0, j-1] + dist_mat[0, j]
     for i in range(1, r):
         for j in range(1, c):
             D[i, j] = dist_mat[i, j] + min(D[i-1,j], D[i,j-1], D[i-1,j-1])

@@ -7,6 +7,7 @@ import os
 import sys
 import threading
 import re
+import random
 from pathlib import Path
 from contextlib import asynccontextmanager
 
@@ -65,7 +66,7 @@ async def lifespan(app: FastAPI):
     )
 
     # 1. STT
-    stt_model = WhisperModel("base", device="cuda", compute_type="float16")
+    stt_model = WhisperModel("distil-large-v3", device="cuda", compute_type="float16")
 
     # 2. LLM
     bnb_config = BitsAndBytesConfig(
@@ -126,8 +127,6 @@ try:
     nvml_handle = pynvml.nvmlDeviceGetHandleByIndex(0)
 except Exception:
     nvml_handle = None
-
-import random
 
 def get_metrics():
     cpu_usage = psutil.cpu_percent()
