@@ -7,15 +7,13 @@ import pyaudio
 import wave
 import time
 from pathlib import Path
+from scipy.spatial.distance import cdist
 
 
 class WakeWordClassifier(nn.Module):
-    """Lightweight MLP for wake word detection."""
-
-    def __init__(self, embedding_dim, hidden_dims=[128, 64], dropout=0.1):
+    def __init__(self, embedding_dim, hidden_dims=[64], dropout=0.3):
         super().__init__()
-        layers = []
-        in_dim = embedding_dim
+        layers, in_dim = [], embedding_dim
         for h in hidden_dims:
             layers.extend([nn.Linear(in_dim, h), nn.ReLU(), nn.Dropout(dropout)])
             in_dim = h
@@ -25,29 +23,26 @@ class WakeWordClassifier(nn.Module):
     def forward(self, x):
         return self.network(x)
 
-
 class RingBuffer:
     def __init__(self, size):
         self.data = np.zeros(size, dtype=np.float32)
         self.size = size
-        self.pos = 0
+        self.pos  = 0
         self.full = False
 
     def extend(self, chunk):
         n = len(chunk)
         if n >= self.size:
-            self.data[:] = chunk[-self.size :]
-            self.pos = 0
+            self.data[:] = chunk[-self.size:]
+            self.pos  = 0
             self.full = True
             return
-
         if self.pos + n <= self.size:
-            self.data[self.pos : self.pos + n] = chunk
+            self.data[self.pos: self.pos + n] = chunk
         else:
             overhead = (self.pos + n) - self.size
-            self.data[self.pos :] = chunk[: n - overhead]
-            self.data[:overhead] = chunk[n - overhead :]
-
+            self.data[self.pos:] = chunk[: n - overhead]
+            self.data[:overhead] = chunk[n - overhead:]
         self.pos = (self.pos + n) % self.size
         if not self.full and self.pos < n:
             self.full = True
@@ -57,207 +52,365 @@ class RingBuffer:
             return self.data[: self.pos]
         return np.roll(self.data, -self.pos)
 
-
 class GoogleEmbeddingModel:
     def __init__(self, model_path: str):
-        self.session = ort.InferenceSession(model_path)
+        self.session    = ort.InferenceSession(model_path)
         self.input_name = self.session.get_inputs()[0].name
 
     def predict(self, audio_16k: np.ndarray) -> np.ndarray:
         MIN_SAMPLES = 12400
         if len(audio_16k) < MIN_SAMPLES:
-            audio_16k = np.pad(
-                audio_16k, (0, MIN_SAMPLES - len(audio_16k)), mode="constant"
-            )
+            audio_16k = np.pad(audio_16k, (0, MIN_SAMPLES - len(audio_16k)))
         if audio_16k.ndim == 1:
             audio_16k = audio_16k[np.newaxis, :]
-        outputs = self.session.run(
-            None, {self.input_name: audio_16k.astype(np.float32)}
-        )
+        outputs = self.session.run(None, {self.input_name: audio_16k.astype(np.float32)})
         emb = outputs[0]
-        if emb.ndim == 4:
-            return emb[0, :, 0, :]
-        elif emb.ndim == 3:
-            return emb[0, :, :]
+        if emb.ndim == 4:   return emb[0, :, 0, :]
+        elif emb.ndim == 3: return emb[0, :, :]
         return emb
 
 
+# Distance / similarity helpers
+def _normalize_rows(X: np.ndarray) -> np.ndarray:
+    return X / (np.linalg.norm(X, axis=1, keepdims=True) + 1e-9)
+
+
+def dtw_cosine_distance(seq1: np.ndarray, seq2: np.ndarray) -> float:
+    """Normalized DTW on cosine distance matrix (same as kws_classifier.py)."""
+    s1, s2   = _normalize_rows(seq1), _normalize_rows(seq2)
+    dist_mat = 1.0 - np.dot(s1, s2.T)          # cosine distance
+    r, c     = dist_mat.shape
+    D        = np.full((r, c), np.inf)
+    D[0, 0]  = dist_mat[0, 0]
+    for i in range(1, r): D[i, 0] = D[i-1, 0] + dist_mat[i, 0]
+    for j in range(1, c): D[0, j] = D[0, j-1] + dist_mat[0, j]
+    for i in range(1, r):
+        for j in range(1, c):
+            D[i, j] = dist_mat[i, j] + min(D[i-1,j], D[i,j-1], D[i-1,j-1])
+    return float(D[-1, -1] / (r + c))
+
+
+def max_cosine_similarity(test_frames: np.ndarray, ref_frames: np.ndarray) -> float:
+    """Max cosine similarity between any frame pair (mirrors kws_classifier.py)."""
+    tn = _normalize_rows(test_frames)
+    rn = _normalize_rows(ref_frames)
+    return float(np.max(np.dot(tn, rn.T)))
+
+
+def mean_cosine_similarity(test_mean: np.ndarray, ref_mean: np.ndarray) -> float:
+    """Cosine similarity between mean embeddings."""
+    tn = test_mean / (np.linalg.norm(test_mean) + 1e-9)
+    rn = ref_mean  / (np.linalg.norm(ref_mean)  + 1e-9)
+    return float(np.dot(tn, rn))
+
+
+def min_euclidean_distance(test_frames: np.ndarray, pooled_ref: np.ndarray) -> float:
+    """Min Euclidean distance between any frame pair."""
+    d = cdist(test_frames, pooled_ref, metric='euclidean')
+    return float(np.min(d))
+
+
+# Fusion score
+def fuse_scores(dtw_dist: float, cos_sim: float, euc_dist: float,
+                mlp_prob: float,
+                w_dtw=0.25, w_cos=0.35, w_euc=0.15, w_mlp=0.25) -> float:
+    """
+    Combine four signals into one [0, 1] confidence score.
+
+    Conversions to similarity (all → higher = more like wake word):
+      DTW  : sim = 1 / (1 + dtw_dist)   — used by kws_classifier.py
+      Cos  : already in [-1, 1], clip to [0, 1]
+      Euc  : sim = 1 / (1 + euc_dist)
+      MLP  : already probability in [0, 1]
+    """
+    dtw_sim = 1.0 / (1.0 + dtw_dist)
+    cos_sim = float(np.clip(cos_sim, 0.0, 1.0))
+    euc_sim = 1.0 / (1.0 + euc_dist)
+    return w_dtw * dtw_sim + w_cos * cos_sim + w_euc * euc_sim + w_mlp * mlp_prob
+
+
 class StreamingKWS:
-    """DTW + MLP Classifier."""
+    """
+    Multi-metric KWS with soft-voting fusion.
+
+    Trigger logic (OR of three gates so a single strong signal suffices):
+      A) Fusion score  >= fusion_threshold                 (default 0.60)
+      B) DTW alone     <  dtw_hard_threshold               (default 0.22)
+         AND cosine    >= cos_hard_threshold               (default 0.82)
+      C) Sustained: N consecutive strides all pass a
+         softer fusion threshold                           (default 0.52)
+
+    Weights and thresholds are all __init__ parameters so you can tune them
+    from the CLI / experiment loop without editing this file.
+    """
 
     def __init__(
-        self, model_path: str = None, threshold=0.25, window_sec=1.5, stride_sec=0.2
+        self,
+        model_path: str = None,
+        fusion_threshold: float = 0.60,
+        w_dtw: float = 0.25,
+        w_cos: float = 0.35,
+        w_euc: float = 0.15,
+        w_mlp: float = 0.25,
+        dtw_hard_threshold: float = 0.22,
+        cos_hard_threshold: float = 0.82,
+        sustained_fusion_threshold: float = 0.52,
+        sustained_window: int = 3,
+        window_sec: float = 1.5,
+        stride_sec: float = 0.2,
+        cooldown_sec: float = 2.0,
+        debug: bool = True,
     ):
         if model_path:
-            self.model = GoogleEmbeddingModel(model_path)
+            self.model     = GoogleEmbeddingModel(model_path)
             self.vad_model, _ = torch.hub.load(
                 repo_or_dir="snakers4/silero-vad", model="silero_vad"
             )
         else:
-            self.model = None
+            self.model     = None
             self.vad_model = None
 
-        self.threshold = threshold
+        self.fusion_threshold = fusion_threshold
+        self.w_dtw, self.w_cos = w_dtw, w_cos
+        self.w_euc, self.w_mlp = w_euc, w_mlp
+        self.dtw_hard_threshold = dtw_hard_threshold
+        self.cos_hard_threshold = cos_hard_threshold
+        self.sustained_fusion_threshold = sustained_fusion_threshold
+        self.sustained_window = sustained_window
         self.window_size = int(16000 * window_sec)
         self.stride_size = int(16000 * stride_sec)
+        self.cooldown_sec = cooldown_sec
+        self.debug = debug
+
         self.buffer = RingBuffer(self.window_size)
-        self.reference_sequences = []
+        self.reference_sequences = []   # list of [T, D] arrays (per enrollment file)
+        self.ref_means = []   # list of [D] mean vectors
+        self.pooled_ref = None # [N*T, D] concatenated for euclidean
         self.mlp = None
         self.new_samples = 0
+        self._last_trigger_time = 0.0
+        self._muted = False
+        self._recent_fusions = []   # rolling fusion scores for sustained gate
+
+    def mute(self):
+        self._muted = True
+
+    def unmute(self):
+        self._muted = False
+        self._recent_fusions.clear()
+        self._last_trigger_time = time.perf_counter()
 
     def enroll(self, ref_paths: list[str], noise_paths: list[str] = None):
         X, y = [], []
         self.reference_sequences = []
+        self.ref_means = []
         embedding_dim = 0
 
         for p in ref_paths:
             with wave.open(p, "rb") as wf:
                 audio = (
-                    np.frombuffer(
-                        wf.readframes(wf.getnframes()), dtype=np.int16
-                    ).astype(np.float32)
-                    / 32768.0
+                    np.frombuffer(wf.readframes(wf.getnframes()), dtype=np.int16)
+                    .astype(np.float32) / 32768.0
                 )
-                audio = (audio - np.mean(audio)) / (np.std(audio) + 1e-9)
-                seq = self.model.predict(audio)
-                self.reference_sequences.append(seq)
-                X.append(np.mean(seq, axis=0))
-                y.append(1)
-                embedding_dim = seq.shape[1]
+            audio = self._normalize_audio(audio)
+            seq   = self.model.predict(audio)  # [T, D]
+            self.reference_sequences.append(seq)
+            self.ref_means.append(np.mean(seq, axis=0))
+            X.append(np.mean(seq, axis=0))
+            y.append(1)
+            embedding_dim = seq.shape[1]
+
+        # Concatenate all ref frames for Euclidean gate
+        self.pooled_ref = np.concatenate(self.reference_sequences, axis=0)
 
         if noise_paths:
             for p in noise_paths:
                 with wave.open(p, "rb") as wf:
                     audio = (
-                        np.frombuffer(
-                            wf.readframes(wf.getnframes()), dtype=np.int16
-                        ).astype(np.float32)
-                        / 32768.0
+                        np.frombuffer(wf.readframes(wf.getnframes()), dtype=np.int16)
+                        .astype(np.float32) / 32768.0
                     )
-                    audio = (audio - np.mean(audio)) / (np.std(audio) + 1e-9)
-                    seq = self.model.predict(audio)
-                    X.append(np.mean(seq, axis=0))
-                    y.append(0)
+                audio = self._normalize_audio(audio)
+                seq   = self.model.predict(audio)
+                X.append(np.mean(seq, axis=0))
+                y.append(0)
 
-            # Train MLP
-            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-            self.mlp = WakeWordClassifier(embedding_dim).to(device)
-            X_t = torch.FloatTensor(np.array(X)).to(device)
-            y_t = torch.LongTensor(np.array(y)).to(device)
+        device  = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.mlp = WakeWordClassifier(embedding_dim, hidden_dims=[64], dropout=0.3).to(device)
+        X_t = torch.FloatTensor(np.array(X)).to(device)
+        y_t = torch.LongTensor(np.array(y)).to(device)
 
-            optimizer = torch.optim.Adam(self.mlp.parameters(), lr=0.001)
-            criterion = nn.CrossEntropyLoss()
+        optimizer = torch.optim.Adam(self.mlp.parameters(), lr=0.001, weight_decay=1e-3)
+        criterion = nn.CrossEntropyLoss()
 
-            self.mlp.train()
-            for _ in range(100):
-                optimizer.zero_grad()
-                outputs = self.mlp(X_t)
-                loss = criterion(outputs, y_t)
-                loss.backward()
-                optimizer.step()
-            self.mlp.eval()
-            print(f"[KWS] MLP trained. Embedded Dim: {embedding_dim}")
+        self.mlp.train()
+        for _ in range(150):
+            optimizer.zero_grad()
+            loss = criterion(self.mlp(X_t), y_t)
+            loss.backward()
+            optimizer.step()
+        self.mlp.eval()
+        print(f"[KWS] Enrolled {len(ref_paths)} refs | "
+              f"{len(noise_paths or [])} noise | emb_dim={embedding_dim}")
 
-    def _dtw_distance(self, seq1, seq2):
-        s1 = seq1 / (np.linalg.norm(seq1, axis=1, keepdims=True) + 1e-9)
-        s2 = seq2 / (np.linalg.norm(seq2, axis=1, keepdims=True) + 1e-9)
-        dist_mat = 1 - np.dot(s1, s2.T)
-        r, c = dist_mat.shape
-        D = np.zeros((r, c))
-        D[0, 0] = dist_mat[0, 0]
-        for i in range(1, r):
-            D[i, 0] = D[i - 1, 0] + dist_mat[i, 0]
-        for j in range(1, c):
-            D[0, j] = D[0, j - 1] + dist_mat[0, j]
-        for i in range(1, r):
-            for j in range(1, c):
-                D[i, j] = dist_mat[i, j] + min(
-                    D[i - 1, j], D[i, j - 1], D[i - 1, j - 1]
-                )
-        return D[-1, -1] / (r + c)
+    @staticmethod
+    def _normalize_audio(audio: np.ndarray) -> np.ndarray:
+        return (audio - np.mean(audio)) / (np.std(audio) + 1e-9)
 
+    def _mlp_prob(self, mean_emb: np.ndarray) -> float:
+        if self.mlp is None:
+            return 0.5
+        device = next(self.mlp.parameters()).device
+        feat   = torch.FloatTensor(mean_emb).unsqueeze(0).to(device)
+        with torch.no_grad():
+            return F.softmax(self.mlp(feat), dim=1)[0, 1].item()
+
+    def _compute_all_metrics(self, current_seq: np.ndarray):
+        """
+        Returns (best_dtw, best_cos_frame, best_cos_mean, min_euc, mlp_prob, fusion).
+        'best' = most wake-word-like value across all reference sequences.
+        """
+        dtw_dists, cos_frame_sims, cos_mean_sims, euc_dists = [], [], [], []
+
+        cur_mean = np.mean(current_seq, axis=0)
+
+        for i, ref_seq in enumerate(self.reference_sequences):
+            dtw_dists.append(dtw_cosine_distance(current_seq, ref_seq))
+            cos_frame_sims.append(max_cosine_similarity(current_seq, ref_seq))
+            cos_mean_sims.append(mean_cosine_similarity(cur_mean, self.ref_means[i]))
+
+        euc_dists.append(min_euclidean_distance(current_seq, self.pooled_ref))
+
+        best_dtw      = min(dtw_dists)
+        best_cos_frame = max(cos_frame_sims)
+        best_cos_mean  = max(cos_mean_sims)
+        min_euc        = min(euc_dists)
+        mlp_prob       = self._mlp_prob(cur_mean)
+
+        # Use frame-level cosine (stronger signal) for fusion
+        fusion = fuse_scores(
+            best_dtw, best_cos_frame, min_euc, mlp_prob,
+            self.w_dtw, self.w_cos, self.w_euc, self.w_mlp
+        )
+
+        return best_dtw, best_cos_frame, best_cos_mean, min_euc, mlp_prob, fusion
+
+    # Streaming Inference
     async def process_chunk(self, audio_16k: np.ndarray):
         try:
             self.buffer.extend(audio_16k)
             if not self.buffer.full:
                 return False, 0
+
             self.new_samples += len(audio_16k)
             if self.new_samples < self.stride_size:
                 return False, 0
-
             self.new_samples = 0
-            window = self.buffer.get()
-            window = (window - np.mean(window)) / (np.std(window) + 1e-9)
 
+            if self._muted:
+                return False, 0
+
+            now = time.perf_counter()
+            if now - self._last_trigger_time < self.cooldown_sec:
+                return False, 0
+
+            window = self.buffer.get()
+            window = self._normalize_audio(window)
+
+            # VAD
             speech_detected = False
             with torch.no_grad():
-                for offset in [0, 5120, 10240, 15488]:
-                    chunk = window[offset : offset + 512]
+                for offset in range(0, len(window) - 512, 4000):
+                    chunk = window[offset: offset + 512]
                     if len(chunk) < 512:
                         continue
-                    audio_tensor = torch.from_numpy(chunk).unsqueeze(0)
-                    prob = self.vad_model(audio_tensor, 16000).item()
-                    if prob > 0.5:
+                    prob = self.vad_model(
+                        torch.from_numpy(chunk).unsqueeze(0), 16000
+                    ).item()
+                    if prob > 0.6:
                         speech_detected = True
                         break
             if not speech_detected:
                 return False, 0
 
-            t_start = time.perf_counter()
+            t_start     = time.perf_counter()
             current_seq = self.model.predict(window)
 
-            distances = [
-                self._dtw_distance(current_seq, ref) for ref in self.reference_sequences
-            ]
-            min_dist = min(distances) if distances else 1.0
+            (best_dtw, best_cos_frame, best_cos_mean,
+             min_euc, mlp_prob, fusion) = self._compute_all_metrics(current_seq)
 
-            prob_wake = 0.0
-            if self.mlp:
-                feat = (
-                    torch.FloatTensor(np.mean(current_seq, axis=0))
-                    .unsqueeze(0)
-                    .to(next(self.mlp.parameters()).device)
-                )
-                with torch.no_grad():
-                    logits = self.mlp(feat)
-                    prob_wake = F.softmax(logits, dim=1)[0, 1].item()
-
-            if min_dist < 0.4 or prob_wake > 0.3:
-                print(f"[DEBUG] KWS Dist: {min_dist:.3f} | MLP Prob: {prob_wake:.3f}")
-
-            if min_dist < self.threshold and prob_wake > 0.6:
-                latency = (time.perf_counter() - t_start) * 1000
+            # Debug print (any metric is close)
+            if self.debug and (
+                best_dtw < 0.4 or best_cos_frame > 0.6
+                or mlp_prob > 0.4 or fusion > 0.45
+            ):
                 print(
-                    f"🔥 [KWS] VERIFIED (Dist: {min_dist:.2f}, Prob: {prob_wake:.2f})"
+                    f"[KWS] DTW={best_dtw:.3f} | "
+                    f"CosFrm={best_cos_frame:.3f} | "
+                    f"CosMean={best_cos_mean:.3f} | "
+                    f"Euc={min_euc:.3f} | "
+                    f"MLP={mlp_prob:.3f} | "
+                    f"Fusion={fusion:.3f}"
+                )
+
+            # Sustain buffer: always append current fusion score
+            self._recent_fusions.append(fusion)
+            self._recent_fusions = self._recent_fusions[-self.sustained_window:]
+
+            # Gate A: fusion
+            gate_a = fusion >= self.fusion_threshold
+
+            # Gate B: hard-AND (DTW + cosine both strong)
+            gate_b = (
+                best_dtw      <  self.dtw_hard_threshold
+                and best_cos_frame >= self.cos_hard_threshold
+            )
+
+            # Gate C: sustained softer fusion
+            gate_c = (
+                len(self._recent_fusions) >= self.sustained_window
+                and all(s >= self.sustained_fusion_threshold
+                        for s in self._recent_fusions)
+            )
+
+            triggered = gate_a or gate_b or gate_c
+
+            if triggered:
+                latency = (time.perf_counter() - t_start) * 1000
+                self._last_trigger_time = time.perf_counter()
+                self._recent_fusions.clear()
+                tag = ("FUSION" if gate_a else "HARD-AND" if gate_b else "SUSTAINED")
+                print(
+                    f"🔥 [KWS] VERIFIED/{tag} "
+                    f"DTW={best_dtw:.3f} CosFrm={best_cos_frame:.3f} "
+                    f"MLP={mlp_prob:.3f} Fusion={fusion:.3f}"
                 )
                 return True, latency
+
         except Exception as e:
             print(f"[ERROR] KWS Processing failed: {e}")
         return False, 0
 
 
-class EnrollmentManager:
-    """Handles enrollment including room noise calibration."""
+# CLI enrollment helper
 
+class EnrollmentManager:
     def __init__(self, ref_dir="refs", sample_rate=16000):
-        self.ref_dir = Path(ref_dir)
+        self.ref_dir     = Path(ref_dir)
         self.ref_dir.mkdir(exist_ok=True)
         self.sample_rate = sample_rate
-        self.pa = pyaudio.PyAudio()
+        self.pa          = pyaudio.PyAudio()
 
     def record_sample(self, filename: str, prompt: str, duration=2.0):
         print(f"\n[ENROLL] {prompt}")
         input("Press Enter to start recording...")
         stream = self.pa.open(
-            format=pyaudio.paInt16,
-            channels=1,
-            rate=self.sample_rate,
-            input=True,
-            frames_per_buffer=1024,
+            format=pyaudio.paInt16, channels=1,
+            rate=self.sample_rate, input=True, frames_per_buffer=1024,
         )
         print("Recording...")
         frames = []
-        for _ in range(0, int(self.sample_rate / 1024 * duration)):
+        for _ in range(int(self.sample_rate / 1024 * duration)):
             frames.append(stream.read(1024))
         print("Done.")
         stream.stop_stream()
@@ -270,22 +423,19 @@ class EnrollmentManager:
 
     def run_full_enrollment(self):
         prompts = [
-            "Say 'Hi Nova'",
-            "Say 'Nova'",
-            "Say 'Hey Nova'",
-            "Say 'Hello Nova'",
-            "Say 'Nova'",
+            "Say 'Hi Nova'", "Say 'Nova'", "Say 'Hey Nova'",
+            "Say 'Hello Nova'", "Say 'Nova'",
         ]
         ref_paths = []
         for i, prompt in enumerate(prompts):
-            path = self.ref_dir / f"nova_{i + 1}.wav"
+            path = self.ref_dir / f"nova_{i+1}.wav"
             self.record_sample(path, prompt)
             ref_paths.append(str(path))
 
-        print("\n[CALIBRATION] Now recording 5 samples of ROOM NOISE (Stay silent).")
+        print("\n[CALIBRATION] Recording 5 samples of room noise — stay silent.")
         noise_paths = []
         for i in range(5):
-            path = self.ref_dir / f"noise_{i + 1}.wav"
+            path = self.ref_dir / f"noise_{i+1}.wav"
             self.record_sample(path, "Remain silent...", duration=2.0)
             noise_paths.append(str(path))
 
