@@ -19,4 +19,4 @@ nova/backend/kws/refs/*.wav
 *.ipynb
 
 # Misc
-*.html
+*.txt
