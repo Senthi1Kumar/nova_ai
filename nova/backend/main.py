@@ -66,7 +66,7 @@ async def lifespan(app: FastAPI):
     )
 
     # 1. STT
-    stt_model = WhisperModel("distil-large-v3", device="cuda", compute_type="float16")
+    stt_model = WhisperModel("small", device="cuda", compute_type="float16")
 
     # 2. LLM
     bnb_config = BitsAndBytesConfig(
