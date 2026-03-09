@@ -30,6 +30,13 @@ dependencies = [
     "flatbuffers",
     "protobuf",
     "nvidia-ml-py",
+    "speechbrain>=1.0.3",
+    "deepface>=0.0.99",
+    "opencv-python>=4.13.0.92",
+    "cryptography>=46.0.5",
+    "python-jose>=3.5.0",
+    "huggingface-hub==0.36.2",
+    "tf-keras>=2.20.1",
 ]
 
 # [tool.uv]
