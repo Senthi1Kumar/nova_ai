@@ -33,7 +33,7 @@
     <header class="flex justify-between items-center flex-shrink-0">
         <div>
             <h1 class="text-3xl font-bold glow tracking-widest">NOVA AI</h1>
-            <p class="text-[10px] opacity-40 tracking-widest">EV VOICE ASSISTANT · v1.0</p>
+            <p class="text-[10px] opacity-40 tracking-widest">EV VOICE ASSISTANT · v1.1</p>
         </div>
         <div class="flex items-center gap-6">
             <div class="text-right">
@@ -92,17 +92,26 @@
                 <div class="flex gap-2 mb-2">
                     <button id="record-nova-btn"
                         class="flex-1 border border-[#00ffcc] text-[#00ffcc] py-2 rounded text-[10px]
-                               tracking-widest hover:bg-[#00ffcc] hover:text-black transition-all">
-                        RECORD "NOVA" (0/5)
+                               tracking-widest hover:bg-[#00ffcc]/20 transition-all relative overflow-hidden">
+                        <div id="nova-progress" class="absolute left-0 top-0 bottom-0 bg-[#00ffcc] opacity-20" style="width: 0%; transition: width 2s linear;"></div>
+                        <span id="nova-btn-text" class="relative z-10">RECORD "NOVA" (0/5)</span>
                     </button>
                     <button id="record-noise-btn"
                         class="flex-1 border border-[#00ffcc] text-[#00ffcc] py-2 rounded text-[10px]
-                               tracking-widest hover:bg-[#00ffcc] hover:text-black transition-all">
-                        RECORD NOISE (0/5)
+                               tracking-widest hover:bg-[#00ffcc]/20 transition-all relative overflow-hidden">
+                        <div id="noise-progress" class="absolute left-0 top-0 bottom-0 bg-[#00ffcc] opacity-20" style="width: 0%; transition: width 2s linear;"></div>
+                        <span id="noise-btn-text" class="relative z-10">RECORD NOISE (0/5)</span>
+                    </button>
+                </div>
+                <div class="flex gap-2 mb-2">
+                    <button id="record-face-btn"
+                        class="flex-1 border border-[#00ffcc] text-[#00ffcc] py-2 rounded text-[10px]
+                               tracking-widest hover:bg-[#00ffcc]/20 transition-all relative overflow-hidden">
+                        <span id="face-btn-text" class="relative z-10">RECORD FACE ID</span>
                     </button>
                 </div>
                 <p id="enroll-status" class="text-[9px] opacity-40 italic">
-                    Record 5 wake-word + 5 noise samples for best accuracy.
+                    Record 5 wake-word/noise samples + 1 Face ID for best accuracy.
                 </p>
             </div>
         </div>
@@ -469,9 +478,23 @@
         const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
         const rec    = new MediaRecorder(stream);
         const chunks = [];
+        
+        const progressBar = document.getElementById(`${type}-progress`);
+        const btnText = document.getElementById(`${type}-btn-text`);
 
-        btn.textContent = 'RECORDING…';
-        btn.classList.add('bg-[#00ffcc]', 'text-black');
+        // Start animation state
+        btnText.textContent = 'RECORDING…';
+        btn.disabled = true; // Prevent double clicks
+        
+        // Reset and trigger CSS transition for the 2-second window
+        progressBar.style.transition = 'none';
+        progressBar.style.width = '0%';
+        
+        // Force reflow to ensure the 0% applies immediately
+        void progressBar.offsetWidth; 
+        
+        progressBar.style.transition = 'width 2s linear';
+        progressBar.style.width = '100%';
 
         rec.ondataavailable = (e) => chunks.push(e.data);
         rec.onstop = async () => {
@@ -483,10 +506,17 @@
 
             document.getElementById('enroll-status').textContent =
                 `Uploading ${type}_${idx}…`;
+                
+            // Keep bar full while uploading, change text
+            btnText.textContent = 'SAVING...';
+            
             await fetch('/enroll/upload', { method: 'POST', body: fd });
 
-            btn.textContent = `RECORD ${type.toUpperCase()} (${idx}/${limit})`;
-            btn.classList.remove('bg-[#00ffcc]', 'text-black');
+            // Reset animation state
+            progressBar.style.transition = 'width 0.2s ease-out';
+            progressBar.style.width = '0%';
+            btnText.textContent = `RECORD ${type.toUpperCase()} (${idx}/${limit})`;
+            btn.disabled = false;
 
             if (novaCount >= 5 && noiseCount >= 5) {
                 document.getElementById('enroll-status').textContent =
@@ -510,6 +540,32 @@
         recordSample('nova',  5, e.currentTarget);
     document.getElementById('record-noise-btn').onclick = (e) =>
         recordSample('noise', 5, e.currentTarget);
+    document.getElementById('record-face-btn').onclick = async (e) => {
+        const btn = e.currentTarget;
+        const btnText = document.getElementById('face-btn-text');
+        btn.disabled = true;
+        btnText.textContent = 'CAPTURING...';
+        
+        document.getElementById('enroll-status').textContent = 'Look directly at the webcam...';
+        
+        try {
+            const res = await fetch('/enroll/face', { method: 'POST' });
+            const data = await res.json();
+            if (data.status === 'success') {
+                btnText.textContent = 'FACE ID ENROLLED ✓';
+                document.getElementById('enroll-status').textContent = 'Face ID enrollment complete.';
+                btn.classList.add('opacity-50');
+            } else {
+                btnText.textContent = 'FACE ID FAILED ❌';
+                document.getElementById('enroll-status').textContent = 'Failed: ' + data.error;
+                btn.disabled = false;
+            }
+        } catch (err) {
+            btnText.textContent = 'ERROR ❌';
+            document.getElementById('enroll-status').textContent = 'Server connection error.';
+            btn.disabled = false;
+        }
+    };
 
     // ── metrics polling ───────────────────────────────────────────────────────
     async function pollMetrics() {

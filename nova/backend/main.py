@@ -32,6 +32,23 @@ from pocket_tts import TTSModel
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from kws.kws_engine import StreamingKWS
 
+L7_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "nova-l7", "L-7")
+sys.path.append(L7_PATH)
+try:
+    from dialogue_manager import DialogueManager
+except ImportError as e:
+    logger.error(f"Failed to import DialogueManager: {e}")
+    DialogueManager = None
+
+L3_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "nova-l7", "L-3")
+sys.path.append(L3_PATH)
+try:
+    from crypto_utils import save_array, encrypt_and_save
+    from verify import extract_live_fingerprint
+    from enroll import enroll_face
+except ImportError as e:
+    logger.error(f"Failed to import L3 Crypto/Verify/Enroll: {e}")
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("nova-backend")
 
@@ -158,7 +175,7 @@ def get_metrics():
         "gpu_util": gpu_util,
         "components": {
             "stt": {
-                "name": "Faster-Whisper (Base)",
+                "name": "Faster-Whisper (Small)",
                 "vram_mb": stt_vram,
                 "load": random.choice(["Low", "Low", "Med"]),
                 "wer": f"{stt_wer}%",
@@ -197,6 +214,7 @@ class NovaSession:
         self.kws_engine = StreamingKWS(model_path=None)
         self.kws_engine.model = shared_kws_model
         self.kws_engine.vad_model = shared_vad_model
+        self.dm = DialogueManager() if DialogueManager else None
 
         refs_dir = os.path.join(os.path.dirname(__file__), "kws", "refs")
         if os.path.exists(refs_dir):
@@ -308,8 +326,8 @@ class NovaSession:
             segments, _ = stt_model.transcribe(
                 audio_np,
                 beam_size=5,
-                vad_filter=True,
-                vad_parameters={"min_silence_duration_ms": 300},
+                # vad_filter=True,
+                # vad_parameters={"min_silence_duration_ms": 1000, "speech_pad_ms": 400},
                 language="en",
             )
             segments     = list(segments)
@@ -335,7 +353,29 @@ class NovaSession:
             })
 
             if transcript:
-                await self.generate_response(transcript)
+                if self.dm:
+                    dm_response = self.dm.process(transcript, audio_buffer=audio_np)
+                    logger.info(f"DM Response: {dm_response}")
+
+                    # We could send dm state updates to UI here if needed
+                    # await self.send_json({"type": "dm_state", "data": dm_response})
+
+                    # Check if it was queued (Nova is currently speaking)
+                    if dm_response.get("intent") in ["stop", "emergency"]:
+                        self.interrupt_flag = True
+                        self.state = "IDLE"
+                        await self.send_json({"type": "interrupted"})
+                        # Optionally speak the stop confirmation, but usually we just want silence
+                        # await self.speak_text(dm_response["nova_says"]) 
+                    elif dm_response.get("queued", False):
+                        await self.speak_text(dm_response["nova_says"])
+                    else:
+                        if dm_response.get("intent") == "general_question":
+                            await self.generate_response(transcript) # Let Qwen answer it
+                        else:
+                            await self.speak_text(dm_response["nova_says"]) # Deterministic L7 response
+                else:
+                    await self.generate_response(transcript)
             else:
                 self.state = "IDLE"
                 await self.send_json({"type": "recording_stopped"})
@@ -354,14 +394,62 @@ class NovaSession:
                 continue
             await self.enqueue_tts(text)
 
+    async def _handle_dm_speaking_done(self):
+        if self.dm:
+            next_response = self.dm.speaking_done()
+            if next_response:
+                logger.info(f"DM Buffered Response: {next_response}")
+                if next_response.get("intent") == "general_question":
+                    # For buffered general questions, we need the original text
+                    # We added original_text to L7
+                    original_text = next_response.get("original_text", "")
+                    if original_text:
+                        await self.generate_response(original_text)
+                    else:
+                        await self.speak_text(next_response["nova_says"])
+                else:
+                    await self.speak_text(next_response["nova_says"])
+
+    async def speak_text(self, text: str):
+        try:
+            if self.dm:
+                self.dm.speaking_started()
+                
+            await self.send_json({"type": "assistant_start"})
+            await self.send_json({"type": "llm_token", "data": text, "latency": {}})
+            
+            tts_queue = asyncio.Queue()
+            tts_task = asyncio.create_task(self.tts_worker(tts_queue))
+            tts_queue.put_nowait(text)
+            tts_queue.put_nowait(None)
+            await tts_task
+            
+            await self._handle_dm_speaking_done()
+            
+        except Exception as e:
+            logger.error(f"speak_text error: {e}")
+        finally:
+            active_states = ["VERIFY", "VERIFY_PIN", "VERIFY_FACE", "SLOT_FILL", "CONFIRM_PENDING", "OTP_PENDING"]
+            if self.dm and self.dm.state.fsm_state in active_states and not self.interrupt_flag:
+                self.state = "LISTENING"
+                self.command_audio = []
+                self.silence_chunks = 0
+                await self.send_json({"type": "ptt_started"}) # Triggers UI listening mode
+            else:
+                self.state = "IDLE"
+                await self.send_json({"type": "recording_stopped"})
+
     async def generate_response(self, prompt: str):
         try:
+            if self.dm:
+                self.dm.speaking_started()
             messages = [
                 {
                     "role": "system",
                     "content": (
                         "You are Nova, an ultra-fast, helpful voice assistant built for an EV "
-                        "dashboard. Your answers must be incredibly concise, direct, and "
+                        "dashboard. You have full real-time access to the vehicle's diagnostic data, "
+                        "sensors, and systems. Your answers must be incredibly concise, direct, and "
                         "conversational. Do not use markdown, emojis, or long explanations."
                     ),
                 },
@@ -422,22 +510,43 @@ class NovaSession:
                     sentence_buffer = ""
 
             if not self.interrupt_flag:
-                clean = self.clean_for_tts(sentence_buffer)
-                if clean:
-                    tts_queue.put_nowait(clean)
+                final_clean = self.clean_for_tts(sentence_buffer)
+                if final_clean:
+                    tts_queue.put_nowait(final_clean)
 
             tts_queue.put_nowait(None)
             await tts_task
 
+            await self._handle_dm_speaking_done()
+
         except Exception as e:
             logger.error(f"LLM error: {e}")
         finally:
-            self.state = "IDLE"
-            await self.send_json({"type": "recording_stopped"})
+            active_states = ["VERIFY", "VERIFY_PIN", "VERIFY_FACE", "SLOT_FILL", "CONFIRM_PENDING", "OTP_PENDING"]
+            if self.dm and self.dm.state.fsm_state in active_states and not self.interrupt_flag:
+                self.state = "LISTENING"
+                self.command_audio = []
+                self.silence_chunks = 0
+                await self.send_json({"type": "ptt_started"}) # Triggers UI listening mode
+            else:
+                self.state = "IDLE"
+                await self.send_json({"type": "recording_stopped"})
 
     def clean_for_tts(self, text: str) -> str:
         text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
-        return text.replace("<think>", "").replace("</think>", "").strip()
+        text = text.replace("<think>", "").replace("</think>", "")
+        
+        # Pronunciation Normalizations for Pocket-TTS
+        # Acronyms
+        text = re.sub(r'\bAC\b', 'A C', text, flags=re.IGNORECASE)
+        text = re.sub(r'\bEV\b', 'E V', text)
+        text = re.sub(r'\bUI\b', 'U I', text)
+        text = re.sub(r'\bAPI\b', 'A P I', text)
+        
+        # Pocket-TTS tends to struggle with naked numbers or fast repeats
+        text = re.sub(r'([a-zA-Z]),([a-zA-Z])', r'\1, \2', text) # Fix missing spaces after commas
+        
+        return text.strip()
 
     async def enqueue_tts(self, text: str):
         if self.tts_muted:
@@ -551,13 +660,55 @@ async def upload_enrollment(
     return {"status": "success", "filename": filename}
 
 
+@app.post("/enroll/face")
+async def trigger_face_enroll():
+    try:
+        # Run face enrollment in a separate thread so it doesn't block the async event loop
+        # while waiting for the camera
+        driver_id = "driver1"
+        success = await asyncio.to_thread(enroll_face, driver_id, False)
+        if success:
+            return {"status": "success", "message": "Face ID enrolled successfully"}
+        else:
+            return {"status": "error", "error": "Could not extract face or no camera found"}
+    except Exception as e:
+        logger.error(f"Face enrollment failed: {e}", exc_info=True)
+        return {"status": "error", "error": str(e)}
+
+
 @app.post("/enroll/re-enroll")
 async def trigger_re_enroll():
+    refs_dir = Path(__file__).parent / "kws" / "refs"
+    
+    # 1. Update KWS Engine
     for session in list(active_sessions):
         try:
             session.enroll()
         except Exception as e:
             logger.error(f"Failed to re-enroll session: {e}")
+
+    # 2. Update L-3 Identity Voiceprint using the KWS samples
+    try:
+        ref_paths = sorted(list(refs_dir.glob("nova_*.wav")))
+        if len(ref_paths) > 0:
+            fingerprints = []
+            for p in ref_paths:
+                fp = extract_live_fingerprint(p)
+                fingerprints.append(fp)
+            
+            master_fingerprint = np.mean(fingerprints, axis=0)
+            master_fingerprint = master_fingerprint / np.linalg.norm(master_fingerprint)
+            
+            # Save it out using L-3's structure
+            driver_id = "driver1"
+            vp_dir = Path(__file__).parent / "nova-l7" / "L-3" / "data" / "voiceprints"
+            vp_dir.mkdir(parents=True, exist_ok=True)
+            save_path = vp_dir / f"{driver_id}.enc"
+            save_array(master_fingerprint, save_path)
+            logger.info(f"L-3 Identity Voiceprint successfully extracted and encrypted for {driver_id}")
+    except Exception as e:
+        logger.error(f"Failed to extract L-3 voiceprint: {e}", exc_info=True)
+
     return {"status": "enrolled", "active_sessions": len(active_sessions)}
 
 
