@@ -37,9 +37,14 @@ dependencies = [
     "python-jose>=3.5.0",
     "huggingface-hub==0.36.2",
     "tf-keras>=2.20.1",
+    "unsloth[cu124-torch260]",
 ]
 
-# [tool.uv]
+[tool.uv]
+environments = [
+    "sys_platform == 'linux'",
+]
+
 # override-dependencies = [
 #     "onnxruntime==1.25.0.dev20260224001",
 # ]
@@ -61,6 +66,7 @@ onnxruntime-gpu = { index = "ort-nightly" }
 torch = { index = "pytorch-cu124" }
 torchvision = { index = "pytorch-cu124" }
 torchaudio = { index = "pytorch-cu124" }
+unsloth = { git = "https://github.com/unslothai/unsloth.git" }
 
 [dependency-groups]
 dev = [
