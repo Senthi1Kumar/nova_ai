@@ -18,5 +18,5 @@ nova/backend/kws/refs/*.wav
 # Notebooks
 *.ipynb
 
-# Misc
-*.txt
+# Env vars
+.env
