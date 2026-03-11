@@ -254,8 +254,46 @@ class StreamingKWS:
             loss.backward()
             optimizer.step()
         self.mlp.eval()
+        
+        # Save the trained model and reference sequences
+        save_dir = Path(__file__).parent / "models"
+        save_dir.mkdir(exist_ok=True)
+        torch.save(self.mlp.state_dict(), save_dir / "mlp_weights.pth")
+        np.save(save_dir / "ref_means.npy", np.array(self.ref_means))
+        np.savez(save_dir / "ref_sequences.npz", *self.reference_sequences)
+        np.save(save_dir / "pooled_ref.npy", self.pooled_ref)
+        
         print(f"[KWS] Enrolled {len(ref_paths)} refs | "
               f"{len(noise_paths or [])} noise | emb_dim={embedding_dim}")
+
+    def load_model(self):
+        """Load pre-trained MLP and reference sequences from disk if they exist."""
+        save_dir = Path(__file__).parent / "models"
+        if not (save_dir / "mlp_weights.pth").exists():
+            return False
+            
+        try:
+            # Load arrays
+            self.ref_means = list(np.load(save_dir / "ref_means.npy"))
+            npz = np.load(save_dir / "ref_sequences.npz")
+            self.reference_sequences = [npz[k] for k in npz.files]
+            self.pooled_ref = np.load(save_dir / "pooled_ref.npy")
+            
+            # Initialize and load MLP
+            embedding_dim = self.ref_means[0].shape[0]
+            self.mlp = nn.Sequential(
+                nn.Linear(embedding_dim, 64),
+                nn.ReLU(),
+                nn.Dropout(0.2),
+                nn.Linear(64, 2)
+            ).to("cuda" if torch.cuda.is_available() else "cpu")
+            self.mlp.load_state_dict(torch.load(save_dir / "mlp_weights.pth"))
+            self.mlp.eval()
+            print("[KWS] Loaded pre-trained KWS model from disk.")
+            return True
+        except Exception as e:
+            print(f"[KWS] Failed to load pre-trained model: {e}")
+            return False
 
     @staticmethod
     def _normalize_audio(audio: np.ndarray) -> np.ndarray:
