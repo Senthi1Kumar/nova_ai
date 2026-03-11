@@ -45,7 +45,7 @@ sys.path.append(L3_PATH)
 try:
     from crypto_utils import save_array, encrypt_and_save
     from verify import extract_live_fingerprint
-    from enroll import enroll_face
+    from enroll import enroll_face, enroll_pin
 except ImportError as e:
     logger.error(f"Failed to import L3 Crypto/Verify/Enroll: {e}")
 
@@ -217,11 +217,12 @@ class NovaSession:
         self.dm = DialogueManager() if DialogueManager else None
 
         refs_dir = os.path.join(os.path.dirname(__file__), "kws", "refs")
-        if os.path.exists(refs_dir):
-            ref_paths   = sorted(str(p) for p in Path(refs_dir).glob("nova_*.wav"))
-            noise_paths = sorted(str(p) for p in Path(refs_dir).glob("noise_*.wav"))
-            if ref_paths:
-                self.kws_engine.enroll(ref_paths, noise_paths)
+        if not self.kws_engine.load_model():
+            if os.path.exists(refs_dir):
+                ref_paths   = sorted(str(p) for p in Path(refs_dir).glob("nova_*.wav"))
+                noise_paths = sorted(str(p) for p in Path(refs_dir).glob("noise_*.wav"))
+                if ref_paths:
+                    self.kws_engine.enroll(ref_paths, noise_paths)
 
         self.command_audio = []
         self.silence_chunks = 0
@@ -234,11 +235,12 @@ class NovaSession:
 
     def enroll(self):
         refs_dir = os.path.join(os.path.dirname(__file__), "kws", "refs")
-        if os.path.exists(refs_dir):
-            ref_paths   = sorted(str(p) for p in Path(refs_dir).glob("nova_*.wav"))
-            noise_paths = sorted(str(p) for p in Path(refs_dir).glob("noise_*.wav"))
-            if ref_paths:
-                self.kws_engine.enroll(ref_paths, noise_paths)
+        if not self.kws_engine.load_model():
+            if os.path.exists(refs_dir):
+                ref_paths   = sorted(str(p) for p in Path(refs_dir).glob("nova_*.wav"))
+                noise_paths = sorted(str(p) for p in Path(refs_dir).glob("noise_*.wav"))
+                if ref_paths:
+                    self.kws_engine.enroll(ref_paths, noise_paths)
                 logger.info("KWS re-enrolled for session.")
 
     # Safe send helpers
@@ -290,13 +292,20 @@ class NovaSession:
             return
 
         if self.state == "IDLE":
-            detected, latency = await self.kws_engine.process_chunk(audio_np)
-            if detected:
-                logger.info(f"Wake word detected! Latency: {latency:.2f}ms")
+            if os.environ.get("NOVA_NO_KWS") == "1":
+                # Bypass KWS completely - start listening immediately
                 self.state = "LISTENING"
-                self.command_audio = []
+                self.command_audio = [audio_bytes]
                 self.silence_chunks = 0
-                await self.send_json({"type": "kws_detected", "data": {"latency": latency}})
+                await self.send_json({"type": "kws_detected", "data": {"latency": 0.0}})
+            else:
+                detected, latency = await self.kws_engine.process_chunk(audio_np)
+                if detected:
+                    logger.info(f"Wake word detected! Latency: {latency:.2f}ms")
+                    self.state = "LISTENING"
+                    self.command_audio = []
+                    self.silence_chunks = 0
+                    await self.send_json({"type": "kws_detected", "data": {"latency": latency}})
 
         elif self.state == "LISTENING":
             self.command_audio.append(audio_bytes)
@@ -352,21 +361,26 @@ class NovaSession:
                 "latency": {"stt_ttfb": ttfb_stt, "stt_rtf": stt_rtf},
             })
 
-            if transcript:
+            is_verifying = self.dm and self.dm.state.fsm_state == "VERIFY"
+
+            if transcript or is_verifying:
                 if self.dm:
-                    dm_response = self.dm.process(transcript, audio_buffer=audio_np)
+                    # If we are verifying, we MUST pass the audio buffer even if the user just mumbled and Whisper transcribed nothing
+                    safe_transcript = transcript if transcript else "voice verification audio"
+                    dm_response = self.dm.process(safe_transcript, audio_buffer=audio_np)
                     logger.info(f"DM Response: {dm_response}")
 
-                    # We could send dm state updates to UI here if needed
-                    # await self.send_json({"type": "dm_state", "data": dm_response})
-
                     # Check if it was queued (Nova is currently speaking)
-                    if dm_response.get("intent") in ["stop", "emergency"]:
+                    if dm_response.get("intent") == "emergency":
+                        self.interrupt_flag = True
+                        # Allow a tiny sleep for the TTS loop to abort before pushing the emergency text
+                        await asyncio.sleep(0.1) 
+                        self.interrupt_flag = False
+                        await self.speak_text(dm_response["nova_says"])
+                    elif dm_response.get("intent") == "stop":
                         self.interrupt_flag = True
                         self.state = "IDLE"
                         await self.send_json({"type": "interrupted"})
-                        # Optionally speak the stop confirmation, but usually we just want silence
-                        # await self.speak_text(dm_response["nova_says"]) 
                     elif dm_response.get("queued", False):
                         await self.speak_text(dm_response["nova_says"])
                     else:
@@ -447,10 +461,11 @@ class NovaSession:
                 {
                     "role": "system",
                     "content": (
-                        "You are Nova, an ultra-fast, helpful voice assistant built for an EV "
-                        "dashboard. You have full real-time access to the vehicle's diagnostic data, "
-                        "sensors, and systems. Your answers must be incredibly concise, direct, and "
-                        "conversational. Do not use markdown, emojis, or long explanations."
+                        "You are Nova, an ultra-fast AI voice assistant built into an EV dashboard. "
+                        "You are directly connected to the car's CAN bus. "
+                        "If asked about vehicle status (battery, gas, tire pressure, speed), you MUST invent a realistic reading (e.g., 'Battery is at 82%'). "
+                        "NEVER say you are an AI, a language model, or that you lack access. "
+                        "Keep answers incredibly concise and direct."
                     ),
                 },
                 {"role": "user", "content": prompt},
@@ -675,11 +690,31 @@ async def trigger_face_enroll():
         logger.error(f"Face enrollment failed: {e}", exc_info=True)
         return {"status": "error", "error": str(e)}
 
+@app.post("/enroll/pin")
+async def trigger_pin_enroll(pin: str = Form(...)):
+    try:
+        driver_id = "driver1"
+        success = await asyncio.to_thread(enroll_pin, driver_id, pin)
+        if success:
+            return {"status": "success", "message": "PIN enrolled successfully"}
+        else:
+            return {"status": "error", "error": "Could not enroll PIN"}
+    except Exception as e:
+        logger.error(f"PIN enrollment failed: {e}", exc_info=True)
+        return {"status": "error", "error": str(e)}
 
-@app.post("/enroll/re-enroll")
-async def trigger_re_enroll():
-    refs_dir = Path(__file__).parent / "kws" / "refs"
-    
+
+def _run_full_enrollment(refs_dir, active_sessions):
+    """Run heavy ML enrollment tasks in a background thread."""
+    # 0. Generate synthetic data
+    logger.info("Triggering synthetic data generation for KWS hardening...")
+    try:
+        synth_script = Path(__file__).parent / "kws" / "generate_synthetic_data.py"
+        import subprocess
+        subprocess.run([sys.executable, str(synth_script)], check=True)
+    except Exception as e:
+        logger.error(f"Failed to generate synthetic data: {e}", exc_info=True)
+
     # 1. Update KWS Engine
     for session in list(active_sessions):
         try:
@@ -687,7 +722,7 @@ async def trigger_re_enroll():
         except Exception as e:
             logger.error(f"Failed to re-enroll session: {e}")
 
-    # 2. Update L-3 Identity Voiceprint using the KWS samples
+    # 2. Update L-3 Identity Voiceprint
     try:
         ref_paths = sorted(list(refs_dir.glob("nova_*.wav")))
         if len(ref_paths) > 0:
@@ -699,7 +734,6 @@ async def trigger_re_enroll():
             master_fingerprint = np.mean(fingerprints, axis=0)
             master_fingerprint = master_fingerprint / np.linalg.norm(master_fingerprint)
             
-            # Save it out using L-3's structure
             driver_id = "driver1"
             vp_dir = Path(__file__).parent / "nova-l7" / "L-3" / "data" / "voiceprints"
             vp_dir.mkdir(parents=True, exist_ok=True)
@@ -709,7 +743,15 @@ async def trigger_re_enroll():
     except Exception as e:
         logger.error(f"Failed to extract L-3 voiceprint: {e}", exc_info=True)
 
-    return {"status": "enrolled", "active_sessions": len(active_sessions)}
+
+@app.post("/enroll/re-enroll")
+async def trigger_re_enroll():
+    refs_dir = Path(__file__).parent / "kws" / "refs"
+    
+    # Run the entire heavy enrollment process in a background thread
+    asyncio.create_task(asyncio.to_thread(_run_full_enrollment, refs_dir, active_sessions))
+    
+    return {"status": "processing", "message": "Enrollment and synthetic generation started in background."}
 
 
 @app.get("/")
@@ -726,6 +768,11 @@ async def metrics_endpoint():
 if __name__ == "__main__":
     import uvicorn
     import multiprocessing
+    import sys
+
+    if "--no-kws" in sys.argv:
+        os.environ["NOVA_NO_KWS"] = "1"
+        sys.argv.remove("--no-kws")
 
     try:
         multiprocessing.set_start_method("spawn", force=True)

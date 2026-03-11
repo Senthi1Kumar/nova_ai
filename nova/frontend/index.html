@@ -109,9 +109,14 @@
                                tracking-widest hover:bg-[#00ffcc]/20 transition-all relative overflow-hidden">
                         <span id="face-btn-text" class="relative z-10">RECORD FACE ID</span>
                     </button>
+                    <button id="record-pin-btn"
+                        class="flex-1 border border-[#00ffcc] text-[#00ffcc] py-2 rounded text-[10px]
+                               tracking-widest hover:bg-[#00ffcc]/20 transition-all relative overflow-hidden">
+                        <span id="pin-btn-text" class="relative z-10">SET 4-DIGIT PIN</span>
+                    </button>
                 </div>
                 <p id="enroll-status" class="text-[9px] opacity-40 italic">
-                    Record 5 wake-word/noise samples + 1 Face ID for best accuracy.
+                    Record 5 wake-word/noise samples, 1 Face ID, and a PIN for best accuracy.
                 </p>
             </div>
         </div>
@@ -557,6 +562,39 @@
                 btn.classList.add('opacity-50');
             } else {
                 btnText.textContent = 'FACE ID FAILED ❌';
+                document.getElementById('enroll-status').textContent = 'Failed: ' + data.error;
+                btn.disabled = false;
+            }
+        } catch (err) {
+            btnText.textContent = 'ERROR ❌';
+            document.getElementById('enroll-status').textContent = 'Server connection error.';
+            btn.disabled = false;
+        }
+    };
+    document.getElementById('record-pin-btn').onclick = async (e) => {
+        const pin = prompt("Enter a 4-digit PIN to set as your Voice Fallback:");
+        if (!pin || !/^\d{4}$/.test(pin)) {
+            alert("Please enter exactly 4 digits.");
+            return;
+        }
+        
+        const btn = e.currentTarget;
+        const btnText = document.getElementById('pin-btn-text');
+        btn.disabled = true;
+        btnText.textContent = 'SAVING PIN...';
+        
+        const fd = new FormData();
+        fd.append('pin', pin);
+        
+        try {
+            const res = await fetch('/enroll/pin', { method: 'POST', body: fd });
+            const data = await res.json();
+            if (data.status === 'success') {
+                btnText.textContent = 'PIN ENROLLED ✓';
+                document.getElementById('enroll-status').textContent = 'PIN enrollment complete.';
+                btn.classList.add('opacity-50');
+            } else {
+                btnText.textContent = 'PIN FAILED ❌';
                 document.getElementById('enroll-status').textContent = 'Failed: ' + data.error;
                 btn.disabled = false;
             }
