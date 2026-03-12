@@ -409,6 +409,20 @@ class NovaSession:
                     dm_response = self.dm.process(safe_transcript, audio_buffer=audio_np)
                     logger.info(f"DM Response: {dm_response}")
 
+                    # Broadcast state to UI so it can show driver name, warnings, and states
+                    await self.send_json({
+                        "type": "dm_state", 
+                        "data": {
+                            "fsm_state": dm_response.get("fsm_state"),
+                            "intent": dm_response.get("intent"),
+                            "routing": dm_response.get("routing"),
+                            "entities": dm_response.get("entities"),
+                            "otp": dm_response.get("otp"),
+                            "driver_name": dm_response.get("driver_name"),
+                            "session_warning": dm_response.get("session_warning"),
+                        }
+                    })
+
                     # Check if it was queued (Nova is currently speaking)
                     if dm_response.get("intent") == "emergency":
                         self.interrupt_flag = True

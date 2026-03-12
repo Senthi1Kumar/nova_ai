@@ -9,8 +9,9 @@ wheels/
 # Virtual environments
 .venv
 
-# Audio
+# KWS
 nova/backend/kws/refs/*.wav
+nova/backend/kws/models/
 
 # Logs
 *.log
@@ -20,3 +21,6 @@ nova/backend/kws/refs/*.wav
 
 # Env vars
 .env
+
+# Gemini
+.gemini/
