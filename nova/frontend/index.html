@@ -199,6 +199,10 @@
                         <span class="opacity-50 tracking-wider">LLM TTFT</span>
                         <span id="llm-latency">-- ms</span>
                     </div>
+                    <div class="flex justify-between pl-3">
+                        <span class="opacity-30 tracking-wider">└ THPT</span>
+                        <span id="llm-throughput" class="opacity-60">-- t/s</span>
+                    </div>
                     <div class="flex justify-between">
                         <span class="opacity-50 tracking-wider">TTS TTFA</span>
                         <span id="tts-latency">-- ms</span>
@@ -214,21 +218,33 @@
                     </div>
                 </div>
 
-                <!-- Voice select -->
-                <div class="mt-4 flex-shrink-0">
-                    <p class="text-[9px] opacity-40 tracking-widest mb-1">TTS VOICE</p>
-                    <select id="voice-select"
-                        class="w-full bg-black border border-[#00ffcc]/40 text-[#00ffcc]
-                               text-[10px] p-2 rounded outline-none tracking-wider">
-                        <option value="alba"    selected>Alba</option>
-                        <option value="marius"  >Marius</option>
-                        <option value="javert"  >Javert</option>
-                        <option value="jean"    >Jean</option>
-                        <option value="fantine" >Fantine</option>
-                        <option value="cosette" >Cosette</option>
-                        <option value="eponine" >Eponine</option>
-                        <option value="azelma"  >Azelma</option>
-                    </select>
+                <!-- Options select -->
+                <div class="mt-4 flex-shrink-0 flex gap-2">
+                    <div class="flex-1">
+                        <p class="text-[9px] opacity-40 tracking-widest mb-1">TTS VOICE</p>
+                        <select id="voice-select"
+                            class="w-full bg-black border border-[#00ffcc]/40 text-[#00ffcc]
+                                   text-[10px] p-2 rounded outline-none tracking-wider">
+                            <option value="alba"    selected>Alba</option>
+                            <option value="marius"  >Marius</option>
+                            <option value="javert"  >Javert</option>
+                            <option value="jean"    >Jean</option>
+                            <option value="fantine" >Fantine</option>
+                            <option value="cosette" >Cosette</option>
+                            <option value="eponine" >Eponine</option>
+                            <option value="azelma"  >Azelma</option>
+                        </select>
+                    </div>
+                    <div class="flex-1">
+                        <p class="text-[9px] opacity-40 tracking-widest mb-1">LLM MODEL</p>
+                        <select id="llm-select"
+                            class="w-full bg-black border border-[#00ffcc]/40 text-[#00ffcc]
+                                   text-[10px] p-2 rounded outline-none tracking-wider">
+                            <option value="qwen/qwen3.5-9b" selected>Qwen 3.5 9B</option>
+                            <option value="meta-llama/llama-3.1-8b-instruct">Llama 3.1 8B</option>
+                            <option value="arcee-ai/trinity-large-preview:free">Trinity Large</option>
+                        </select>
+                    </div>
                 </div>
             </div>
 
@@ -425,6 +441,9 @@
                 if (msg.latency?.llm_ttft)
                     document.getElementById('llm-latency').textContent =
                         `${(msg.latency.llm_ttft * 1000).toFixed(0)} ms`;
+                if (msg.latency?.llm_throughput)
+                    document.getElementById('llm-throughput').textContent =
+                        `${(msg.latency.llm_throughput).toFixed(1)} t/s`;
                 break;
 
             case 'tts_metrics':
@@ -477,6 +496,10 @@
     document.getElementById('voice-select').onchange = (e) =>
         ws?.readyState === WebSocket.OPEN &&
         ws.send(JSON.stringify({ type: 'change_voice', data: e.target.value }));
+
+    document.getElementById('llm-select').onchange = (e) =>
+        ws?.readyState === WebSocket.OPEN &&
+        ws.send(JSON.stringify({ type: 'change_llm', data: e.target.value }));
 
     // ── enrollment ────────────────────────────────────────────────────────────
     async function recordSample(type, limit, btn) {

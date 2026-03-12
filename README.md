@@ -39,7 +39,7 @@ Nova includes a built-in enrollment UI to calibrate the wake-word engine to your
 
 ## 📋 Prerequisites
 
-- **OS**: Linux (Ubuntu recommended)
+- **OS**: Linux
 - **Hardware**: NVIDIA GPU with >= 4GB VRAM
 - **Python**: 3.12+
 - **Tools**: [uv](https://docs.astral.sh/uv/)
@@ -56,14 +56,22 @@ Nova includes a built-in enrollment UI to calibrate the wake-word engine to your
    git submodule update --init --recursive
    ```
 
-2. **Patch pocket-tts submodule**:
+2. **Set OpenRouter API Key in `.env` file**
+
+   ```bash
+   cp .env.example .env
+   ```
+
+   Edit the `.env` file and add your OpenRouter API key.
+
+3. **Patch pocket-tts submodule**:
    The `pocket-tts` submodule defaults to install CPU versions of PyTorch. Run this patch script to force CUDA compatibility before installing dependencies:
 
    ```bash
    ./patch_pocket-tts_submodule.sh
    ```
 
-3. **Install Dependencies and activate `.venv`**:
+4. **Install Dependencies and activate `.venv`**:
 
    ```bash
    uv sync --prerelease=allow
@@ -71,13 +79,13 @@ Nova includes a built-in enrollment UI to calibrate the wake-word engine to your
    .venv\Scripts\activate  # for windows
    ```
 
-4. **Start Nova**:
+5. **Start Nova**:
 
    ```bash
    uv run nova/backend/main.py
    ```
 
-5. **Access Dashboard**:
+6. **Access Dashboard**:
    Navigate to `http://localhost:8000` and enable **"ALWAYS LISTENING"**.
 
 ## 🏗 Directory Structure

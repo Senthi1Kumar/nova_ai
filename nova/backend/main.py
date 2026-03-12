@@ -10,6 +10,8 @@ import re
 import random
 from pathlib import Path
 from contextlib import asynccontextmanager
+from warnings import filterwarnings
+from dotenv import load_dotenv
 
 import numpy as np
 import torch
@@ -28,6 +30,11 @@ from transformers import (
     BitsAndBytesConfig,
 )
 from pocket_tts import TTSModel
+from ddgs import DDGS
+
+filterwarnings("ignore")
+
+load_dotenv()
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from kws.kws_engine import StreamingKWS
@@ -55,9 +62,11 @@ logger = logging.getLogger("nova-backend")
 stt_model = None
 llm_model = None
 llm_tokenizer = None
+openai_client = None
 tts_model = None
 voice_catalog = {}
 current_voice_name = "alba"
+current_llm_name = "qwen/qwen3.5-9b"
 shared_vad_model = None
 shared_kws_model = None
 active_sessions = set()
@@ -69,6 +78,7 @@ async def lifespan(app: FastAPI):
         stt_model, \
         llm_model, \
         llm_tokenizer, \
+        openai_client, \
         tts_model, \
         voice_catalog, \
         shared_vad_model, \
@@ -77,36 +87,43 @@ async def lifespan(app: FastAPI):
     primary_model = "Qwen/Qwen3.5-0.8B"
     fallback_model = "unsloth/SmolLM2-1.7B-Instruct-bnb-4bit"
 
-    logger.info(
-        f"Loading models (FastAPI WebSocket + Faster-Whisper + {primary_model} "
-        f"and {fallback_model} fallback)..."
-    )
+    logger.info("Loading models (FastAPI WebSocket + Faster-Whisper + OpenRouter/Local LLM)...")
 
     # 1. STT
-    stt_model = WhisperModel("small", device="cuda", compute_type="float16")
+    stt_model = WhisperModel("distil-large-v3", device="cuda", compute_type="float16")
 
     # 2. LLM
-    bnb_config = BitsAndBytesConfig(
-        load_in_4bit=True,
-        bnb_4bit_use_double_quant=True,
-        bnb_4bit_quant_type="nf4",
-        bnb_4bit_compute_dtype=torch.float16,
-    )
-    try:
-        logger.info(f"Attempting to load primary model: {primary_model}")
-        llm_tokenizer = AutoTokenizer.from_pretrained(primary_model)
-        llm_model = AutoModelForCausalLM.from_pretrained(
-            primary_model, quantization_config=bnb_config, device_map="auto"
+    api_key = os.environ.get("OPENROUTER_API_KEY")
+    if api_key:
+        from openai import AsyncOpenAI
+        openai_client = AsyncOpenAI(
+            base_url="https://openrouter.ai/api/v1",
+            api_key=api_key,
         )
-        logger.info(f"Primary model loaded successfully: {primary_model}")
-    except Exception as e:
-        logger.error(
-            f"Failed to load primary model: {e}. Falling back to {fallback_model}."
+        logger.info("OpenRouter AsyncOpenAI client initialized. Skipping local LLM loading.")
+    else:
+        logger.warning("OPENROUTER_API_KEY not found. Loading local models...")
+        bnb_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_use_double_quant=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=torch.float16,
         )
-        llm_tokenizer = AutoTokenizer.from_pretrained(fallback_model)
-        llm_model = AutoModelForCausalLM.from_pretrained(
-            fallback_model, quantization_config=bnb_config, device_map="auto"
-        )
+        try:
+            logger.info(f"Attempting to load primary model: {primary_model}")
+            llm_tokenizer = AutoTokenizer.from_pretrained(primary_model)
+            llm_model = AutoModelForCausalLM.from_pretrained(
+                primary_model, quantization_config=bnb_config, device_map="auto"
+            )
+            logger.info(f"Primary model loaded successfully: {primary_model}")
+        except Exception as e:
+            logger.error(
+                f"Failed to load primary model: {e}. Falling back to {fallback_model}."
+            )
+            llm_tokenizer = AutoTokenizer.from_pretrained(fallback_model)
+            llm_model = AutoModelForCausalLM.from_pretrained(
+                fallback_model, quantization_config=bnb_config, device_map="auto"
+            )
 
     # 3. TTS
     tts_model = TTSModel.load_model().to("cuda" if torch.cuda.is_available() else "cpu")
@@ -158,7 +175,7 @@ def get_metrics():
             pass
 
     stt_vram = 480 + random.randint(-5, 5)
-    llm_vram = 600 + random.randint(-10, 10)
+    llm_vram = 0 if openai_client else (600 + random.randint(-10, 10))
     tts_vram = 1200 + random.randint(-15, 15)
     kws_vram = 15 + random.randint(-1, 1)
     stt_wer  = round(4.5  + random.uniform(-0.3, 0.3), 2)
@@ -181,11 +198,11 @@ def get_metrics():
                 "wer": f"{stt_wer}%",
             },
             "llm": {
-                "name": "SmolLM2-1.7B (4-bit)",
+                "name": current_llm_name if openai_client else "SmolLM2-1.7B (4-bit)",
                 "vram_mb": llm_vram,
-                "load": random.choice(["Med", "Med", "High"]),
-                "accuracy": f"{llm_acc}%",
-                "f1": str(llm_f1),
+                "load": "API" if openai_client else random.choice(["Med", "Med", "High"]),
+                "accuracy": f"{llm_acc}%" if not openai_client else "N/A",
+                "f1": str(llm_f1) if not openai_client else "N/A",
             },
             "tts": {
                 "name": "Pocket-TTS",
@@ -205,6 +222,28 @@ def get_metrics():
 
 
 # Session
+def search_text(query: str) -> str:
+    try:
+        results = DDGS().text(query, max_results=3)
+        return json.dumps(results)
+    except Exception as e:
+        return f"Text search failed: {e}"
+
+def search_news(query: str) -> str:
+    try:
+        results = DDGS().news(query, max_results=3)
+        return json.dumps(results)
+    except Exception as e:
+        return f"News search failed: {e}"
+
+def search_books(query: str) -> str:
+    try:
+        results = DDGS().books(query, max_results=3)
+        return json.dumps(results)
+    except Exception as e:
+        return f"Books search failed: {e}"
+
+
 class NovaSession:
     def __init__(self, websocket: WebSocket):
         self.websocket = websocket
@@ -335,8 +374,8 @@ class NovaSession:
             segments, _ = stt_model.transcribe(
                 audio_np,
                 beam_size=5,
-                # vad_filter=True,
-                # vad_parameters={"min_silence_duration_ms": 1000, "speech_pad_ms": 400},
+                vad_filter=True,
+                vad_parameters={"min_silence_duration_ms": 1000, "speech_pad_ms": 400},
                 language="en",
             )
             segments     = list(segments)
@@ -430,7 +469,7 @@ class NovaSession:
                 self.dm.speaking_started()
                 
             await self.send_json({"type": "assistant_start"})
-            await self.send_json({"type": "llm_token", "data": text, "latency": {}})
+            await self.send_json({"type": "llm_token", "data": text, "latency": {"llm_ttft": 0.05, "llm_throughput": 0.0}})
             
             tts_queue = asyncio.Queue()
             tts_task = asyncio.create_task(self.tts_worker(tts_queue))
@@ -455,6 +494,7 @@ class NovaSession:
 
     async def generate_response(self, prompt: str):
         try:
+            global current_llm_name
             if self.dm:
                 self.dm.speaking_started()
             messages = [
@@ -470,59 +510,241 @@ class NovaSession:
                 },
                 {"role": "user", "content": prompt},
             ]
-            text_prompt = llm_tokenizer.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True
-            )
-            inputs = llm_tokenizer(
-                text_prompt, return_tensors="pt", add_special_tokens=False
-            ).to("cuda")
-
-            streamer = TextIteratorStreamer(
-                llm_tokenizer, skip_prompt=True, skip_special_tokens=True
-            )
-            generation_kwargs = dict(
-                **inputs,
-                streamer=streamer,
-                max_new_tokens=128,
-                temperature=0.7,
-                top_p=0.8,
-                repetition_penalty=1.0,
-            )
-            threading.Thread(target=llm_model.generate, kwargs=generation_kwargs).start()
-
+            
             await self.send_json({"type": "assistant_start"})
-
-            sentence_buffer = ""
             start_time = time.time()
             ttft_llm = None
             is_thinking = False
-
+            sentence_buffer = ""
             tts_queue = asyncio.Queue()
             tts_task = asyncio.create_task(self.tts_worker(tts_queue))
+            tokens_count = 0
 
-            for new_text in streamer:
-                if self.interrupt_flag:
-                    break
-                if ttft_llm is None:
-                    ttft_llm = time.time() - start_time
-                await self.send_json({
-                    "type": "llm_token",
-                    "data": new_text,
-                    "latency": {"llm_ttft": ttft_llm},
-                })
+            tools = [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "search_text",
+                        "description": "Perform a general web search for facts, weather, or websites.",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "query": {"type": "string", "description": "The text to search for"}
+                            },
+                            "required": ["query"],
+                        },
+                    },
+                },
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "search_news",
+                        "description": "Search for the latest breaking news and recently published articles.",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "query": {"type": "string", "description": "The news topic to search for"}
+                            },
+                            "required": ["query"],
+                        },
+                    },
+                },
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "search_books",
+                        "description": "Search the web for books, authors, or literary references.",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "query": {"type": "string", "description": "The book, title, or author to look up"}
+                            },
+                            "required": ["query"],
+                        },
+                    },
+                }
+            ]
 
-                if "<think>" in new_text:
-                    is_thinking = True
-                if not is_thinking:
-                    sentence_buffer += new_text
-                    if any(p in new_text for p in [".", "!", "?", "\n", ","]):
-                        clean = self.clean_for_tts(sentence_buffer)
-                        if clean:
-                            tts_queue.put_nowait(clean)
+            if openai_client:
+                stream = await openai_client.chat.completions.create(
+                    model=current_llm_name,
+                    messages=messages,
+                    stream=True,
+                    tools=tools,
+                    stream_options={"include_usage": True}
+                )
+                
+                tool_calls_buffer = {}
+                async for chunk in stream:
+                    if self.interrupt_flag:
+                        break
+                        
+                    delta = chunk.choices[0].delta if chunk.choices else None
+                    if not delta:
+                        continue
+                        
+                    if delta.tool_calls:
+                        for tool_call in delta.tool_calls:
+                            idx = tool_call.index
+                            if idx not in tool_calls_buffer:
+                                tool_calls_buffer[idx] = {"id": tool_call.id, "function": {"name": tool_call.function.name, "arguments": ""}}
+                            if tool_call.function.arguments:
+                                tool_calls_buffer[idx]["function"]["arguments"] += tool_call.function.arguments
+                        continue
+                        
+                    content = delta.content
+                    if content:
+                        tokens_count += 1
+                        if ttft_llm is None:
+                            ttft_llm = time.time() - start_time
+                        
+                        latency_data = {"llm_ttft": ttft_llm}
+                        elapsed = time.time() - (start_time + ttft_llm)
+                        if elapsed > 0:
+                            latency_data["llm_throughput"] = tokens_count / elapsed
+
+                        await self.send_json({
+                            "type": "llm_token",
+                            "data": content,
+                            "latency": latency_data,
+                        })
+
+                        if "<think>" in content:
+                            is_thinking = True
+                        if not is_thinking:
+                            sentence_buffer += content
+                            if any(p in content for p in [".", "!", "?", "\n", ","]):
+                                clean = self.clean_for_tts(sentence_buffer)
+                                if clean:
+                                    tts_queue.put_nowait(clean)
+                                sentence_buffer = ""
+                        if "</think>" in content:
+                            is_thinking = False
+                            sentence_buffer = ""
+                            
+                # Handle tool executions if any
+                if tool_calls_buffer and not self.interrupt_flag:
+                    # Append assistant's tool calls to messages
+                    messages.append({
+                        "role": "assistant", 
+                        "tool_calls": [
+                            {"id": tc["id"], "type": "function", "function": {"name": tc["function"]["name"], "arguments": tc["function"]["arguments"]}} 
+                            for tc in tool_calls_buffer.values()
+                        ]
+                    })
+                    
+                    for tc in tool_calls_buffer.values():
+                        func_name = tc["function"]["name"]
+                        try:
+                            args = json.loads(tc["function"]["arguments"])
+                            if func_name == "search_text":
+                                result = search_text(args["query"])
+                            elif func_name == "search_news":
+                                result = search_news(args["query"])
+                            elif func_name == "search_books":
+                                result = search_books(args["query"])
+                            else:
+                                result = f"Unknown function: {func_name}"
+                        except Exception as e:
+                            result = f"Error executing tool: {e}"
+                            
+                        messages.append({
+                            "role": "tool",
+                            "tool_call_id": tc["id"],
+                            "name": func_name,
+                            "content": result
+                        })
+                        
+                    # Request final stream after tools
+                    stream2 = await openai_client.chat.completions.create(
+                        model=current_llm_name,
+                        messages=messages,
+                        stream=True,
+                        stream_options={"include_usage": True}
+                    )
+                    async for chunk in stream2:
+                        if self.interrupt_flag:
+                            break
+                        content = chunk.choices[0].delta.content if chunk.choices else None
+                        if content:
+                            tokens_count += 1
+                            if ttft_llm is None:
+                                ttft_llm = time.time() - start_time
+                            
+                            latency_data = {"llm_ttft": ttft_llm}
+                            elapsed = time.time() - (start_time + ttft_llm)
+                            if elapsed > 0:
+                                latency_data["llm_throughput"] = tokens_count / elapsed
+
+                            await self.send_json({
+                                "type": "llm_token",
+                                "data": content,
+                                "latency": latency_data,
+                            })
+
+                            if "<think>" in content:
+                                is_thinking = True
+                            if not is_thinking:
+                                sentence_buffer += content
+                                if any(p in content for p in [".", "!", "?", "\n", ","]):
+                                    clean = self.clean_for_tts(sentence_buffer)
+                                    if clean:
+                                        tts_queue.put_nowait(clean)
+                                    sentence_buffer = ""
+                            if "</think>" in content:
+                                is_thinking = False
+                                sentence_buffer = ""
+            else:
+                text_prompt = llm_tokenizer.apply_chat_template(
+                    messages, tokenize=False, add_generation_prompt=True
+                )
+                inputs = llm_tokenizer(
+                    text_prompt, return_tensors="pt", add_special_tokens=False
+                ).to("cuda")
+
+                streamer = TextIteratorStreamer(
+                    llm_tokenizer, skip_prompt=True, skip_special_tokens=True
+                )
+                generation_kwargs = dict(
+                    **inputs,
+                    streamer=streamer,
+                    max_new_tokens=128,
+                    temperature=0.7,
+                    top_p=0.8,
+                    repetition_penalty=1.0,
+                )
+                threading.Thread(target=llm_model.generate, kwargs=generation_kwargs).start()
+
+                for new_text in streamer:
+                    if self.interrupt_flag:
+                        break
+                    tokens_count += 1
+                    if ttft_llm is None:
+                        ttft_llm = time.time() - start_time
+                    
+                    latency_data = {"llm_ttft": ttft_llm}
+                    elapsed = time.time() - (start_time + ttft_llm)
+                    if elapsed > 0:
+                        latency_data["llm_throughput"] = tokens_count / elapsed
+
+                    await self.send_json({
+                        "type": "llm_token",
+                        "data": new_text,
+                        "latency": latency_data,
+                    })
+
+                    if "<think>" in new_text:
+                        is_thinking = True
+                    if not is_thinking:
+                        sentence_buffer += new_text
+                        if any(p in new_text for p in [".", "!", "?", "\n", ","]):
+                            clean = self.clean_for_tts(sentence_buffer)
+                            if clean:
+                                tts_queue.put_nowait(clean)
+                            sentence_buffer = ""
+                    if "</think>" in new_text:
+                        is_thinking = False
                         sentence_buffer = ""
-                if "</think>" in new_text:
-                    is_thinking = False
-                    sentence_buffer = ""
 
             if not self.interrupt_flag:
                 final_clean = self.clean_for_tts(sentence_buffer)
@@ -643,6 +865,10 @@ async def websocket_endpoint(websocket: WebSocket):
                     global current_voice_name
                     current_voice_name = msg["data"]
                     await session.send_json({"type": "voice_changed", "data": current_voice_name})
+                elif msg["type"] == "change_llm":
+                    global current_llm_name
+                    current_llm_name = msg["data"]
+                    await session.send_json({"type": "llm_changed", "data": current_llm_name})
     except (WebSocketDisconnect, RuntimeError) as e:
         logger.info(f"WebSocket closed: {e}")
     finally:
