@@ -54,6 +54,13 @@ class VADHandler(BaseHandler):
             self.command_audio = []
             return
 
+        if isinstance(audio_bytes, dict) and audio_bytes.get("type") == "generation_done":
+            self.state = audio_bytes.get("next_state", "IDLE")
+            if self.state == "LISTENING":
+                self.command_audio = []
+                self.silence_chunks = 0
+            return
+
         if not isinstance(audio_bytes, bytes):
             return
 
