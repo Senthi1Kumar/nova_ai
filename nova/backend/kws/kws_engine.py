@@ -95,7 +95,7 @@ def dtw_cosine_distance(seq1: np.ndarray, seq2: np.ndarray) -> float:
 
 
 def max_cosine_similarity(test_frames: np.ndarray, ref_frames: np.ndarray) -> float:
-    """Max cosine similarity between any frame pair (mirrors kws_classifier.py)."""
+    """Max cosine similarity between any frame pair."""
     tn = _normalize_rows(test_frames)
     rn = _normalize_rows(ref_frames)
     return float(np.max(np.dot(tn, rn.T)))
@@ -281,12 +281,9 @@ class StreamingKWS:
             
             # Initialize and load MLP
             embedding_dim = self.ref_means[0].shape[0]
-            self.mlp = nn.Sequential(
-                nn.Linear(embedding_dim, 64),
-                nn.ReLU(),
-                nn.Dropout(0.2),
-                nn.Linear(64, 2)
-            ).to("cuda" if torch.cuda.is_available() else "cpu")
+            self.mlp = WakeWordClassifier(embedding_dim, hidden_dims=[64], dropout=0.3).to(
+                "cuda" if torch.cuda.is_available() else "cpu"
+            )
             self.mlp.load_state_dict(torch.load(save_dir / "mlp_weights.pth"))
             self.mlp.eval()
             print("[KWS] Loaded pre-trained KWS model from disk.")

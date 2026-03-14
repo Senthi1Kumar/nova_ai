@@ -37,7 +37,11 @@ filterwarnings("ignore")
 load_dotenv()
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-from kws.kws_engine import StreamingKWS
+# from kws.kws_engine import StreamingKWS
+from kws.kws_engine_v2 import StreamingKWSv2 as StreamingKWS
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("Nova-backend")
 
 L7_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "nova-l7", "L-7")
 sys.path.append(L7_PATH)
@@ -55,9 +59,6 @@ try:
     from enroll import enroll_face, enroll_pin
 except ImportError as e:
     logger.error(f"Failed to import L3 Crypto/Verify/Enroll: {e}")
-
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("nova-backend")
 
 stt_model = None
 llm_model = None
