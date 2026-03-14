@@ -90,8 +90,13 @@ async def lifespan(app: FastAPI):
 
     logger.info("Loading models (FastAPI WebSocket + Faster-Whisper + OpenRouter/Local LLM)...")
 
-    # 1. STT
-    stt_model = WhisperModel("distil-large-v3", device="cuda", compute_type="float16")
+    # 1. STT — Faster-Whisper distil-large-v3
+    stt_model = WhisperModel(
+        "distil-large-v3",
+        device="cuda" if torch.cuda.is_available() else "cpu",
+        compute_type="float16" if torch.cuda.is_available() else "int8",
+    )
+    logger.info("Faster-Whisper distil-large-v3 loaded successfully.")
 
     # 2. LLM
     api_key = os.environ.get("OPENROUTER_API_KEY")
@@ -101,30 +106,34 @@ async def lifespan(app: FastAPI):
             base_url="https://openrouter.ai/api/v1",
             api_key=api_key,
         )
-        logger.info("OpenRouter AsyncOpenAI client initialized. Skipping local LLM loading.")
-    else:
-        logger.warning("OPENROUTER_API_KEY not found. Loading local models...")
-        bnb_config = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_use_double_quant=True,
-            bnb_4bit_quant_type="nf4",
-            bnb_4bit_compute_dtype=torch.float16,
+        logger.info("OpenRouter AsyncOpenAI client initialized.")
+
+    # Always load local LLM as fallback (or primary if no API key)
+    bnb_config = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_use_double_quant=True,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_compute_dtype=torch.float16,
+    )
+    try:
+        logger.info(f"Loading local fallback model: {primary_model}")
+        llm_tokenizer = AutoTokenizer.from_pretrained(primary_model)
+        llm_model = AutoModelForCausalLM.from_pretrained(
+            primary_model, quantization_config=bnb_config, device_map="auto"
+        )
+        logger.info(f"Local model loaded: {primary_model}")
+    except Exception as e:
+        logger.error(
+            f"Failed to load primary model: {e}. Falling back to {fallback_model}."
         )
         try:
-            logger.info(f"Attempting to load primary model: {primary_model}")
-            llm_tokenizer = AutoTokenizer.from_pretrained(primary_model)
-            llm_model = AutoModelForCausalLM.from_pretrained(
-                primary_model, quantization_config=bnb_config, device_map="auto"
-            )
-            logger.info(f"Primary model loaded successfully: {primary_model}")
-        except Exception as e:
-            logger.error(
-                f"Failed to load primary model: {e}. Falling back to {fallback_model}."
-            )
             llm_tokenizer = AutoTokenizer.from_pretrained(fallback_model)
             llm_model = AutoModelForCausalLM.from_pretrained(
                 fallback_model, quantization_config=bnb_config, device_map="auto"
             )
+            logger.info(f"Fallback model loaded: {fallback_model}")
+        except Exception as e2:
+            logger.error(f"Failed to load fallback model too: {e2}")
 
     # 3. TTS
     tts_model = TTSModel.load_model().to("cuda" if torch.cuda.is_available() else "cpu")
@@ -193,7 +202,7 @@ def get_metrics():
         "gpu_util": gpu_util,
         "components": {
             "stt": {
-                "name": "Faster-Whisper (Small)",
+                "name": "Faster-Whisper (distil-large-v3)",
                 "vram_mb": stt_vram,
                 "load": random.choice(["Low", "Low", "Med"]),
                 "wer": f"{stt_wer}%",
@@ -253,7 +262,7 @@ class NovaSession:
 
         self.kws_engine = StreamingKWS(model_path=None)
         self.kws_engine.model = shared_kws_model
-        self.kws_engine.vad_model = shared_vad_model
+        # self.kws_engine.vad_model = shared_vad_model
         self.dm = DialogueManager() if DialogueManager else None
 
         refs_dir = os.path.join(os.path.dirname(__file__), "kws", "refs")
@@ -349,6 +358,7 @@ class NovaSession:
 
         elif self.state == "LISTENING":
             self.command_audio.append(audio_bytes)
+
             if not self.ptt_active:
                 if prob < 0.4:
                     self.silence_chunks += 1
@@ -375,8 +385,8 @@ class NovaSession:
             segments, _ = stt_model.transcribe(
                 audio_np,
                 beam_size=5,
-                vad_filter=True,
-                vad_parameters={"min_silence_duration_ms": 1000, "speech_pad_ms": 400},
+                # vad_filter=True,
+                # vad_parameters={"min_silence_duration_ms": 1000, "speech_pad_ms": 400},
                 language="en",
             )
             segments     = list(segments)
@@ -391,9 +401,12 @@ class NovaSession:
             )
             transcript = (
                 " ".join(s.text for s in segments).strip()
-                if avg_no_speech < 0.6
-                else ""
+                if avg_no_speech < 0.6 else ""
             )
+            
+            ttfb_stt = time.time() - t0
+            audio_dur = len(audio_np) / 16000.0
+            stt_rtf = ttfb_stt / audio_dur if audio_dur > 0 else 0
 
             await self.send_json({
                 "type": "transcript",
@@ -459,6 +472,13 @@ class NovaSession:
             if text is None:
                 break
             if self.interrupt_flag:
+                # Flush the entire queue if interrupted
+                while not queue.empty():
+                    try:
+                        queue.get_nowait()
+                        queue.task_done()
+                    except asyncio.QueueEmpty:
+                        break
                 continue
             await self.enqueue_tts(text)
 
@@ -520,7 +540,13 @@ class NovaSession:
                         "You are directly connected to the car's CAN bus. "
                         "If asked about vehicle status (battery, gas, tire pressure, speed), you MUST invent a realistic reading (e.g., 'Battery is at 82%'). "
                         "NEVER say you are an AI, a language model, or that you lack access. "
-                        "Keep answers incredibly concise and direct."
+                        "Keep answers incredibly concise and direct. "
+                        "You have access to real-time web search tools: "
+                        "use 'search_news' for current events, headlines, and breaking news; "
+                        "use 'search_text' for general facts, weather, and web lookups; "
+                        "use 'search_books' for book and literary references. "
+                        "ALWAYS use these tools when the user asks about news, weather, current events, or any real-world facts you are unsure about. "
+                        "Summarize the search results concisely for a driver."
                     ),
                 },
                 {"role": "user", "content": prompt},
@@ -580,7 +606,10 @@ class NovaSession:
                 }
             ]
 
-            if openai_client:
+            use_openrouter = openai_client is not None
+            
+            if use_openrouter:
+              try:
                 stream = await openai_client.chat.completions.create(
                     model=current_llm_name,
                     messages=messages,
@@ -709,9 +738,20 @@ class NovaSession:
                             if "</think>" in content:
                                 is_thinking = False
                                 sentence_buffer = ""
-            else:
+              except Exception as api_err:
+                logger.warning(f"OpenRouter failed ({api_err}), falling back to local LLM...")
+                use_openrouter = False  # Fall through to local below
+                # Reset state for local attempt
+                tokens_count = 0
+                ttft_llm = None
+                sentence_buffer = ""
+                start_time = time.time()
+            
+            if not use_openrouter:
+                # Strip any tool-related messages from a failed OpenRouter attempt
+                local_messages = [m for m in messages if m.get("role") in ("system", "user")]
                 text_prompt = llm_tokenizer.apply_chat_template(
-                    messages, tokenize=False, add_generation_prompt=True
+                    local_messages, tokenize=False, add_generation_prompt=True
                 )
                 inputs = llm_tokenizer(
                     text_prompt, return_tensors="pt", add_special_tokens=False
@@ -869,6 +909,7 @@ async def websocket_endpoint(websocket: WebSocket):
             elif "text" in data:
                 msg = json.loads(data["text"])
                 if msg["type"] == "start_ptt":
+                    session.interrupt_flag = True
                     session.ptt_active   = True
                     session.state        = "LISTENING"
                     session.command_audio = []
@@ -951,8 +992,16 @@ def _run_full_enrollment(refs_dir, active_sessions):
     logger.info("Triggering synthetic data generation for KWS hardening...")
     try:
         synth_script = Path(__file__).parent / "kws" / "generate_synthetic_data.py"
-        import subprocess
-        subprocess.run([sys.executable, str(synth_script)], check=True)
+        import subprocess, signal
+        # start_new_session isolates the child from Ctrl+C (SIGINT) sent to the parent
+        proc = subprocess.run(
+            [sys.executable, str(synth_script)],
+            check=True,
+            timeout=120,
+            start_new_session=True,
+        )
+    except subprocess.TimeoutExpired:
+        logger.warning("Synthetic data generation timed out after 120s — skipping.")
     except Exception as e:
         logger.error(f"Failed to generate synthetic data: {e}", exc_info=True)
 
