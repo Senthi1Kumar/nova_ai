@@ -52,6 +52,9 @@ Nova includes a built-in enrollment UI to calibrate the wake-word engine to your
    git clone --recursive https://github.com/Senthi1Kumar/nova_ai.git
    cd nova_ai
 
+   # Checkout to `v1.1` branch
+   git checkout v1.1
+
    # If you already cloned the repository without --recursive, run this command:
    git submodule update --init --recursive
    ```
@@ -74,8 +77,9 @@ Nova includes a built-in enrollment UI to calibrate the wake-word engine to your
 4. **Install Dependencies and activate `.venv`**:
 
    ```bash
-   uv sync --prerelease=allow
+   uv sync
    source .venv/bin/activate  # for linux
+   
    .venv\Scripts\activate  # for windows
    ```
 
