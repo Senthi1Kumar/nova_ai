@@ -33,7 +33,7 @@
     <header class="flex justify-between items-center flex-shrink-0">
         <div>
             <h1 class="text-3xl font-bold glow tracking-widest">NOVA AI</h1>
-            <p class="text-[10px] opacity-40 tracking-widest">EV VOICE ASSISTANT · v1.1</p>
+            <p class="text-[10px] opacity-40 tracking-widest">EV VOICE ASSISTANT · v1.2</p>
         </div>
         <div class="flex items-center gap-6">
             <div class="text-right">
@@ -52,8 +52,59 @@
                     </div>
                 </label>
             </div>
+            <button id="settings-btn" title="Enrollment & Settings"
+                class="border border-[#00ffcc]/40 rounded-lg px-3 py-2 text-[#00ffcc] hover:bg-[#00ffcc]/10 transition-all text-base leading-none">
+                ☰
+            </button>
         </div>
     </header>
+
+    <!-- ── Settings Drawer ── -->
+    <div id="settings-drawer"
+         class="fixed top-0 right-0 h-full w-80 bg-[#080808] border-l border-[#00ffcc]/20
+                z-50 flex flex-col transform translate-x-full transition-transform duration-300 overflow-y-auto"
+         style="box-shadow: -4px 0 30px rgba(0,255,204,0.08);">
+        <div class="flex justify-between items-center p-5 border-b border-[#00ffcc]/20">
+            <h2 class="text-sm font-bold tracking-widest text-[#00ffcc]">ENROLLMENT & SETTINGS</h2>
+            <button id="settings-close" class="text-[#00ffcc] hover:opacity-60 text-xl leading-none">✕</button>
+        </div>
+
+        <!-- Enrolled Users -->
+        <div class="p-5 border-b border-[#00ffcc]/10">
+            <h3 class="text-[9px] font-bold tracking-widest opacity-50 mb-3">ENROLLED USERS</h3>
+            <div id="driver-list" class="flex flex-col gap-2 mb-3"></div>
+            <button id="add-family-btn"
+                class="w-full border border-dashed border-[#00ffcc]/40 rounded-lg py-2 text-[10px]
+                       tracking-widest text-[#00ffcc]/60 hover:text-[#00ffcc] hover:border-[#00ffcc]/70
+                       transition-all hidden">
+                + ADD FAMILY MEMBER
+            </button>
+            <!-- Inline family voice enrollment -->
+            <div id="family-enroll-panel" class="hidden mt-3">
+                <p class="text-[9px] opacity-60 mb-2 tracking-widest">RECORD 5 PHRASES FOR FAMILY MEMBER</p>
+                <div id="family-voice-prompts" class="flex flex-col gap-2"></div>
+                <p id="family-voice-status" class="text-[9px] opacity-50 mt-2"></p>
+            </div>
+        </div>
+
+        <!-- KWS Model Versions -->
+        <div class="p-5">
+            <h3 class="text-[9px] font-bold tracking-widest opacity-50 mb-3">KWS WAKE-WORD MODEL</h3>
+            <div id="kws-version-list" class="flex flex-col gap-2 mb-3"></div>
+            <button id="add-kws-samples-btn"
+                class="w-full border border-[#00ffcc]/40 rounded-lg py-2 text-[10px] tracking-widest
+                       text-[#00ffcc] hover:bg-[#00ffcc]/10 transition-all">
+                + ADD NOVA SAMPLES & RETRAIN
+            </button>
+            <!-- KWS extra sample recording -->
+            <div id="kws-extra-panel" class="hidden mt-3">
+                <p class="text-[9px] opacity-60 mb-2 tracking-widest">SAY "NOVA" — RECORD 3 MORE SAMPLES</p>
+                <div class="flex gap-2 flex-wrap" id="kws-extra-btns"></div>
+                <p id="kws-extra-status" class="text-[9px] opacity-50 mt-2"></p>
+            </div>
+        </div>
+    </div>
+    <div id="settings-overlay" class="fixed inset-0 bg-black/50 z-40 hidden"></div>
 
     <!-- ── Main grid: 5 | 4 | 3 ── -->
     <main class="grid grid-cols-12 gap-4 flex-grow overflow-hidden min-h-0">
@@ -161,6 +212,35 @@
                 </div>
             </div>
 
+            <!-- Car Controls -->
+            <div class="card rounded-2xl p-4 flex-shrink-0">
+                <h2 class="text-[10px] font-bold tracking-widest opacity-60 mb-3 border-b border-[#00ffcc]/20 pb-2">
+                    CAR CONTROLS
+                </h2>
+                <div class="grid grid-cols-4 gap-2 text-center text-[9px] tracking-widest">
+                    <div id="ctrl-ac" class="border border-[#00ffcc]/20 rounded-lg p-2">
+                        <div class="text-lg mb-1">❄️</div>
+                        <div class="opacity-50">AC</div>
+                        <div id="ctrl-ac-state" class="text-[#00ffcc]/40 font-bold">OFF</div>
+                    </div>
+                    <div id="ctrl-heater" class="border border-[#00ffcc]/20 rounded-lg p-2">
+                        <div class="text-lg mb-1">🔥</div>
+                        <div class="opacity-50">HEATER</div>
+                        <div id="ctrl-heater-state" class="text-[#00ffcc]/40 font-bold">OFF</div>
+                    </div>
+                    <div id="ctrl-sunroof" class="border border-[#00ffcc]/20 rounded-lg p-2">
+                        <div class="text-lg mb-1">🌤️</div>
+                        <div class="opacity-50">SUN ROOF</div>
+                        <div id="ctrl-sunroof-state" class="text-[#00ffcc]/40 font-bold">CLOSED</div>
+                    </div>
+                    <div id="ctrl-lights" class="border border-[#00ffcc]/20 rounded-lg p-2">
+                        <div class="text-lg mb-1">💡</div>
+                        <div class="opacity-50">LIGHTS</div>
+                        <div id="ctrl-lights-state" class="text-[#00ffcc]/40 font-bold">OFF</div>
+                    </div>
+                </div>
+            </div>
+
             <!-- Component insights -->
             <div class="card rounded-2xl p-5 flex-grow overflow-y-auto min-h-0">
                 <h2 class="text-[10px] font-bold tracking-widest opacity-60 mb-3
@@ -177,12 +257,12 @@
         <div class="col-span-3 flex flex-col gap-4 min-h-0">
 
             <!-- Evaluation -->
-            <div class="card rounded-2xl p-5 flex-grow min-h-0 flex flex-col">
+            <div class="card rounded-2xl p-5 flex-shrink-0 flex flex-col">
                 <h2 class="text-[10px] font-bold tracking-widest opacity-60 mb-4
                            border-b border-[#00ffcc]/20 pb-2 flex-shrink-0">
                     EVALUATION
                 </h2>
-                <div class="space-y-3 text-[10px] flex-grow">
+                <div class="space-y-3 text-[10px]">
                     <div class="flex justify-between">
                         <span class="opacity-50 tracking-wider">KWS LATENCY</span>
                         <span id="kws-latency">-- ms</span>
@@ -222,7 +302,7 @@
                 <div class="mt-4 flex-shrink-0 flex gap-2">
                     <div class="flex-1">
                         <p class="text-[9px] opacity-40 tracking-widest mb-1">TTS VOICE</p>
-                        <select id="voice-select"
+                        <select id="voice-select" title="TTS Voice"
                             class="w-full bg-black border border-[#00ffcc]/40 text-[#00ffcc]
                                    text-[10px] p-2 rounded outline-none tracking-wider">
                             <option value="alba"    selected>Alba</option>
@@ -237,39 +317,100 @@
                     </div>
                     <div class="flex-1">
                         <p class="text-[9px] opacity-40 tracking-widest mb-1">LLM MODEL</p>
-                        <select id="llm-select"
+                        <select id="llm-select" title="LLM Model"
                             class="w-full bg-black border border-[#00ffcc]/40 text-[#00ffcc]
                                    text-[10px] p-2 rounded outline-none tracking-wider">
-                            <option value="qwen/qwen3.5-9b" selected>Qwen 3.5 9B</option>
+                            <option value="nvidia/llama-3.3-nemotron-super-49b-v1.5" selected>Nemotron 49B</option>
+                            <option value="qwen/qwen3.5-9b">Qwen 3.5 9B</option>
+                            <option value="google/gemini-2.5-flash">Gemini 2.5 Flash</option>
                             <option value="meta-llama/llama-3.1-8b-instruct">Llama 3.1 8B</option>
-                            <option value="arcee-ai/trinity-large-preview:free">Trinity Large</option>
                         </select>
                     </div>
                 </div>
             </div>
 
             <!-- Last exchange -->
-            <div class="card rounded-2xl p-4 flex-shrink-0">
-                <p class="text-[9px] opacity-40 tracking-widest mb-2">LAST EXCHANGE</p>
+            <div class="card rounded-2xl p-4 flex-grow min-h-0 flex flex-col overflow-hidden">
+                <p class="text-[9px] opacity-40 tracking-widest mb-2 flex-shrink-0">LAST EXCHANGE</p>
                 <p id="last-user"
-                   class="text-[10px] opacity-50 mb-2 leading-relaxed break-words line-clamp-2">
+                   class="text-[10px] opacity-50 mb-2 leading-relaxed break-words line-clamp-2 flex-shrink-0">
                     —
                 </p>
                 <p id="last-assistant"
-                   class="text-[10px] text-[#00ffcc] leading-relaxed break-words line-clamp-3">
+                   class="text-[10px] text-[#00ffcc] leading-relaxed break-words flex-grow overflow-y-auto">
                     —
                 </p>
             </div>
         </div>
     </main>
 
+    <!-- ── Onboarding Modal ── -->
+    <div id="onboarding-modal"
+        class="fixed inset-0 bg-black/90 flex items-center justify-center z-50 hidden">
+        <div class="card rounded-2xl p-8 max-w-lg w-full mx-4">
+            <h2 class="text-xl font-bold glow tracking-widest mb-1">WELCOME TO NOVA AI</h2>
+            <p class="text-[10px] opacity-40 tracking-widest mb-6">EV VOICE ASSISTANT SETUP</p>
+
+            <!-- Step 1: KWS Enrollment -->
+            <div id="ob-step-kws">
+                <p class="text-[11px] opacity-70 mb-4 leading-relaxed">
+                    First, teach Nova your wake word. Record yourself saying <strong class="text-[#00ffcc]">"Nova"</strong>
+                    5 times, then record 5 background noise samples.
+                </p>
+                <div class="flex gap-3 mb-3">
+                    <button id="ob-nova-btn"
+                        class="flex-1 border border-[#00ffcc] text-[#00ffcc] py-2 rounded text-[10px]
+                               tracking-widest hover:bg-[#00ffcc]/20 transition-all relative overflow-hidden">
+                        <div id="ob-nova-progress" class="absolute left-0 top-0 bottom-0 bg-[#00ffcc] opacity-20" style="width:0%;transition:width 2s linear;"></div>
+                        <span id="ob-nova-text" class="relative z-10">RECORD "NOVA" (0/5)</span>
+                    </button>
+                    <button id="ob-noise-btn"
+                        class="flex-1 border border-[#00ffcc] text-[#00ffcc] py-2 rounded text-[10px]
+                               tracking-widest hover:bg-[#00ffcc]/20 transition-all relative overflow-hidden">
+                        <div id="ob-noise-progress" class="absolute left-0 top-0 bottom-0 bg-[#00ffcc] opacity-20" style="width:0%;transition:width 2s linear;"></div>
+                        <span id="ob-noise-text" class="relative z-10">RECORD NOISE (0/5)</span>
+                    </button>
+                </div>
+                <p id="ob-kws-status" class="text-[9px] opacity-40 italic">Record 5 of each to enable wake word detection.</p>
+            </div>
+
+            <!-- Step 1b: Training progress -->
+            <div id="ob-step-training" class="hidden text-center py-4">
+                <div class="text-2xl mb-3 animate-spin inline-block">⚙️</div>
+                <p id="ob-training-msg" class="text-[11px] opacity-70 tracking-widest">Training wake word model…</p>
+                <div class="mt-3 h-1 bg-[#00ffcc]/20 rounded overflow-hidden">
+                    <div id="ob-training-bar" class="h-full bg-[#00ffcc] transition-all" style="width:0%"></div>
+                </div>
+            </div>
+
+            <!-- Step 2: Voice fingerprint -->
+            <div id="ob-step-voice" class="hidden">
+                <p class="text-[11px] opacity-70 mb-4 leading-relaxed">
+                    Now record your voice fingerprint. Speak naturally — say the prompted phrase clearly.
+                    This lets Nova verify it's you for payments and sensitive actions.
+                </p>
+                <div id="ob-voice-prompts" class="space-y-2 mb-4"></div>
+                <p id="ob-voice-status" class="text-[9px] opacity-40 italic">Say each phrase clearly. Takes ~3 seconds each.</p>
+            </div>
+
+            <!-- Done -->
+            <div id="ob-step-done" class="hidden text-center py-4">
+                <div class="text-3xl mb-3">✅</div>
+                <p class="text-[11px] text-[#00ffcc] tracking-widest mb-1">SETUP COMPLETE</p>
+                <p class="text-[9px] opacity-50">Nova knows your voice. Say "Nova" to get started.</p>
+                <button id="ob-done-btn"
+                    class="mt-5 px-8 py-2 border border-[#00ffcc] rounded text-[10px]
+                           tracking-widest hover:bg-[#00ffcc] hover:text-black transition-all">
+                    START NOVA
+                </button>
+            </div>
+        </div>
+    </div>
+
     <script>
     // ── state ──────────────────────────────────────────────────────────────────
-    let ws, audioContext, processor, input, analyser;
-    let isRecordingUI   = false;
-    let novaCount       = 0;
-    let noiseCount      = 0;
-    let lastAssistantText = '';
+    let ws, isRecordingUI = false, novaCount = 0, noiseCount = 0, lastAssistantText = '';
+    const carState = { ac: false, heater: false, sunroof: false, lights: false };
 
     // ── state-ring helpers ────────────────────────────────────────────────────
     const stateRing  = document.getElementById('state-ring');
@@ -316,176 +457,228 @@
         }
     }
 
-    // ── audio init ────────────────────────────────────────────────────────────
-    async function initAudio() {
-        audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
-        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-        input    = audioContext.createMediaStreamSource(stream);
-        analyser = audioContext.createAnalyser();
-        processor = audioContext.createScriptProcessor(4096, 1, 1);
-
-        processor.onaudioprocess = (e) => {
-            if (ws?.readyState !== WebSocket.OPEN) return;
-            const f32 = e.inputBuffer.getChannelData(0);
-            const i16 = new Int16Array(f32.length);
-            for (let i = 0; i < f32.length; i++)
-                i16[i] = Math.max(-1, Math.min(1, f32[i])) * 0x7FFF;
-            ws.send(i16.buffer);
-        };
-
-        input.connect(analyser);
-        input.connect(processor);
-        processor.connect(audioContext.destination);
-        drawVisualizer();
-    }
-
-    // ── TTS audio queue ───────────────────────────────────────────────────────
-    let audioQueue    = [];
-    let nextStartTime = 0;
+// ── WebSocket ──────────────────────────────────────────────────────────
+    let localStream;
+    let audioContext, analyser, input;
+    // Audio playback scheduling (PCM chunks from TTS)
+    let playbackCtx;
+    let gainNode;
+    let nextPlayTime = 0;
 
     function stopAllAudio() {
-        // Suspend immediately kills scheduled sources, then resume for next TTS
-        if (!audioContext) return;
-        audioContext.suspend().then(() => {
-            audioQueue    = [];
-            nextStartTime = 0;
-            audioContext.resume();
-        });
-    }
-
-    function processAudioQueue() {
-        while (audioQueue.length > 0) {
-            const data = audioQueue.shift();
-            try {
-                const i16 = new Int16Array(data);
-                const f32 = new Float32Array(i16.length);
-                for (let i = 0; i < i16.length; i++) f32[i] = i16[i] / 32768.0;
-                const buf = audioContext.createBuffer(1, f32.length, 24000);
-                buf.getChannelData(0).set(f32);
-                const src = audioContext.createBufferSource();
-                src.buffer = buf;
-                src.connect(audioContext.destination);
-                if (nextStartTime < audioContext.currentTime)
-                    nextStartTime = audioContext.currentTime + 0.05;
-                src.start(nextStartTime);
-                nextStartTime += buf.duration;
-            } catch (e) { console.error('Audio playback error:', e); }
+        // Disconnect gain node to instantly silence queued audio
+        if (gainNode) {
+            try { gainNode.disconnect(); } catch(_) {}
+            gainNode = playbackCtx.createGain();
+            gainNode.connect(playbackCtx.destination);
         }
+        nextPlayTime = 0;
     }
 
-    // ── WebSocket ─────────────────────────────────────────────────────────────
-    function startConnection() {
-        ws = new WebSocket(`ws://${window.location.host}/ws`);
-        ws.binaryType = 'arraybuffer';
+    function stopWebSocket() {
+        if (ws) { ws.close(); ws = null; }
+        if (localStream) localStream.getTracks().forEach(t => t.stop());
+        document.getElementById('connection-status').textContent = 'OFFLINE';
+        document.getElementById('connection-status').className = 'text-red-500 font-bold text-sm tracking-widest';
+        setUIState('idle');
+    }
 
-        ws.onopen = () => {
-            document.getElementById('connection-status').textContent = 'ONLINE';
-            document.getElementById('connection-status').className =
-                'text-green-400 font-bold text-sm tracking-widest';
-            setUIState('idle');
-            initAudio();
-            ws.send(JSON.stringify({
-                type: 'change_voice',
-                data: document.getElementById('voice-select').value,
-            }));
-        };
+    const sendUIEvent = (type, data=null) => {
+        // Send via WebSocket if connected, otherwise HTTP fallback
+        if (ws && ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ type, data }));
+        } else {
+            fetch('/ui-event', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ type, data })
+            });
+        }
+    };
 
-        ws.onmessage = (e) => {
-            if (typeof e.data === 'string') handleJsonMessage(JSON.parse(e.data));
-            else { audioQueue.push(e.data); processAudioQueue(); }
-        };
+    async function setupWebSocket() {
+        try {
+            // Mic for visualizer only (STT uses sounddevice on server)
+            try {
+                localStream = await navigator.mediaDevices.getUserMedia({
+                    audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }
+                });
+                audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
+                input = audioContext.createMediaStreamSource(localStream);
+                analyser = audioContext.createAnalyser();
+                input.connect(analyser);
+                drawVisualizer();
+            } catch (micErr) {
+                console.warn('Mic not available for visualizer:', micErr);
+            }
 
-        ws.onclose = () => {
-            document.getElementById('connection-status').textContent = 'OFFLINE';
-            document.getElementById('connection-status').className =
-                'text-red-500 font-bold text-sm tracking-widest';
-            setUIState('idle');
-            processor?.disconnect();
-            input?.disconnect();
-        };
+            // Audio playback context (24kHz for TTS PCM)
+            playbackCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 24000 });
+            gainNode = playbackCtx.createGain();
+            gainNode.connect(playbackCtx.destination);
+            nextPlayTime = 0;
+
+            // Connect WebSocket
+            const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+            ws = new WebSocket(`${proto}//${location.host}/ws`);
+            ws.binaryType = 'arraybuffer';
+
+            ws.onopen = () => {
+                document.getElementById('connection-status').textContent = 'ONLINE';
+                document.getElementById('connection-status').className = 'text-green-400 font-bold text-sm tracking-widest';
+                setUIState('idle');
+                sendUIEvent("change_voice", document.getElementById('voice-select').value);
+                sendUIEvent("change_llm", document.getElementById('llm-select').value);
+            };
+
+            ws.onmessage = (event) => {
+                if (event.data instanceof ArrayBuffer) {
+                    // Binary: PCM int16 24kHz audio from TTS
+                    const int16 = new Int16Array(event.data);
+                    const float32 = new Float32Array(int16.length);
+                    for (let i = 0; i < int16.length; i++) {
+                        float32[i] = int16[i] / 32768.0;
+                    }
+                    const buffer = playbackCtx.createBuffer(1, float32.length, 24000);
+                    buffer.getChannelData(0).set(float32);
+                    const source = playbackCtx.createBufferSource();
+                    source.buffer = buffer;
+                    source.connect(gainNode);
+                    const now = playbackCtx.currentTime;
+                    if (nextPlayTime < now) nextPlayTime = now;
+                    source.start(nextPlayTime);
+                    nextPlayTime += buffer.duration;
+                } else {
+                    // Text: JSON event
+                    try {
+                        handleJsonMessage(JSON.parse(event.data));
+                    } catch (e) {
+                        console.warn('Bad JSON from server:', e);
+                    }
+                }
+            };
+
+            ws.onclose = () => {
+                document.getElementById('connection-status').textContent = 'OFFLINE';
+                document.getElementById('connection-status').className = 'text-red-500 font-bold text-sm tracking-widest';
+            };
+
+            ws.onerror = (err) => {
+                console.error('WebSocket error:', err);
+            };
+
+        } catch (err) {
+            console.error('WebSocket setup error:', err);
+            stopWebSocket();
+        }
     }
 
     function handleJsonMessage(msg) {
         switch (msg.type) {
-
             case 'kws_detected':
-                document.getElementById('kws-latency').textContent =
-                    `${msg.data.latency.toFixed(0)} ms`;
+                document.getElementById('kws-latency').textContent = `${msg.data.latency.toFixed(0)} ms`;
                 isRecordingUI = true;
                 setUIState('listening');
                 break;
-
-            case 'transcript':
-                if (msg.data) {
-                    document.getElementById('last-user').textContent = '▸ ' + msg.data;
-                }
-                if (msg.latency?.stt_ttfb)
-                    document.getElementById('stt-latency').textContent =
-                        `${(msg.latency.stt_ttfb * 1000).toFixed(0)} ms`;
-                if (msg.latency?.stt_rtf)
-                    document.getElementById('stt-rtf').textContent =
-                        `${msg.latency.stt_rtf.toFixed(2)}x`;
+            case 'speech_started':
+                isRecordingUI = true;
+                setUIState('listening');
                 break;
-
+            case 'transcript_partial':
+                if (msg.data) document.getElementById('last-user').textContent = '▸ ' + msg.data + ' …';
+                break;
+            case 'transcript':
+                if (msg.data) document.getElementById('last-user').textContent = '▸ ' + msg.data;
+                if (msg.latency?.stt_ttfb) document.getElementById('stt-latency').textContent = `${(msg.latency.stt_ttfb * 1000).toFixed(0)} ms`;
+                if (msg.latency?.stt_rtf) document.getElementById('stt-rtf').textContent = `${msg.latency.stt_rtf.toFixed(2)}x`;
+                break;
             case 'assistant_start':
                 lastAssistantText = '';
                 document.getElementById('last-assistant').textContent = '…';
                 setUIState('thinking');
                 break;
-
             case 'llm_token':
                 if (!msg.data.includes('<think>') && !msg.data.includes('</think>'))
                     lastAssistantText += msg.data;
-                document.getElementById('last-assistant').textContent =
-                    lastAssistantText.trim();
-                if (msg.latency?.llm_ttft)
-                    document.getElementById('llm-latency').textContent =
-                        `${(msg.latency.llm_ttft * 1000).toFixed(0)} ms`;
-                if (msg.latency?.llm_throughput)
-                    document.getElementById('llm-throughput').textContent =
-                        `${(msg.latency.llm_throughput).toFixed(1)} t/s`;
+                document.getElementById('last-assistant').textContent = lastAssistantText.trim();
+                if (msg.latency?.llm_ttft) document.getElementById('llm-latency').textContent = `${(msg.latency.llm_ttft * 1000).toFixed(0)} ms`;
+                if (msg.latency?.llm_throughput) document.getElementById('llm-throughput').textContent = `${msg.latency.llm_throughput.toFixed(1)} t/s`;
                 break;
-
             case 'tts_metrics':
                 setUIState('speaking');
-                if (msg.data?.ttfa)
-                    document.getElementById('tts-latency').textContent =
-                        `${(msg.data.ttfa * 1000).toFixed(0)} ms`;
-                if (msg.data?.tts_rtf)
-                    document.getElementById('tts-rtf').textContent =
-                        `${msg.data.tts_rtf.toFixed(2)}x`;
-                if (msg.data?.e2e)
-                    document.getElementById('e2e-latency').textContent =
-                        `${(msg.data.e2e * 1000).toFixed(0)} ms`;
+                if (msg.data?.ttfa) document.getElementById('tts-latency').textContent = `${(msg.data.ttfa * 1000).toFixed(0)} ms`;
+                if (msg.data?.tts_rtf) document.getElementById('tts-rtf').textContent = `${msg.data.tts_rtf.toFixed(2)}x`;
+                if (msg.data?.e2e) document.getElementById('e2e-latency').textContent = `${(msg.data.e2e * 1000).toFixed(0)} ms`;
                 break;
-
             case 'recording_stopped':
                 isRecordingUI = false;
                 setUIState('idle');
                 break;
-
             case 'ptt_started':
                 isRecordingUI = true;
                 setUIState('listening');
                 break;
-
             case 'interrupted':
-                stopAllAudio();      // kill queued browser audio immediately
+                stopAllAudio();
                 isRecordingUI = true;
                 setUIState('listening');
+                break;
+
+            case 'generation_start':
+                setUIState('thinking');
+                break;
+
+            case 'generation_done':
+                setUIState('idle');
+                break;
+
+            case 'dm_state':
+                if (msg.data?.nova_says) {
+                    document.getElementById('last-assistant').textContent = msg.data.nova_says;
+                    lastAssistantText = msg.data.nova_says;
+                }
+                if (msg.data?.intent === 'vehicle_control' && msg.data?.entities) {
+                    const e = msg.data.entities;
+                    if (e.commands && e.commands.length > 1) {
+                        // Compound command: "switch off AC and open sunroof"
+                        for (const cmd of e.commands) {
+                            updateCarControl(cmd.component, cmd.action !== 'off');
+                        }
+                    } else if (e.component) {
+                        updateCarControl(e.component, e.action !== 'off');
+                    }
+                }
+                break;
+
+            case 'enrollment_done':
+                // KWS training finished — if onboarding modal is open, advance to voice step
+                if (!document.getElementById('onboarding-modal').classList.contains('hidden')) {
+                    showObStep('voice');
+                }
+                break;
+
+            case 'enrollment_check':
+                if (msg.fully_enrolled) {
+                    localStorage.setItem('nova_setup_done', '1');
+                    document.getElementById('onboarding-modal').classList.add('hidden');
+                }
+                break;
+
+            case 'kws_version_activated':
+                if (msg.success) refreshKwsVersionList();
                 break;
         }
     }
 
     // ── controls ──────────────────────────────────────────────────────────────
     document.getElementById('always-listening-toggle').onchange = (e) => {
-        if (e.target.checked) startConnection();
-        else ws?.close();
+        if (e.target.checked) setupWebSocket();
+        else stopWebSocket();
     };
 
     const pttBtn   = document.getElementById('ptt-button');
     const sendPTT  = (type) =>
-        ws?.readyState === WebSocket.OPEN && ws.send(JSON.stringify({ type }));
+        sendUIEvent(type);
 
     pttBtn.addEventListener('mousedown',  () => sendPTT('start_ptt'));
     pttBtn.addEventListener('mouseup',    () => sendPTT('stop_ptt'));
@@ -494,16 +687,244 @@
     pttBtn.addEventListener('touchend',   (e) => { e.preventDefault(); sendPTT('stop_ptt'); });
 
     document.getElementById('voice-select').onchange = (e) =>
-        ws?.readyState === WebSocket.OPEN &&
-        ws.send(JSON.stringify({ type: 'change_voice', data: e.target.value }));
+        sendUIEvent('change_voice', e.target.value);
 
     document.getElementById('llm-select').onchange = (e) =>
-        ws?.readyState === WebSocket.OPEN &&
-        ws.send(JSON.stringify({ type: 'change_llm', data: e.target.value }));
+        sendUIEvent('change_llm', e.target.value);
+
+    // ── car controls ──────────────────────────────────────────────────────────
+    const CAR_CTRL_LABELS = { sunroof: ['CLOSED', 'OPEN'], ac: ['OFF', 'ON'], heater: ['OFF', 'ON'], lights: ['OFF', 'ON'] };
+    function updateCarControl(component, isOn) {
+        const comp = component.toLowerCase().replace(/\s+/g, '');
+        const key = comp === 'window' ? 'sunroof' : comp; // map window → sunroof
+        if (!(key in carState)) return;
+        carState[key] = isOn;
+        const labels = CAR_CTRL_LABELS[key];
+        const stateEl = document.getElementById(`ctrl-${key}-state`);
+        const cardEl  = document.getElementById(`ctrl-${key}`);
+        if (!stateEl || !cardEl) return;
+        stateEl.textContent = isOn ? labels[1] : labels[0];
+        stateEl.className = isOn ? 'text-[#00ffcc] font-bold' : 'text-[#00ffcc]/40 font-bold';
+        cardEl.style.borderColor = isOn ? 'rgba(0,255,204,0.6)' : 'rgba(0,255,204,0.2)';
+    }
+
+    // ── settings drawer ───────────────────────────────────────────────────────
+    const FAMILY_VOICE_PROMPTS = [
+        "Set the cabin temperature to twenty-two degrees.",
+        "How much driving range is left in the battery?",
+        "Open the sunroof and play some relaxing music.",
+        "Play some jazz music and turn up the volume.",
+        "What's the traffic like on the highway ahead?"
+    ];
+    let familyEnrollCount = 0;
+
+    document.getElementById('settings-btn').addEventListener('click', openSettingsDrawer);
+    document.getElementById('settings-close').addEventListener('click', closeSettingsDrawer);
+    document.getElementById('settings-overlay').addEventListener('click', closeSettingsDrawer);
+
+    function openSettingsDrawer() {
+        document.getElementById('settings-drawer').style.transform = 'translateX(0)';
+        document.getElementById('settings-overlay').classList.remove('hidden');
+        loadDriverList();
+        refreshKwsVersionList();
+    }
+    function closeSettingsDrawer() {
+        document.getElementById('settings-drawer').style.transform = 'translateX(100%)';
+        document.getElementById('settings-overlay').classList.add('hidden');
+    }
+
+    async function loadDriverList() {
+        const res = await fetch('/enroll/drivers').then(r => r.json()).catch(() => ({ drivers: [] }));
+        const drivers = res.drivers || [];
+        const list = document.getElementById('driver-list');
+        list.innerHTML = '';
+        drivers.forEach(did => {
+            const isOwner = did === 'driver1';
+            list.innerHTML += `
+                <div class="flex items-center justify-between border border-[#00ffcc]/20 rounded-lg px-3 py-2">
+                    <div>
+                        <p class="text-[11px] font-bold text-[#00ffcc]">${isOwner ? 'OWNER' : 'FAMILY MEMBER'}</p>
+                        <p class="text-[9px] opacity-40">${did} · voice ✓</p>
+                    </div>
+                    ${isOwner ? '' : `<button onclick="removeDriver('${did}')"
+                        class="text-[9px] text-red-400 hover:text-red-300 border border-red-400/30
+                               rounded px-2 py-1 transition-all">REMOVE</button>`}
+                </div>`;
+        });
+        const addBtn = document.getElementById('add-family-btn');
+        if (drivers.length < 2) {
+            addBtn.classList.remove('hidden');
+        } else {
+            addBtn.classList.add('hidden');
+            document.getElementById('family-enroll-panel').classList.add('hidden');
+        }
+    }
+
+    async function removeDriver(driverId) {
+        if (!confirm(`Remove family member (${driverId})?`)) return;
+        await fetch(`/enroll/drivers/${driverId}`, { method: 'DELETE' });
+        loadDriverList();
+    }
+
+    document.getElementById('add-family-btn').addEventListener('click', () => {
+        const panel = document.getElementById('family-enroll-panel');
+        panel.classList.toggle('hidden');
+        if (!panel.classList.contains('hidden')) buildFamilyVoicePrompts();
+    });
+
+    function buildFamilyVoicePrompts() {
+        familyEnrollCount = 0;
+        const container = document.getElementById('family-voice-prompts');
+        container.innerHTML = '';
+        FAMILY_VOICE_PROMPTS.forEach((phrase, i) => {
+            container.innerHTML += `
+                <div class="flex items-center gap-2">
+                    <button id="fvp-btn-${i}"
+                        class="border border-[#00ffcc]/50 rounded px-2 py-1 text-[10px] text-[#00ffcc]
+                               hover:bg-[#00ffcc]/10 transition-all w-8 flex-shrink-0">▶</button>
+                    <span id="fvp-label-${i}" class="text-[9px] opacity-50 flex-1">${phrase}</span>
+                    <span id="fvp-check-${i}" class="text-[#00ffcc] text-[10px]"></span>
+                </div>`;
+        });
+        FAMILY_VOICE_PROMPTS.forEach((phrase, i) => {
+            document.getElementById(`fvp-btn-${i}`).addEventListener('click', async () => {
+                const btn = document.getElementById(`fvp-btn-${i}`);
+                const chk = document.getElementById(`fvp-check-${i}`);
+                btn.disabled = true; btn.textContent = '●';
+                document.getElementById('family-voice-status').textContent = `Recording: "${phrase}"`;
+                const stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
+                const rec = new MediaRecorder(stream);
+                const chunks = [];
+                rec.ondataavailable = e => chunks.push(e.data);
+                rec.onstop = async () => {
+                    stream.getTracks().forEach(t => t.stop());
+                    const blob = new Blob(chunks, { type: 'audio/webm' });
+                    const fd = new FormData();
+                    fd.append('file', blob, `family_${i+1}.webm`);
+                    fd.append('index', i + 1);
+                    fd.append('total', FAMILY_VOICE_PROMPTS.length);
+                    fd.append('driver_id', 'driver2');
+                    const data = await (await fetch('/enroll/voice-sample', { method: 'POST', body: fd })).json();
+                    btn.textContent = '✓'; chk.textContent = '✓';
+                    familyEnrollCount++;
+                    document.getElementById('family-voice-status').textContent = `Recorded ${familyEnrollCount}/${FAMILY_VOICE_PROMPTS.length}`;
+                    if (data.status === 'enrolled') {
+                        setTimeout(() => {
+                            document.getElementById('family-enroll-panel').classList.add('hidden');
+                            loadDriverList();
+                        }, 500);
+                    }
+                };
+                rec.start();
+                setTimeout(() => rec.stop(), 3500);
+            });
+        });
+    }
+
+    async function refreshKwsVersionList() {
+        const res = await fetch('/enroll/kws-models').then(r => r.json()).catch(() => ({ versions: [] }));
+        const versions = res.versions || [];
+        const list = document.getElementById('kws-version-list');
+        list.innerHTML = '';
+        if (versions.length === 0) {
+            list.innerHTML = '<p class="text-[9px] opacity-40">No saved versions yet.</p>';
+            return;
+        }
+        versions.forEach((v, idx) => {
+            const isActive = idx === 0; // most recent = active
+            const label = `${v.slice(0,4)}-${v.slice(4,6)}-${v.slice(6,8)} ${v.slice(9,11)}:${v.slice(11,13)}`;
+            list.innerHTML += `
+                <div class="flex items-center justify-between border border-[#00ffcc]/20 rounded-lg px-3 py-2">
+                    <div>
+                        <p class="text-[10px] font-bold text-[#00ffcc]">${isActive ? '● ' : ''}${label}</p>
+                        <p class="text-[9px] opacity-40">${isActive ? 'active' : 'saved'}</p>
+                    </div>
+                    <div class="flex gap-1">
+                        ${!isActive ? `<button onclick="activateKwsVersion('${v}')"
+                            class="text-[9px] border border-[#00ffcc]/40 rounded px-2 py-1
+                                   text-[#00ffcc] hover:bg-[#00ffcc]/10 transition-all">USE</button>` : ''}
+                        ${!isActive ? `<button onclick="deleteKwsVersion('${v}')"
+                            class="text-[9px] border border-red-400/30 rounded px-2 py-1
+                                   text-red-400 hover:text-red-300 transition-all">✕</button>` : ''}
+                    </div>
+                </div>`;
+        });
+    }
+
+    async function activateKwsVersion(version) {
+        await fetch(`/enroll/kws-activate/${version}`, { method: 'POST' });
+        document.getElementById('kws-version-list').innerHTML =
+            '<p class="text-[9px] opacity-40 animate-pulse">Activating…</p>';
+    }
+
+    async function deleteKwsVersion(version) {
+        if (!confirm(`Delete KWS version ${version}?`)) return;
+        await fetch(`/enroll/kws-models/${version}`, { method: 'DELETE' });
+        refreshKwsVersionList();
+    }
+
+    // Add extra KWS samples + retrain
+    let kwsExtraCount = 0;
+    const KWS_EXTRA_TARGET = 3;
+    document.getElementById('add-kws-samples-btn').addEventListener('click', () => {
+        const panel = document.getElementById('kws-extra-panel');
+        panel.classList.toggle('hidden');
+        if (!panel.classList.contains('hidden')) buildKwsExtraBtns();
+    });
+
+    function buildKwsExtraBtns() {
+        kwsExtraCount = 0;
+        const container = document.getElementById('kws-extra-btns');
+        container.innerHTML = '';
+        for (let i = 0; i < KWS_EXTRA_TARGET; i++) {
+            container.innerHTML += `
+                <button id="kws-extra-${i}"
+                    class="border border-[#00ffcc]/50 rounded px-3 py-1 text-[10px] text-[#00ffcc]
+                           hover:bg-[#00ffcc]/10 transition-all">▶ ${i+1}</button>`;
+        }
+        for (let i = 0; i < KWS_EXTRA_TARGET; i++) {
+            document.getElementById(`kws-extra-${i}`).addEventListener('click', async () => {
+                const btn = document.getElementById(`kws-extra-${i}`);
+                btn.disabled = true; btn.textContent = '●';
+                document.getElementById('kws-extra-status').textContent = 'Recording "Nova"…';
+                const stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
+                const rec = new MediaRecorder(stream);
+                const chunks = [];
+                rec.ondataavailable = e => chunks.push(e.data);
+                rec.onstop = async () => {
+                    stream.getTracks().forEach(t => t.stop());
+                    const blob = new Blob(chunks, { type: 'audio/webm' });
+                    const fd = new FormData();
+                    fd.append('file', blob, `nova_extra_${i+1}.webm`);
+                    fd.append('sample_type', 'nova');
+                    fd.append('index', `extra_${Date.now()}_${i}`);
+                    await fetch('/enroll/upload', { method: 'POST', body: fd });
+                    btn.textContent = '✓';
+                    kwsExtraCount++;
+                    document.getElementById('kws-extra-status').textContent = `Uploaded ${kwsExtraCount}/${KWS_EXTRA_TARGET}`;
+                    if (kwsExtraCount >= KWS_EXTRA_TARGET) {
+                        document.getElementById('kws-extra-status').textContent = 'Retraining…';
+                        await fetch('/enroll/re-enroll', { method: 'POST' });
+                        document.getElementById('kws-extra-panel').classList.add('hidden');
+                        // Poll until done, then refresh version list
+                        const poll = setInterval(async () => {
+                            const s = await (await fetch('/enroll/status')).json();
+                            if (s.state === 'done') {
+                                clearInterval(poll);
+                                refreshKwsVersionList();
+                            }
+                        }, 1500);
+                    }
+                };
+                rec.start();
+                setTimeout(() => rec.stop(), 2000);
+            });
+        }
+    }
 
     // ── enrollment ────────────────────────────────────────────────────────────
     async function recordSample(type, limit, btn) {
-        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
         const rec    = new MediaRecorder(stream);
         const chunks = [];
         
@@ -568,6 +989,37 @@
         recordSample('nova',  5, e.currentTarget);
     document.getElementById('record-noise-btn').onclick = (e) =>
         recordSample('noise', 5, e.currentTarget);
+    document.getElementById('record-pin-btn').onclick = async (e) => {
+        const pin = prompt("Enter a 4-digit PIN to set as your Voice Fallback:");
+        if (!pin || !/^\d{4}$/.test(pin)) {
+            alert("Please enter exactly 4 digits.");
+            return;
+        }
+        const btn = e.currentTarget;
+        const btnText = document.getElementById('pin-btn-text');
+        btn.disabled = true;
+        btnText.textContent = 'SAVING PIN...';
+        const fd = new FormData();
+        fd.append('pin', pin);
+        try {
+            const res = await fetch('/enroll/pin', { method: 'POST', body: fd });
+            const data = await res.json();
+            if (data.status === 'success') {
+                btnText.textContent = 'PIN ENROLLED ✓';
+                document.getElementById('enroll-status').textContent = 'PIN enrollment complete.';
+                btn.classList.add('opacity-50');
+            } else {
+                btnText.textContent = 'PIN FAILED ❌';
+                document.getElementById('enroll-status').textContent = 'Failed: ' + data.error;
+                btn.disabled = false;
+            }
+        } catch (err) {
+            btnText.textContent = 'ERROR ❌';
+            document.getElementById('enroll-status').textContent = 'Server connection error.';
+            btn.disabled = false;
+        }
+    };
+
     document.getElementById('record-face-btn').onclick = async (e) => {
         const btn = e.currentTarget;
         const btnText = document.getElementById('face-btn-text');
@@ -594,39 +1046,175 @@
             btn.disabled = false;
         }
     };
-    document.getElementById('record-pin-btn').onclick = async (e) => {
-        const pin = prompt("Enter a 4-digit PIN to set as your Voice Fallback:");
-        if (!pin || !/^\d{4}$/.test(pin)) {
-            alert("Please enter exactly 4 digits.");
-            return;
-        }
-        
-        const btn = e.currentTarget;
-        const btnText = document.getElementById('pin-btn-text');
+
+    // ── onboarding modal ──────────────────────────────────────────────────────
+    const VOICE_PROMPTS = [
+        "The quick brown fox jumps over the lazy dog.",
+        "Nova, navigate me home and play some music.",
+        "What is the weather forecast for tomorrow?",
+        "Turn on the AC and set temperature to twenty-two degrees.",
+        "Order me a coffee from the nearest café.",
+    ];
+    let obNovaCount = 0, obNoiseCount = 0, obVoiceCount = 0;
+
+    function showObStep(step) {
+        ['kws', 'training', 'voice', 'done'].forEach(s =>
+            document.getElementById(`ob-step-${s}`).classList.add('hidden'));
+        document.getElementById(`ob-step-${step}`).classList.remove('hidden');
+        if (step === 'voice') buildVoicePrompts();
+    }
+
+    async function obRecordSample(type, limit, btn, textEl, progressEl, countRef, onComplete) {
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
+        const rec = new MediaRecorder(stream);
+        const chunks = [];
+        textEl.textContent = 'RECORDING…';
         btn.disabled = true;
-        btnText.textContent = 'SAVING PIN...';
-        
-        const fd = new FormData();
-        fd.append('pin', pin);
-        
-        try {
-            const res = await fetch('/enroll/pin', { method: 'POST', body: fd });
-            const data = await res.json();
-            if (data.status === 'success') {
-                btnText.textContent = 'PIN ENROLLED ✓';
-                document.getElementById('enroll-status').textContent = 'PIN enrollment complete.';
-                btn.classList.add('opacity-50');
-            } else {
-                btnText.textContent = 'PIN FAILED ❌';
-                document.getElementById('enroll-status').textContent = 'Failed: ' + data.error;
-                btn.disabled = false;
-            }
-        } catch (err) {
-            btnText.textContent = 'ERROR ❌';
-            document.getElementById('enroll-status').textContent = 'Server connection error.';
+        progressEl.style.transition = 'none';
+        progressEl.style.width = '0%';
+        void progressEl.offsetWidth;
+        progressEl.style.transition = 'width 2s linear';
+        progressEl.style.width = '100%';
+        rec.ondataavailable = e => chunks.push(e.data);
+        rec.onstop = async () => {
+            const fd = new FormData();
+            fd.append('file', new Blob(chunks, { type: 'audio/wav' }));
+            fd.append('sample_type', type);
+            const idx = ++countRef.val;
+            fd.append('index', idx);
+            textEl.textContent = 'SAVING…';
+            await fetch('/enroll/upload', { method: 'POST', body: fd });
+            progressEl.style.transition = 'width 0.2s ease-out';
+            progressEl.style.width = '0%';
+            textEl.textContent = `RECORD ${type.toUpperCase()} (${idx}/${limit})`;
             btn.disabled = false;
+            document.getElementById('ob-kws-status').textContent =
+                `Saved ${type}_${idx}. (nova: ${obNovaCount}/${limit}, noise: ${obNoiseCount}/${limit})`;
+            stream.getTracks().forEach(t => t.stop());
+            if (onComplete) onComplete(idx, limit);
+        };
+        rec.start();
+        setTimeout(() => rec.stop(), 2000);
+    }
+
+    const obNovaRef = { val: 0 }, obNoiseRef = { val: 0 };
+
+    function checkObKWSComplete() {
+        if (obNovaRef.val >= 5 && obNoiseRef.val >= 5) {
+            showObStep('training');
+            document.getElementById('ob-kws-status').textContent = 'Training wake word model…';
+            // Trigger re-enroll and poll status
+            fetch('/enroll/re-enroll', { method: 'POST' });
+            let prog = 0;
+            const bar = document.getElementById('ob-training-bar');
+            const msg = document.getElementById('ob-training-msg');
+            const trainingPoll = setInterval(async () => {
+                prog = Math.min(prog + 2, 95);
+                bar.style.width = prog + '%';
+                try {
+                    const s = await (await fetch('/enroll/status')).json();
+                    if (s.state === 'done') {
+                        clearInterval(trainingPoll);
+                        bar.style.width = '100%';
+                        msg.textContent = 'Wake word trained! Now enroll your voice fingerprint.';
+                        setTimeout(() => showObStep('voice'), 800);
+                    } else if (s.message) {
+                        msg.textContent = s.message;
+                    }
+                } catch (_) {}
+            }, 1500);
         }
-    };
+    }
+
+    document.getElementById('ob-nova-btn').addEventListener('click', e =>
+        obRecordSample('nova', 5, e.currentTarget,
+            document.getElementById('ob-nova-text'),
+            document.getElementById('ob-nova-progress'),
+            obNovaRef, checkObKWSComplete));
+
+    document.getElementById('ob-noise-btn').addEventListener('click', e =>
+        obRecordSample('noise', 5, e.currentTarget,
+            document.getElementById('ob-noise-text'),
+            document.getElementById('ob-noise-progress'),
+            obNoiseRef, checkObKWSComplete));
+
+    function buildVoicePrompts() {
+        const container = document.getElementById('ob-voice-prompts');
+        container.innerHTML = '';
+        VOICE_PROMPTS.forEach((phrase, i) => {
+            container.innerHTML += `
+                <div class="flex items-center gap-3">
+                    <button type="button" id="ob-vp-btn-${i}"
+                        class="flex-shrink-0 border border-[#00ffcc]/40 text-[10px] px-3 py-1 rounded
+                               tracking-widest hover:bg-[#00ffcc]/20 transition-all">
+                        REC
+                    </button>
+                    <span id="ob-vp-label-${i}"
+                        class="text-[9px] opacity-50 italic flex-1">"${phrase}"</span>
+                    <span id="ob-vp-check-${i}" class="text-[10px]"></span>
+                </div>`;
+        });
+        VOICE_PROMPTS.forEach((phrase, i) => {
+            document.getElementById(`ob-vp-btn-${i}`).addEventListener('click', async () => {
+                const btn = document.getElementById(`ob-vp-btn-${i}`);
+                const lbl = document.getElementById(`ob-vp-label-${i}`);
+                const chk = document.getElementById(`ob-vp-check-${i}`);
+                btn.disabled = true;
+                btn.textContent = '●';
+                lbl.classList.remove('opacity-50');
+                lbl.classList.add('text-[#00ffcc]');
+                const stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
+                const rec = new MediaRecorder(stream);
+                const chunks = [];
+                rec.ondataavailable = e => chunks.push(e.data);
+                rec.onstop = async () => {
+                    btn.textContent = '…';
+                    const fd = new FormData();
+                    fd.append('file', new Blob(chunks, { type: 'audio/wav' }));
+                    fd.append('index', i + 1);
+                    fd.append('total', VOICE_PROMPTS.length);
+                    const res = await fetch('/enroll/voice-sample', { method: 'POST', body: fd });
+                    const data = await res.json();
+                    stream.getTracks().forEach(t => t.stop());
+                    btn.textContent = '✓';
+                    chk.textContent = '✓';
+                    lbl.classList.add('opacity-30');
+                    document.getElementById('ob-voice-status').textContent =
+                        `Recorded ${i + 1}/${VOICE_PROMPTS.length}`;
+                    if (data.status === 'enrolled' || i + 1 >= VOICE_PROMPTS.length) {
+                        setTimeout(() => showObStep('done'), 400);
+                    }
+                };
+                rec.start();
+                setTimeout(() => rec.stop(), 3500);
+            });
+        });
+    }
+
+    document.getElementById('ob-done-btn').addEventListener('click', () => {
+        document.getElementById('onboarding-modal').classList.add('hidden');
+        localStorage.setItem('nova_setup_done', '1');
+    });
+
+    // Check actual enrollment state from backend; fall back to localStorage if unreachable
+    async function checkEnrollmentAndInit() {
+        try {
+            const s = await (await fetch('/enroll/check')).json();
+            if (s.fully_enrolled) {
+                localStorage.setItem('nova_setup_done', '1');
+                document.getElementById('onboarding-modal').classList.add('hidden');
+            } else {
+                document.getElementById('onboarding-modal').classList.remove('hidden');
+                showObStep(s.kws_enrolled ? 'voice' : 'kws');
+            }
+        } catch {
+            if (!localStorage.getItem('nova_setup_done')) {
+                document.getElementById('onboarding-modal').classList.remove('hidden');
+                showObStep('kws');
+            }
+        }
+    }
+    checkEnrollmentAndInit();
 
     // ── metrics polling ───────────────────────────────────────────────────────
     async function pollMetrics() {
@@ -645,6 +1233,8 @@
                 const c = document.getElementById('component-container');
                 c.innerHTML = '';
                 for (const [k, v] of Object.entries(d.components)) {
+                    const vramText = v.vram_mb > 0 ? `${v.vram_mb} MB` : 'N/A';
+                    const loadClass = v.load === 'GPU' ? 'text-[#00ffcc]' : 'opacity-50';
                     let extra = '';
                     if (v.wer)      extra += `<span class="opacity-50 mr-2">WER ${v.wer}</span>`;
                     if (v.accuracy) extra += `<span class="opacity-50 mr-2">Acc ${v.accuracy}</span>` +
@@ -656,11 +1246,11 @@
                         <div class="border-l-2 border-[#00ffcc]/40 pl-2 mb-3">
                             <div class="flex justify-between font-bold text-[#00ffcc] mb-1 tracking-wider">
                                 <span>${k.toUpperCase()} — ${v.name}</span>
-                                <span class="opacity-60">${v.vram_mb} MB</span>
+                                <span class="opacity-60">${vramText}</span>
                             </div>
                             <div class="flex justify-between">
                                 <div class="flex flex-wrap gap-x-2">${extra}</div>
-                                <span class="opacity-30 ml-2 whitespace-nowrap">
+                                <span class="opacity-30 ml-2 whitespace-nowrap ${loadClass}">
                                     ${v.load}
                                 </span>
                             </div>

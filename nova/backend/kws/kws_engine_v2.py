@@ -147,9 +147,10 @@ class StreamingKWSv2:
         w_cos: float = 0.35,
         w_euc: float = 0.15,
         w_mlp: float = 0.25,
-        dtw_hard_threshold: float = 0.22,
-        cos_hard_threshold: float = 0.82,
-        sustained_fusion_threshold: float = 0.52,
+        dtw_hard_threshold: float = 0.15,
+        cos_hard_threshold: float = 0.90,
+        mlp_hard_threshold: float = 0.1,
+        sustained_fusion_threshold: float = 0.58,
         sustained_window: int = 3,
         window_sec: float = 1.5,
         stride_sec: float = 0.2,
@@ -166,6 +167,7 @@ class StreamingKWSv2:
         self.w_euc, self.w_mlp = w_euc, w_mlp
         self.dtw_hard_threshold = dtw_hard_threshold
         self.cos_hard_threshold = cos_hard_threshold
+        self.mlp_hard_threshold = mlp_hard_threshold
         self.sustained_fusion_threshold = sustained_fusion_threshold
         self.sustained_window = sustained_window
         self.window_size = int(16000 * window_sec)
@@ -191,7 +193,7 @@ class StreamingKWSv2:
         self._recent_fusions.clear()
         self._last_trigger_time = time.perf_counter()
 
-    def enroll(self, ref_paths: list[str], noise_paths: list[str] = None):
+    def enroll(self, ref_paths: list[str], noise_paths: list[str] = None, version_tag: str = None):
         X, y = [], []
         self.reference_sequences = []
         self.ref_means = []
@@ -248,6 +250,15 @@ class StreamingKWSv2:
         np.savez(save_dir / "ref_sequences.npz", *self.reference_sequences)
         np.save(save_dir / "pooled_ref.npy", self.pooled_ref)
 
+        if version_tag:
+            v_dir = save_dir / "versions" / version_tag
+            v_dir.mkdir(parents=True, exist_ok=True)
+            torch.save(self.mlp.state_dict(), v_dir / "mlp_weights.pth")
+            np.save(v_dir / "ref_means.npy", np.array(self.ref_means))
+            np.savez(v_dir / "ref_sequences.npz", *self.reference_sequences)
+            np.save(v_dir / "pooled_ref.npy", self.pooled_ref)
+            print(f"[KWSv2] Saved versioned model: {version_tag}")
+
         print(f"[KWSv2] Enrolled {len(ref_paths)} refs | "
               f"{len(noise_paths or [])} noise | emb_dim={embedding_dim}")
 
@@ -272,6 +283,19 @@ class StreamingKWSv2:
         except Exception as e:
             print(f"[KWSv2] Failed to load pre-trained model: {e}")
             return False
+
+    def load_version(self, version_tag: str) -> bool:
+        """Activate a previously saved versioned model by copying it to the active slot."""
+        import shutil
+        v_dir = Path(__file__).parent / "models" / "versions" / version_tag
+        if not (v_dir / "mlp_weights.pth").exists():
+            print(f"[KWSv2] Version {version_tag} not found.")
+            return False
+        save_dir = Path(__file__).parent / "models"
+        for fname in ["mlp_weights.pth", "ref_means.npy", "ref_sequences.npz", "pooled_ref.npy"]:
+            shutil.copy2(v_dir / fname, save_dir / fname)
+        print(f"[KWSv2] Activated version {version_tag}.")
+        return self.load_model()
 
     # internals
 
@@ -313,7 +337,7 @@ class StreamingKWSv2:
 
     # streaming inference (NO VAD)
 
-    async def process_chunk(self, audio_16k: np.ndarray):
+    def process_chunk(self, audio_16k: np.ndarray):
         try:
             self.buffer.extend(audio_16k)
             if not self.buffer.full:
@@ -357,15 +381,22 @@ class StreamingKWSv2:
             self._recent_fusions.append(fusion)
             self._recent_fusions = self._recent_fusions[-self.sustained_window:]
 
-            gate_a = fusion >= self.fusion_threshold
+            # All gates require MLP agreement to prevent false alarms.
+            # The Google speech embedding produces high CosFrm (~0.95) for
+            # ANY speech, so DTW+CosFrm alone are not discriminative.
+            mlp_ok = mlp_prob >= self.mlp_hard_threshold
+
+            gate_a = fusion >= self.fusion_threshold and mlp_ok
             gate_b = (
-                best_dtw      <  self.dtw_hard_threshold
+                best_dtw       <  self.dtw_hard_threshold
                 and best_cos_frame >= self.cos_hard_threshold
+                and mlp_ok
             )
             gate_c = (
                 len(self._recent_fusions) >= self.sustained_window
                 and all(s >= self.sustained_fusion_threshold
                         for s in self._recent_fusions)
+                and mlp_ok
             )
 
             triggered = gate_a or gate_b or gate_c

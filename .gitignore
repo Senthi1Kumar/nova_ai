@@ -24,3 +24,21 @@ nova/backend/kws/models/
 
 # Gemini
 .gemini/
+
+# IDE
+.vscode/
+
+# Pretrained models (large binaries)
+pretrained_models/
+nova/backend/pretrained_models/
+
+# Voice reference audio (user-specific, keep SETUP.md only)
+nova/backend/voices/*.wav
+
+# Logs directory
+logs/
+
+# External repos / experiments
+moonshine/
+speech-to-speech/
+sparknet/
