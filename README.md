@@ -1,100 +1,161 @@
 # Nova AI
 
-Nova is a high-performance, low-latency voice AI assistant designed for EV dashboards. It features a robust "Always Listening" wake-word engine, near-instant streaming transcription, and fluid voice synthesis, all optimized to run on consumer hardware.
+Nova is a high-performance, low-latency voice AI assistant designed for EV dashboards. It features a custom wake-word engine, streaming speech-to-text, real-time LLM reasoning with web search, and neural voice synthesis — all running as isolated multiprocessing workers communicating over lock-free queues.
 
-## 🚀 Key Features
+## Key Features
 
-- **Always Listening (KWS)**: A custom-trained Key Word Spotting engine using Google Speech Embeddings and a PyTorch MLP classifier.
-- **Hybrid Interaction**: Supports both hands-free wake-word activation ("Nova") and manual "Push to Talk" (PTT) modes.
-- **Streaming Pipeline**: True end-to-end streaming. Nova starts "thinking" and "speaking" while the transcription is still finalizing.
-- **VRAM Optimized**: Co-locates STT, LLM, and VAD models within 4GB VRAM using 4-bit quantization and shared model instances.
-- **Real-time Metrics**: Live tracking of STT, LLM, TTS, and End-to-End latencies for performance benchmarking.
+- **Multiprocessing Pipeline**: STT, LLM, TTS, and KWS run as separate processes communicating via `mp.Queue`, each with its own GPU allocation. No GIL contention.
+- **Always Listening (KWS)**: Custom-trained wake-word engine using Google Speech Embeddings + PyTorch MLP classifier. Supports versioned model snapshots with rollback.
+- **Hybrid Interaction**: Hands-free wake-word activation ("Nova") and manual Push-to-Talk (PTT) via WebRTC or WebSocket.
+- **Streaming STT**: Moonshine Voice (Medium) with built-in VAD — starts transcribing while the user is still speaking.
+- **Tool-Calling LLM**: OpenRouter API (Nemotron 49B, Qwen3.5, Gemini Flash) with streaming tool calls. Web search via [Dux Distributed Global Search](https://github.com/deedy5/ddgs) (`ddgs`) returns actual news headlines, not website links. Falls back to local Qwen3.5-0.8B (4-bit) when offline.
+- **Neural TTS**: FasterQwen3TTS with CUDA graph acceleration (12 kHz output, resampled to 24 kHz). Falls back to Pocket-TTS with multiple voice options.
+- **Layer 7 Dialogue Manager**: Intent classification (Gemma-300M semantic embeddings), payment flow with voice verification (ECAPA-TDNN voiceprint → PIN → Face ID), OTP, and mock commerce.
+- **Compound Vehicle Control**: "Switch off the AC and open the sunroof" handled as multiple actions in a single command.
+- **Echo Suppression**: TTS playback tracking with delayed STT unmute prevents the assistant from hearing its own voice.
+- **Real-time Metrics**: Live E2E, STT, LLM (TTFT + throughput), and TTS (TTFA + RTF) latency tracking.
 
-## 🛠 Tech Stack
+## Tech Stack
 
-| Component | Technology | Description |
+| Component | Technology | Details |
 | :--- | :--- | :--- |
-| **Protocol** | **FastAPI WebSockets** | Real-time binary audio and JSON metadata streaming. |
-| **STT** | **Faster-Whisper (Small)** | CTranslate2-based Whisper implementation for high-speed transcription. |
-| **LLM** | **SmolLM2-1.7B / Qwen2.5-0.5B** | 4-bit quantized (NF4) Instruct models for instant reasoning. |
-| **TTS** | **Pocket-TTS** | High-fidelity voice synthesis with background streaming tasks. |
-| **KWS/VAD** | **Silero + Google Embeddings** | Advanced voice activity and wake-word detection. |
+| **Gateway** | **FastAPI + FastRTC** | WebRTC (SDP) + WebSocket, FSM state machine, echo suppression |
+| **STT** | **Moonshine Voice (Medium)** | Streaming transcription with built-in VAD, ~0.5s latency |
+| **LLM** | **OpenRouter (Nemotron 49B)** | Streaming tool calls, web search, local Qwen3.5-0.8B fallback |
+| **TTS** | **FasterQwen3TTS** | CUDA graphs, voice cloning, 12→24 kHz resampling. Pocket-TTS fallback |
+| **KWS** | **Google Speech Embeddings + MLP** | Custom wake-word detection with versioned model snapshots |
+| **Intent** | **Gemma-300M Embeddings** | Semantic intent classification with regex entity extraction |
+| **Voice Auth** | **ECAPA-TDNN (SpeechBrain)** | Voiceprint verification, PIN fallback, Face ID fallback |
+| **Commerce** | **SQLite Mock Backend** | Merchant search, basket, checkout, payment with OTP |
 
-## 📊 Performance Metrics Explained
+## Architecture
 
-Nova tracks four critical latency stages to ensure a seamless "human-like" interaction:
+```text
+Browser (WebRTC/WS)
+    │
+    ▼
+┌─────────────────────────────────────────────────────┐
+│  FastAPI Gateway  (main.py)                         │
+│  FSM: IDLE → LISTENING → GENERATING → IDLE          │
+│  Echo suppression, delayed STT restart              │
+└──┬──────────┬──────────┬──────────┬─────────────────┘
+   │          │          │          │
+   ▼          ▼          ▼          ▼
+┌──────┐  ┌──────┐  ┌──────┐  ┌──────┐
+│ KWS  │  │ STT  │  │ LLM  │  │ TTS  │
+│Worker│  │Worker│  │Worker│  │Worker│
+└──────┘  └──────┘  └──────┘  └──────┘
+   mp.Queue ←──→ mp.Queue ←──→ mp.Queue
 
-1. **STT (TTFB - Time to First Byte)**: Time from voice stop to the first transcript appearing. Measures recognition speed.
-2. **LLM (TTFT - Time to First Token)**: Time from transcript completion to the first generated word. Measures "thinking" delay.
-3. **TTS (TTFA - Time to First Audio)**: Time from token generation to the first audible chunk being synthesized. Measures voice synthesis delay.
-4. **END-TO-END (E2E)**: The total duration from the moment the user stops speaking to the moment Nova's voice is heard. **Target: < 1.5s.**
+KWS → detects "Nova" → starts STT
+STT → transcribes → sends to LLM
+LLM → intent classify → stream tokens → sentence split → TTS
+TTS → generate audio chunks → send to browser
+```
 
-## 🎙 KWS Enrollment
+## Performance
 
-Nova includes a built-in enrollment UI to calibrate the wake-word engine to your specific voice and environment:
+| Metric | Description | Target |
+| :--- | :--- | :--- |
+| **STT TTFB** | Voice stop → first transcript | < 0.6s |
+| **LLM TTFT** | Transcript → first token | < 1.0s (API) |
+| **TTS TTFA** | Token → first audio chunk | < 0.5s |
+| **E2E** | Voice stop → Nova speaks | < 1.5s |
 
-1. **Wake Word**: Record 5 samples of you saying "Nova".
-2. **Noise**: Record 2 samples of your environment (car engine, AC, road noise).
-3. **Training**: The system automatically trains a PyTorch MLP classifier on top of the Google Speech Embeddings for high-precision rejection of non-wake-word speech.
+## KWS Enrollment + Voice Fingerprint
 
-## 📋 Prerequisites
+Nova includes a built-in enrollment UI:
+
+1. **Wake Word**: Record 5 samples of "Nova" + 5 noise samples → trains MLP classifier
+2. **Voice Fingerprint**: Record 5 speech phrases → computes ECAPA-TDNN embedding → encrypted voiceprint
+3. **KWS Versioning**: Each re-enrollment saves a timestamped snapshot. Switch between versions from the settings menu.
+
+## Payment Flow
+
+```text
+"Order a coffee from Starbucks"
+  → Intent: payment → merchant search → menu display
+  → "Yes" to confirm
+  → Voice verification (voiceprint match)
+    ✗ fail → PIN fallback → Face ID fallback
+    ✓ pass → Voice OTP (4-digit, spoken)
+  → OTP match → location check → payment processed
+```
+
+## Prerequisites
 
 - **OS**: Linux
-- **Hardware**: NVIDIA GPU with >= 4GB VRAM
+- **Hardware**: NVIDIA GPU with >= 6GB VRAM (STT + TTS + KWS co-located)
 - **Python**: 3.12+
 - **Tools**: [uv](https://docs.astral.sh/uv/)
 
-## 🏃 Quick Start
+## Quick Start
 
 1. **Clone the repository**:
 
    ```bash
    git clone --recursive https://github.com/Senthi1Kumar/nova_ai.git
    cd nova_ai
-
-   # Checkout to `v1.1` branch
-   git checkout v1.1
-
-   # If you already cloned the repository without --recursive, run this command:
+   git checkout v1.2
    git submodule update --init --recursive
    ```
 
-2. **Set OpenRouter API Key in `.env` file**
+2. **Set OpenRouter API Key**:
 
    ```bash
    cp .env.example .env
+   # Edit .env and add your OPENROUTER_API_KEY
    ```
 
-   Edit the `.env` file and add your OpenRouter API key.
-
-3. **Patch pocket-tts submodule**:
-   The `pocket-tts` submodule defaults to install CPU versions of PyTorch. Run this patch script to force CUDA compatibility before installing dependencies:
+3. **Patch pocket-tts submodule** (forces CUDA PyTorch):
 
    ```bash
    ./patch_pocket-tts_submodule.sh
    ```
 
-4. **Install Dependencies and activate `.venv`**:
+4. **Install dependencies**:
 
    ```bash
    uv sync
-   source .venv/bin/activate  # for linux
-   
-   .venv\Scripts\activate  # for windows
+   source .venv/bin/activate
    ```
 
-5. **Start Nova**:
+5. **Optional: Record a voice reference** for TTS (see `nova/backend/voices/SETUP.md`):
 
    ```bash
-   uv run nova/backend/main.py
+   arecord -d 8 -f cd -r 24000 -c 1 nova/backend/voices/nova_ref.wav
    ```
 
-6. **Access Dashboard**:
-   Navigate to `http://localhost:8000` and enable **"ALWAYS LISTENING"**.
+6. **Start Nova**:
 
-## 🏗 Directory Structure
+   ```bash
+   # With KWS wake-word detection:
+   uv run nova/backend/main.py
 
-- `nova/backend/`: FastAPI server, session management, and model loading.
-- `nova/backend/kws/`: Wake-word engine with MLP classifier and speech embedding model.
-- `nova/frontend/`: WebSocket-based dashboard and sequential audio playback logic.
-- `pocket-tts/`: (Submodule) High-performance TTS synthesis.
+   # Without KWS (always-listening mode):
+   uv run nova/backend/main.py --no-kws
+   ```
+
+7. **Open Dashboard**: Navigate to `http://localhost:8000`
+
+## Directory Structure
+
+```text
+nova/
+├── backend/
+│   ├── main.py                  # FastAPI gateway, FSM, WebRTC/WS
+│   ├── pipeline_mp/             # Multiprocessing workers
+│   │   ├── stt_moonshine_worker.py   # Moonshine streaming STT
+│   │   ├── llm_worker.py             # OpenRouter + local fallback LLM
+│   │   ├── tts_worker.py             # FasterQwen3TTS + Pocket-TTS
+│   │   └── kws_worker.py             # Wake-word detection worker
+│   ├── kws/                     # KWS engine, enrollment, synthetic data
+│   │   └── kws_engine_v2.py          # MLP classifier with versioned save/load
+│   ├── nova-l7/                 # (Submodule) Layer 7 dialogue system
+│   │   ├── L-7/                      # Intent classifier + dialogue manager
+│   │   └── L-3/                      # Voice/PIN/Face verification + commerce
+│   └── voices/                  # TTS voice reference audio
+├── frontend/
+│   └── index.html               # Dashboard UI (WebRTC + WebSocket)
+└── pocket-tts/                  # (Submodule) Pocket-TTS voice synthesis
+```
