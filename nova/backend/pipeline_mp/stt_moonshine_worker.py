@@ -22,6 +22,9 @@ def run_stt_worker(
     """
     Multiprocessing worker for Moonshine STT using MicTranscriber.
     audio -> mic capture -> VAD -> speaker identification -> STT -> app action
+
+    Supports runtime variant switching via "change_stt_variant" queue message.
+    Falls back to CPU automatically when CUDA is unavailable.
     """
     import setproctitle
     setproctitle.setproctitle("nova-stt-worker")
@@ -39,65 +42,108 @@ def run_stt_worker(
             ModelArch,
         )
         import numpy as np
-        import sounddevice as sd
+        import torch
     except ImportError as e:
         logger.error(f"Failed to import moonshine_voice or dependencies: {e}")
         return
 
-    logger.info("Initializing Moonshine STT (Medium Streaming)...")
+    # Add pipeline_mp to sys.path so stt_config is importable
+    pipeline_mp_dir = os.path.dirname(os.path.abspath(__file__))
+    if pipeline_mp_dir not in sys.path:
+        sys.path.insert(0, pipeline_mp_dir)
 
-    try:
-        model_path, model_arch = get_model_for_language("en", ModelArch.MEDIUM_STREAMING)
-        transcriber = Transcriber(model_path=model_path, model_arch=model_arch, options={"return_audio_data": "1"})
-        mic_stream = transcriber.create_stream(0.5)
+    from stt_config import STT_SETTINGS, STT_VARIANT_REGISTRY
 
-        # Intent recognition is handled by DialogueManager in LLM worker
-        # (IntentClassifier loads gemma-300m there; no need for a second copy here)
+    # ── Device detection ──────────────────────────────────────────────────────
+    has_cuda = torch.cuda.is_available()
+    device_label = "CUDA" if has_cuda else "CPU"
+    if not has_cuda:
+        logger.warning(
+            "CUDA not available — Moonshine will run on CPU. "
+            "Expect higher latency. Consider using 'tiny' variant for better RTF."
+        )
 
-        logger.info("Moonshine STT initialized and waiting for commands.")
-    except Exception as e:
-        logger.error(f"Failed to load Moonshine models: {e}")
+    # ── Model loader / unloader ───────────────────────────────────────────────
+    _transcriber_state: dict = {
+        "transcriber": None,
+        "mic_stream":  None,
+        "variant":     STT_SETTINGS.active,
+        "listener":    None,
+    }
+
+    def _load_variant(variant_key: str):
+        """Load a Moonshine variant, replacing any currently loaded model."""
+        if variant_key not in STT_VARIANT_REGISTRY:
+            logger.warning(f"Unknown STT variant '{variant_key}', keeping current.")
+            return
+
+        cfg = STT_VARIANT_REGISTRY[variant_key]
+        arch = getattr(ModelArch, cfg.model_arch_name)
+
+        ws_out_queue.put({
+            "type": "stt_variant_loading",
+            "data": {"variant": variant_key, "status": "loading", "device": device_label}
+        })
+        logger.info(f"Loading Moonshine {cfg.display_name} on {device_label} …")
+
+        try:
+            model_path, model_arch = get_model_for_language(cfg.language, arch)
+            new_transcriber = Transcriber(
+                model_path=model_path,
+                model_arch=model_arch,
+                options={"return_audio_data": "1"},
+            )
+            new_mic_stream = new_transcriber.create_stream(0.5)
+            _transcriber_state["transcriber"] = new_transcriber
+            _transcriber_state["mic_stream"]  = new_mic_stream
+            _transcriber_state["variant"]     = variant_key
+
+            # Re-attach the listener if one already exists
+            if _transcriber_state["listener"] is not None:
+                new_mic_stream.add_listener(_transcriber_state["listener"])
+
+            logger.info(f"Moonshine {cfg.display_name} ready on {device_label}.")
+            ws_out_queue.put({
+                "type": "stt_variant_loading",
+                "data": {"variant": variant_key, "status": "ready", "device": device_label}
+            })
+            ws_out_queue.put({
+                "type": "stt_variant_changed",
+                "data": {"variant": variant_key, "display_name": cfg.display_name}
+            })
+        except Exception as e:
+            logger.error(f"Failed to load Moonshine {variant_key}: {e}")
+            ws_out_queue.put({
+                "type": "stt_variant_loading",
+                "data": {"variant": variant_key, "status": "error", "error": str(e)}
+            })
+
+    # Initial load
+    _load_variant(STT_SETTINGS.active)
+
+    if _transcriber_state["transcriber"] is None:
+        logger.error("STT: initial model load failed — worker exiting.")
         return
 
+    # ── Session state ─────────────────────────────────────────────────────────
     state = {
         "session_active": False,
         "is_ptt": False,
         "should_listen": False,
-        "tts_muted": False,       # Echo suppression: mute mic while TTS is playing
-        "stream_started": False,   # mic_stream started once, never stopped (C lib doesn't support restart)
-        "ptt_stopping": False,     # PTT released — waiting for on_line_completed or timeout
-        "ptt_stop_time": 0.0,      # When PTT stop was requested (for timeout)
-        "session_start_time": 0.0, # When session was started (to reject stale stops)
+        "tts_muted": False,
+        "stream_started": False,
+        "ptt_stopping": False,
+        "ptt_stop_time": 0.0,
+        "session_start_time": 0.0,
     }
 
-    PTT_DRAIN_TIMEOUT = 3.0  # Max seconds to wait for moonshine to finish after PTT release
-
-    def audio_callback(in_data, _frames, _time, _status):
-        if not state["should_listen"] or state["tts_muted"]:
-            return
-        if in_data is not None:
-            try:
-                audio_data = in_data.astype(np.float32).flatten()
-                mic_stream.add_audio(audio_data, 16000)
-            except Exception as e:
-                error_msg = str(e)
-                if "VAD is not active" in error_msg or "moonshine-c-api" in error_msg.lower():
-                    pass
-                else:
-                    logger.debug(f"Audio callback error: {e}")
-
-    sd_stream = sd.InputStream(
-        samplerate=16000,
-        blocksize=1024,
-        channels=1,
-        dtype="float32",
-        callback=audio_callback,
-    )
-    sd_stream.start()
+    PTT_DRAIN_TIMEOUT = 3.0
 
     def _ensure_stream_started():
-        """Start mic_stream once. Never stop it — the C library doesn't support restart."""
         if not state["stream_started"]:
+            mic_stream = _transcriber_state["mic_stream"]
+            if mic_stream is None:
+                return
             try:
                 mic_stream.start()
                 state["stream_started"] = True
@@ -106,7 +152,6 @@ def run_stt_worker(
                 logger.error(f"Failed to start mic_stream: {e}")
 
     def _end_session():
-        """End the current STT session without touching mic_stream."""
         state["session_active"] = False
         state["should_listen"] = False
         state["is_ptt"] = False
@@ -137,14 +182,12 @@ def run_stt_worker(
             speaker_info = f"[Speaker #{event.line.speaker_index}] " if event.line.has_speaker_id else ""
             logger.info(f"STT Final: {speaker_info}'{transcript}' | Latency: {latency_ms/1000.0:.2f}s | RTF: {rtf:.2f}")
 
-            # Send transcript and metrics
             ws_out_queue.put({
                 "type": "transcript",
                 "data": transcript,
                 "latency": {"stt_ttfb": latency_ms / 1000.0, "stt_rtf": rtf}
             })
 
-            # Send to LLM worker with audio data for Layer 3
             llm_payload = {
                 "type": "text",
                 "text": transcript,
@@ -152,89 +195,119 @@ def run_stt_worker(
             if event.line.audio_data:
                 llm_payload["audio_data"] = event.line.audio_data
 
-            if transcript or (event.line.audio_data and not transcript):
+            if transcript:
                 llm_in_queue.put(llm_payload)
                 ws_out_queue.put({"type": "generation_start"})
             else:
                 ws_out_queue.put({"type": "recording_stopped"})
 
-            # In PTT mode, on_line_completed means we're done — end the session
             if state["is_ptt"]:
                 logger.info("PTT: line completed, ending session.")
                 _end_session()
-            # In auto-listen mode, keep session alive — just pause listening
-            # until generation_done restarts it via "start" message
             else:
                 logger.info("Auto-listen: line completed, pausing until generation_done.")
                 state["should_listen"] = False
                 state["session_active"] = False
 
     listener = STTListener()
-    mic_stream.add_listener(listener)
+    _transcriber_state["listener"] = listener
+    _transcriber_state["mic_stream"].add_listener(listener)
+
+    # Report available variants and current config to gateway
+    ws_out_queue.put({
+        "type": "stt_variants_available",
+        "data": {
+            "variants": {
+                k: {"display_name": v.display_name, "vram_mb": v.vram_mb}
+                for k, v in STT_VARIANT_REGISTRY.items()
+            },
+            "active": _transcriber_state["variant"],
+            "device": device_label,
+        }
+    })
 
     while not stop_event.is_set():
         try:
             msg = stt_in_queue.get(timeout=0.05)
         except Empty:
-            # Check PTT drain timeout
             if state["ptt_stopping"] and (time.time() - state["ptt_stop_time"]) > PTT_DRAIN_TIMEOUT:
                 logger.warning("PTT drain timeout — forcing session end.")
                 _end_session()
                 ws_out_queue.put({"type": "recording_stopped"})
             continue
 
-        if isinstance(msg, dict):
-            if msg.get("type") == "start":
-                if not state["session_active"]:
-                    state["session_active"] = True
-                    state["is_ptt"] = msg.get("ptt", False)
-                    state["ptt_stopping"] = False
-                    state["session_start_time"] = time.time()
-                    logger.info(f"STT Session Started (PTT: {state['is_ptt']})")
-                    _ensure_stream_started()
-                    state["should_listen"] = True
+        if isinstance(msg, bytes):
+            if state["should_listen"] and not state["tts_muted"]:
+                mic_stream = _transcriber_state["mic_stream"]
+                if mic_stream is not None:
+                    audio = np.frombuffer(msg, dtype=np.int16).astype(np.float32) / 32768.0
+                    try:
+                        mic_stream.add_audio(audio, 16000)
+                    except Exception as e:
+                        if "VAD is not active" not in str(e):
+                            logger.debug(f"add_audio error: {e}")
+            continue
 
-            elif msg.get("type") == "stop":
-                if state["session_active"]:
-                    # Reject stale stops that arrive within 0.5s of session start.
-                    # These are leftovers from previous flows racing through mp.Queue.
-                    age = time.time() - state["session_start_time"]
-                    if age < 0.5 and not state["is_ptt"]:
-                        logger.info(f"Ignoring stale stop (session age={age:.2f}s < 0.5s)")
-                        continue
-                    if state["is_ptt"]:
-                        # PTT release: stop feeding audio but let moonshine drain
-                        # on_line_completed will end the session, or timeout will
-                        logger.info("PTT released — draining buffered audio...")
-                        state["should_listen"] = False
-                        state["ptt_stopping"] = True
-                        state["ptt_stop_time"] = time.time()
-                    else:
-                        # Auto-listen stop from gateway (silence timeout or explicit stop)
-                        logger.info("STT Session Stopped (auto-listen).")
-                        _end_session()
-                        # Notify gateway so it can restart the listen cycle
-                        ws_out_queue.put({"type": "recording_stopped"})
+        if not isinstance(msg, dict):
+            continue
 
-            elif msg.get("type") == "interrupted":
-                if state["session_active"]:
-                    logger.info("STT Session Interrupted")
+        msg_type = msg.get("type")
+
+        if msg_type == "change_stt_variant":
+            requested = msg.get("data", "")
+            if requested == _transcriber_state["variant"]:
+                continue
+            if state["session_active"]:
+                logger.warning("Cannot switch STT variant mid-session — ignoring.")
+                continue
+            # Reset stream_started so the new stream can be started fresh
+            state["stream_started"] = False
+            _load_variant(requested)
+
+        elif msg_type == "start":
+            if not state["session_active"]:
+                state["session_active"] = True
+                state["is_ptt"] = msg.get("ptt", False)
+                state["ptt_stopping"] = False
+                state["session_start_time"] = time.time()
+                logger.info(f"STT Session Started (PTT: {state['is_ptt']})")
+                _ensure_stream_started()
+                state["should_listen"] = True
+
+        elif msg_type == "stop":
+            if state["session_active"]:
+                age = time.time() - state["session_start_time"]
+                if age < 0.5 and not state["is_ptt"]:
+                    logger.info(f"Ignoring stale stop (session age={age:.2f}s < 0.5s)")
+                    continue
+                if state["is_ptt"]:
+                    logger.info("PTT released — draining buffered audio...")
+                    state["should_listen"] = False
+                    state["ptt_stopping"] = True
+                    state["ptt_stop_time"] = time.time()
+                else:
+                    logger.info("STT Session Stopped (auto-listen).")
                     _end_session()
+                    ws_out_queue.put({"type": "recording_stopped"})
 
-            elif msg.get("type") == "tts_mute":
-                state["tts_muted"] = True
+        elif msg_type == "interrupted":
+            if state["session_active"]:
+                logger.info("STT Session Interrupted")
+                _end_session()
 
-            elif msg.get("type") == "tts_unmute":
-                state["tts_muted"] = False
+        elif msg_type == "tts_mute":
+            state["tts_muted"] = True
 
-        elif isinstance(msg, bytes):
-            pass
+        elif msg_type == "tts_unmute":
+            state["tts_muted"] = False
 
     try:
-        sd_stream.stop()
-        sd_stream.close()
-        mic_stream.close()
-        transcriber.close()
+        mic_stream = _transcriber_state["mic_stream"]
+        transcriber = _transcriber_state["transcriber"]
+        if mic_stream:
+            mic_stream.close()
+        if transcriber:
+            transcriber.close()
     except Exception:
         pass
 

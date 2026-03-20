@@ -62,8 +62,11 @@ class RingBuffer:
 
 class GoogleEmbeddingModel:
     def __init__(self, model_path: str):
+        # Use CPU — this model is small (~7 MB) and KWS runs in its own process.
+        # CUDAExecutionProvider requires cuBLAS matching the onnxruntime-gpu build
+        # (e.g. CUDA 12 vs system CUDA 13), causing load errors. CPU avoids this.
         self.session    = ort.InferenceSession(model_path,
-        providers=["CUDAExecutionProvider"])
+        providers=["CPUExecutionProvider"])
         self.input_name = self.session.get_inputs()[0].name
 
     def predict(self, audio_16k: np.ndarray) -> np.ndarray:
@@ -78,7 +81,7 @@ class GoogleEmbeddingModel:
             return emb[0, :, 0, :]
         elif emb.ndim == 3:
             return emb[0, :, :]
-        return emb
+        return emb # type: ignore
 
 
 # Distance / similarity helpers

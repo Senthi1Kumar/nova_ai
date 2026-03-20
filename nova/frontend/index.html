@@ -193,7 +193,7 @@
                     </div>
                     <div>
                         <div class="flex justify-between text-[10px] mb-1 tracking-wider">
-                            <span class="opacity-60">GPU VRAM (4 GB)</span>
+                            <span id="gpu-vram-label" class="opacity-60">GPU VRAM</span>
                             <span id="gpu-mem-val">0 MB</span>
                         </div>
                         <div class="progress-bar rounded-full">
@@ -299,33 +299,46 @@
                 </div>
 
                 <!-- Options select -->
-                <div class="mt-4 flex-shrink-0 flex gap-2">
-                    <div class="flex-1">
-                        <p class="text-[9px] opacity-40 tracking-widest mb-1">TTS VOICE</p>
-                        <select id="voice-select" title="TTS Voice"
-                            class="w-full bg-black border border-[#00ffcc]/40 text-[#00ffcc]
-                                   text-[10px] p-2 rounded outline-none tracking-wider">
-                            <option value="alba"    selected>Alba</option>
-                            <option value="marius"  >Marius</option>
-                            <option value="javert"  >Javert</option>
-                            <option value="jean"    >Jean</option>
-                            <option value="fantine" >Fantine</option>
-                            <option value="cosette" >Cosette</option>
-                            <option value="eponine" >Eponine</option>
-                            <option value="azelma"  >Azelma</option>
-                        </select>
+                <div class="mt-4 flex-shrink-0 space-y-2">
+                    <div class="flex gap-2">
+                        <div class="flex-1">
+                            <p class="text-[9px] opacity-40 tracking-widest mb-1">TTS ENGINE</p>
+                            <select id="tts-engine-select" title="TTS Engine"
+                                class="w-full bg-black border border-[#00ffcc]/40 text-[#00ffcc]
+                                       text-[10px] p-2 rounded outline-none tracking-wider">
+                                <option value="faster-qwen3" selected>FasterQwen3TTS</option>
+                                <option value="pocket-tts">Pocket-TTS</option>
+                            </select>
+                        </div>
+                        <div class="flex-1">
+                            <p class="text-[9px] opacity-40 tracking-widest mb-1">VOICE</p>
+                            <select id="voice-select" title="TTS Voice"
+                                class="w-full bg-black border border-[#00ffcc]/40 text-[#00ffcc]
+                                       text-[10px] p-2 rounded outline-none tracking-wider">
+                            </select>
+                        </div>
                     </div>
-                    <div class="flex-1">
-                        <p class="text-[9px] opacity-40 tracking-widest mb-1">LLM MODEL</p>
-                        <select id="llm-select" title="LLM Model"
-                            class="w-full bg-black border border-[#00ffcc]/40 text-[#00ffcc]
-                                   text-[10px] p-2 rounded outline-none tracking-wider">
-                            <option value="nvidia/llama-3.3-nemotron-super-49b-v1.5" selected>Nemotron 49B</option>
-                            <option value="qwen/qwen3.5-9b">Qwen 3.5 9B</option>
-                            <option value="google/gemini-2.5-flash">Gemini 2.5 Flash</option>
-                            <option value="meta-llama/llama-3.1-8b-instruct">Llama 3.1 8B</option>
-                        </select>
+                    <div class="flex gap-2">
+                        <div class="flex-1">
+                            <p class="text-[9px] opacity-40 tracking-widest mb-1">LLM MODEL</p>
+                            <select id="llm-select" title="LLM Model"
+                                class="w-full bg-black border border-[#00ffcc]/40 text-[#00ffcc]
+                                       text-[10px] p-2 rounded outline-none tracking-wider">
+                                <option value="auto" selected>Auto (smart routing)</option>
+                            </select>
+                        </div>
+                        <div class="flex-1">
+                            <p class="text-[9px] opacity-40 tracking-widest mb-1">STT MODEL</p>
+                            <select id="stt-variant-select" title="STT Variant"
+                                class="w-full bg-black border border-[#00ffcc]/40 text-[#00ffcc]
+                                       text-[10px] p-2 rounded outline-none tracking-wider">
+                                <option value="tiny">Tiny (~200 MB)</option>
+                                <option value="small" selected>Small (~400 MB)</option>
+                                <option value="medium">Medium (~800 MB)</option>
+                            </select>
+                        </div>
                     </div>
+                    <p id="vram-warning" class="text-[9px] text-yellow-400 mt-1 hidden"></p>
                 </div>
             </div>
 
@@ -507,6 +520,21 @@
                 input = audioContext.createMediaStreamSource(localStream);
                 analyser = audioContext.createAnalyser();
                 input.connect(analyser);
+
+                // Stream 16kHz PCM to server via WebSocket for STT
+                const pcmProcessor = audioContext.createScriptProcessor(4096, 1, 1);
+                pcmProcessor.onaudioprocess = (e) => {
+                    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+                    const float32 = e.inputBuffer.getChannelData(0);
+                    const int16 = new Int16Array(float32.length);
+                    for (let i = 0; i < float32.length; i++) {
+                        int16[i] = Math.max(-32768, Math.min(32767, float32[i] * 32768));
+                    }
+                    ws.send(int16.buffer);
+                };
+                input.connect(pcmProcessor);
+                pcmProcessor.connect(audioContext.destination);
+
                 drawVisualizer();
             } catch (micErr) {
                 console.warn('Mic not available for visualizer:', micErr);
@@ -527,8 +555,10 @@
                 document.getElementById('connection-status').textContent = 'ONLINE';
                 document.getElementById('connection-status').className = 'text-green-400 font-bold text-sm tracking-widest';
                 setUIState('idle');
+                sendUIEvent("change_tts_engine", document.getElementById('tts-engine-select').value);
                 sendUIEvent("change_voice", document.getElementById('voice-select').value);
                 sendUIEvent("change_llm", document.getElementById('llm-select').value);
+                // Don't send variant on connect — server reports active variant via stt_variants_available
             };
 
             ws.onmessage = (event) => {
@@ -665,8 +695,26 @@
                 break;
 
             case 'kws_version_activated':
-                if (msg.success) refreshKwsVersionList();
+                refreshKwsVersionList();
                 break;
+
+            case 'stt_variant_changed': {
+                const sel = document.getElementById('stt-variant-select');
+                if (sel && msg.data?.variant) sel.value = msg.data.variant;
+                break;
+            }
+
+            case 'stt_variant_loading': {
+                const d = msg.data || {};
+                if (d.status === 'loading') {
+                    console.log(`[STT] Loading ${d.variant} on ${d.device}…`);
+                } else if (d.status === 'ready') {
+                    console.log(`[STT] ${d.variant} ready on ${d.device}`);
+                } else if (d.status === 'error') {
+                    console.warn(`[STT] Failed to load ${d.variant}: ${d.error}`);
+                }
+                break;
+            }
         }
     }
 
@@ -686,11 +734,133 @@
     pttBtn.addEventListener('touchstart', (e) => { e.preventDefault(); sendPTT('start_ptt'); });
     pttBtn.addEventListener('touchend',   (e) => { e.preventDefault(); sendPTT('stop_ptt'); });
 
+    // ── TTS engine/voice management ─────────────────────────────────────────
+    let ttsInfo = null;
+
+    async function loadTTSInfo() {
+        try {
+            ttsInfo = await (await fetch('/tts/info')).json();
+            const engineSel = document.getElementById('tts-engine-select');
+            engineSel.value = ttsInfo.current_engine;
+            populateVoices(ttsInfo.current_engine);
+        } catch (_) {}
+    }
+
+    function populateVoices(engineId) {
+        const voiceSel = document.getElementById('voice-select');
+        voiceSel.innerHTML = '';
+        if (!ttsInfo) return;
+        const engine = ttsInfo.engines.find(e => e.id === engineId);
+        if (!engine || !engine.voices.length) {
+            voiceSel.innerHTML = '<option value="">— no voices —</option>';
+            voiceSel.disabled = true;
+            return;
+        }
+        voiceSel.disabled = false;
+        for (const v of engine.voices) {
+            const opt = document.createElement('option');
+            opt.value = v.id;
+            opt.textContent = v.name;
+            voiceSel.appendChild(opt);
+        }
+        // Restore current voice if it belongs to this engine
+        if (ttsInfo.current_engine === engineId && engine.voices.some(v => v.id === ttsInfo.current_voice)) {
+            voiceSel.value = ttsInfo.current_voice;
+        }
+    }
+
+    document.getElementById('tts-engine-select').onchange = (e) => {
+        const engineId = e.target.value;
+        sendUIEvent('change_tts_engine', engineId);
+        populateVoices(engineId);
+        // Auto-select first voice for the new engine
+        const voiceSel = document.getElementById('voice-select');
+        if (voiceSel.value) sendUIEvent('change_voice', voiceSel.value);
+        checkVramBudget();
+    };
+
     document.getElementById('voice-select').onchange = (e) =>
         sendUIEvent('change_voice', e.target.value);
 
-    document.getElementById('llm-select').onchange = (e) =>
+    document.getElementById('llm-select').onchange = (e) => {
         sendUIEvent('change_llm', e.target.value);
+        checkVramBudget();
+    };
+
+    document.getElementById('stt-variant-select').onchange = (e) =>
+        sendUIEvent('change_stt_variant', e.target.value);
+
+    loadTTSInfo();
+
+    // ── LLM info + VRAM budget ───────────────────────────────────────────
+    let llmInfo = null;
+
+    async function loadLLMInfo() {
+        try {
+            llmInfo = await (await fetch('/llm/info')).json();
+            const sel = document.getElementById('llm-select');
+            sel.innerHTML = '<option value="auto">Auto (smart routing)</option>';
+
+            if (llmInfo.cloud_models.length) {
+                const grp1 = document.createElement('optgroup');
+                grp1.label = 'Cloud (OpenRouter)';
+                for (const m of llmInfo.cloud_models) {
+                    const opt = document.createElement('option');
+                    opt.value = m.id;
+                    opt.textContent = m.name;
+                    grp1.appendChild(opt);
+                }
+                sel.appendChild(grp1);
+            }
+
+            if (llmInfo.local_models.length) {
+                const grp2 = document.createElement('optgroup');
+                grp2.label = 'Local (on-device)';
+                for (const m of llmInfo.local_models) {
+                    const opt = document.createElement('option');
+                    opt.value = m.id;
+                    opt.textContent = `${m.name} (~${m.vram_mb} MB)`;
+                    grp2.appendChild(opt);
+                }
+                sel.appendChild(grp2);
+            }
+
+            sel.value = llmInfo.current_llm;
+        } catch (_) {}
+    }
+
+    function checkVramBudget() {
+        const warn = document.getElementById('vram-warning');
+        if (!ttsInfo || !llmInfo || !llmInfo.gpu_total_mb) { warn.classList.add('hidden'); return; }
+
+        const gpuTotal = llmInfo.gpu_total_mb;
+        const baseline = llmInfo.baseline_vram_mb || 850;
+
+        const ttsEngine = document.getElementById('tts-engine-select').value;
+        const llmModel = document.getElementById('llm-select').value;
+
+        const ttsEntry = ttsInfo.engines.find(e => e.id === ttsEngine);
+        const ttsVram = ttsEntry ? (ttsEntry.vram_mb || 0) : 0;
+
+        let llmVram = 0;
+        if (llmModel.startsWith('local:')) {
+            const lm = llmInfo.local_models.find(m => m.id === llmModel);
+            llmVram = lm ? lm.vram_mb : 0;
+        } else if (llmModel === 'auto') {
+            const defaultLocal = llmInfo.local_models[0];
+            llmVram = defaultLocal ? defaultLocal.vram_mb : 0;
+        }
+
+        const total = baseline + ttsVram + llmVram;
+        if (total > gpuTotal) {
+            warn.textContent = `VRAM warning: ${ttsEngine} (${ttsVram} MB) + LLM (${llmVram} MB) + baseline (${baseline} MB) = ${total} MB > ${gpuTotal} MB GPU — may OOM`;
+            warn.classList.remove('hidden');
+        } else {
+            warn.classList.add('hidden');
+        }
+    }
+
+    loadLLMInfo();
 
     // ── car controls ──────────────────────────────────────────────────────────
     const CAR_CTRL_LABELS = { sunroof: ['CLOSED', 'OPEN'], ac: ['OFF', 'ON'], heater: ['OFF', 'ON'], lights: ['OFF', 'ON'] };
@@ -822,16 +992,17 @@
     }
 
     async function refreshKwsVersionList() {
-        const res = await fetch('/enroll/kws-models').then(r => r.json()).catch(() => ({ versions: [] }));
+        const res = await fetch('/enroll/kws-models').then(r => r.json()).catch(() => ({ versions: [], active_version: null }));
         const versions = res.versions || [];
+        const activeVersion = res.active_version;
         const list = document.getElementById('kws-version-list');
         list.innerHTML = '';
         if (versions.length === 0) {
             list.innerHTML = '<p class="text-[9px] opacity-40">No saved versions yet.</p>';
             return;
         }
-        versions.forEach((v, idx) => {
-            const isActive = idx === 0; // most recent = active
+        versions.forEach((v) => {
+            const isActive = v === activeVersion;
             const label = `${v.slice(0,4)}-${v.slice(4,6)}-${v.slice(6,8)} ${v.slice(9,11)}:${v.slice(11,13)}`;
             list.innerHTML += `
                 <div class="flex items-center justify-between border border-[#00ffcc]/20 rounded-lg px-3 py-2">
@@ -1224,8 +1395,11 @@
             document.getElementById('cpu-val').textContent      = `${d.cpu.toFixed(0)}%`;
             document.getElementById('cpu-bar').style.width      = `${d.cpu}%`;
             document.getElementById('gpu-mem-val').textContent  = `${d.gpu_mem.toFixed(0)} MB`;
+            const vramTotal = d.gpu_mem_total || 4096;
+            document.getElementById('gpu-vram-label').textContent =
+                `GPU VRAM (${(vramTotal / 1024).toFixed(0)} GB)`;
             document.getElementById('gpu-mem-bar').style.width  =
-                `${Math.min((d.gpu_mem / 4096) * 100, 100)}%`;
+                `${Math.min((d.gpu_mem / vramTotal) * 100, 100)}%`;
             document.getElementById('gpu-util-val').textContent = `${d.gpu_util.toFixed(0)}%`;
             document.getElementById('gpu-util-bar').style.width = `${d.gpu_util}%`;
 

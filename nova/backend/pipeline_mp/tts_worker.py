@@ -1,14 +1,16 @@
 """
-TTS Worker — FasterQwen3TTS (primary, CUDA graphs) with Pocket-TTS fallback.
+TTS Worker — Lazy-loaded engines: only the active engine occupies GPU memory.
 
-Voice reference:
+Default: Pocket-TTS (low VRAM ~150 MB).  FasterQwen3TTS (~2.75 GB) loaded on demand.
+Switching engines unloads the old model and frees VRAM before loading the new one.
+
+Voice reference (Qwen3):
   Primary:  nova/backend/voices/nova_ref.wav   (record any clear 5-10s sample)
   Fallback: first available KWS enrollment sample
 
 Qwen3-TTS outputs 12 kHz audio; this worker resamples to 24 kHz before
 sending so the rest of the pipeline stays unchanged.
 """
-import os
 import time
 import wave
 import struct
@@ -66,7 +68,7 @@ def _resample_12k_to_24k(audio: np.ndarray) -> np.ndarray:
         ).astype(np.float32)
 
 
-# worker 
+# worker
 
 def run_tts_worker(
     tts_in_queue: mp.Queue,  # type: ignore[type-arg]
@@ -81,17 +83,40 @@ def run_tts_worker(
     import logging as _logging
     _logging.getLogger("sox").setLevel(_logging.ERROR)
 
-    use_qwen   = False
+    # ── Check availability (can import?) without loading into GPU ─────────────
+    qwen_available = False
+    pocket_available = False
+
+    try:
+        from faster_qwen3_tts import FasterQwen3TTS  # noqa: F401
+        qwen_available = True
+        logger.info("FasterQwen3TTS package available.")
+    except ImportError:
+        logger.info("FasterQwen3TTS not installed — engine unavailable.")
+
+    try:
+        from pocket_tts import TTSModel  # noqa: F401
+        pocket_available = True
+        logger.info("Pocket-TTS package available.")
+    except ImportError:
+        logger.info("Pocket-TTS not installed — engine unavailable.")
+
+    # ── Mutable model state (only one engine loaded at a time) ────────────────
     qwen_model = None
     ref_audio  = None
+    pocket_model  = None
+    voice_catalog: dict = {}
 
-    # Try FasterQwen3TTS
-    try:
+    def _load_qwen():
+        nonlocal qwen_model, ref_audio
+        if not qwen_available or qwen_model is not None:
+            return
         from faster_qwen3_tts import FasterQwen3TTS
 
         logger.info("Loading FasterQwen3TTS (Qwen/Qwen3-TTS-12Hz-0.6B-Base) …")
-        qwen_model = FasterQwen3TTS.from_pretrained("Qwen/Qwen3-TTS-12Hz-0.6B-Base")
+        ws_out_queue.put({"type": "engine_loading", "data": {"engine": "faster-qwen3", "status": "loading"}})
 
+        qwen_model = FasterQwen3TTS.from_pretrained("Qwen/Qwen3-TTS-12Hz-0.6B-Base")
         ref_audio = _find_ref_audio()
         if ref_audio is None:
             ref_audio = _make_silence_wav(_NOVA_REF)
@@ -102,10 +127,7 @@ def run_tts_worker(
                 f"it to {_NOVA_REF}"
             )
 
-        use_qwen = True
-        logger.info(f"FasterQwen3TTS ready. Voice ref: {ref_audio}")
-
-        # Warm up CUDA graphs at init — avoids ~60s delay on first real request
+        # Warm up CUDA graphs — avoids ~60s delay on first real request
         logger.info("Warming up CUDA graphs (silent dummy generation)...")
         try:
             for _chunk, _sr, _timing in qwen_model.generate_voice_clone_streaming(
@@ -120,45 +142,78 @@ def run_tts_worker(
         except Exception as warm_e:
             logger.warning(f"CUDA graph warmup failed (non-fatal): {warm_e}")
 
-    except Exception as e:
-        logger.warning(f"FasterQwen3TTS unavailable ({e}) — falling back to Pocket-TTS.")
+        logger.info(f"FasterQwen3TTS ready. Voice ref: {ref_audio}")
+        ws_out_queue.put({"type": "engine_loading", "data": {"engine": "faster-qwen3", "status": "ready"}})
 
-    # Pocket-TTS fallback
-    pocket_model  = None
-    voice_catalog: dict = {}
+    def _unload_qwen():
+        nonlocal qwen_model, ref_audio
+        if qwen_model is None:
+            return
+        import torch
+        del qwen_model
+        qwen_model = None
+        ref_audio = None
+        torch.cuda.empty_cache()
+        logger.info("FasterQwen3TTS unloaded — VRAM freed.")
 
-    if not use_qwen:
-        try:
-            import torch
-            from pocket_tts import TTSModel
-            # from huggingface_hub import login
+    def _load_pocket():
+        nonlocal pocket_model, voice_catalog
+        if not pocket_available or pocket_model is not None:
+            return
+        import torch
+        from pocket_tts import TTSModel
 
-            # hf_token = os.environ.get("HF_TOKEN")
-            # if hf_token:
-            #     login(token=hf_token)
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        logger.info(f"Loading Pocket-TTS on {device} …")
+        ws_out_queue.put({"type": "engine_loading", "data": {"engine": "pocket-tts", "status": "loading"}})
 
-            device = "cuda" if torch.cuda.is_available() else "cpu"
-            logger.info(f"Loading Pocket-TTS on {device} …")
-            pocket_model = TTSModel.load_model().to(device)
+        pocket_model = TTSModel.load_model().to(device)
 
-            for voice in ["alba", "marius", "javert", "jean", "fantine", "cosette", "eponine", "azelma"]:
-                try:
-                    state = pocket_model.get_state_for_audio_prompt(voice)
-                    for mod, mod_state in state.items():
-                        for k, v in mod_state.items():
-                            if isinstance(v, torch.Tensor):
-                                state[mod][k] = v.to(device)
-                    voice_catalog[voice] = state
-                except Exception as ve:
-                    logger.error(f"Failed voice {voice}: {ve}")
+        for voice in ["alba", "marius", "javert", "jean", "fantine", "cosette", "eponine", "azelma"]:
+            try:
+                state = pocket_model.get_state_for_audio_prompt(voice)
+                for mod, mod_state in state.items():
+                    for k, v in mod_state.items():
+                        if isinstance(v, torch.Tensor):
+                            state[mod][k] = v.to(device)
+                voice_catalog[voice] = state
+            except Exception as ve:
+                logger.error(f"Failed voice {voice}: {ve}")
 
-            logger.info("Pocket-TTS loaded.")
-        except Exception as e:
-            logger.error(f"Failed to load Pocket-TTS: {e}")
+        logger.info("Pocket-TTS loaded.")
+        ws_out_queue.put({"type": "engine_loading", "data": {"engine": "pocket-tts", "status": "ready"}})
+
+    def _unload_pocket():
+        nonlocal pocket_model, voice_catalog
+        if pocket_model is None:
+            return
+        import torch
+        del pocket_model
+        pocket_model = None
+        voice_catalog.clear()
+        torch.cuda.empty_cache()
+        logger.info("Pocket-TTS unloaded — VRAM freed.")
+
+    # ── Load ONLY the default engine (pocket-tts = low VRAM) ──────────────────
+    current_engine = "pocket-tts"
+    if pocket_available:
+        _load_pocket()
+    elif qwen_available:
+        _load_qwen()
+        current_engine = "faster-qwen3"
+    else:
+        logger.error("No TTS engine available!")
+
+    logger.info(f"Active TTS engine: {current_engine}")
+
+    # Report available engines to gateway
+    ws_out_queue.put({"type": "tts_engines_available", "data": {
+        "faster-qwen3": qwen_available,
+        "pocket-tts": pocket_available,
+    }})
 
     # main loop
     current_voice = "alba"
-    # Use mp.Event for interrupt signaling (avoids queue reordering from get_nowait)
     _interrupt = tts_interrupt_event  # alias for readability
 
     while not stop_event.is_set():
@@ -172,6 +227,24 @@ def run_tts_worker(
 
         if msg.get("type") == "change_voice":
             current_voice = msg.get("data", current_voice)
+            continue
+
+        if msg.get("type") == "change_tts_engine":
+            requested = msg.get("data", current_engine)
+            if requested == current_engine:
+                continue
+            if requested == "faster-qwen3" and qwen_available:
+                _unload_pocket()
+                _load_qwen()
+                current_engine = "faster-qwen3"
+                logger.info("Switched TTS engine → FasterQwen3TTS.")
+            elif requested == "pocket-tts" and pocket_available:
+                _unload_qwen()
+                _load_pocket()
+                current_engine = "pocket-tts"
+                logger.info("Switched TTS engine → Pocket-TTS.")
+            else:
+                logger.warning(f"Cannot switch to '{requested}' — engine not available.")
             continue
 
         if msg.get("type") == "eof":
@@ -207,7 +280,7 @@ def run_tts_worker(
             t0          = time.time()
             first_chunk = True
 
-            if use_qwen and qwen_model is not None:
+            if current_engine == "faster-qwen3" and qwen_model is not None:
                 # FasterQwen3TTS streaming (CUDA graphs, 12 kHz → 24 kHz)
                 # Timeout: ~1s of TTS output per word, min 10s.  Prevents hangs on garbage.
                 word_count = len(text.split())
@@ -247,7 +320,7 @@ def run_tts_worker(
 
                     ws_out_queue.put({"type": "audio_out", "bytes": pcm_bytes})
 
-            elif pocket_model is not None:
+            elif current_engine == "pocket-tts" and pocket_model is not None:
                 # ── Pocket-TTS streaming (24 kHz) ─────────────────────────────
                 import torch
                 voice_state = voice_catalog.get(current_voice)

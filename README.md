@@ -12,15 +12,17 @@ Nova is a high-performance, low-latency voice AI assistant designed for EV dashb
 - **Neural TTS**: FasterQwen3TTS with CUDA graph acceleration (12 kHz output, resampled to 24 kHz). Falls back to Pocket-TTS with multiple voice options.
 - **Layer 7 Dialogue Manager**: Intent classification (Gemma-300M semantic embeddings), payment flow with voice verification (ECAPA-TDNN voiceprint → PIN → Face ID), OTP, and mock commerce.
 - **Compound Vehicle Control**: "Switch off the AC and open the sunroof" handled as multiple actions in a single command.
-- **Echo Suppression**: TTS playback tracking with delayed STT unmute prevents the assistant from hearing its own voice.
+- **Echo Suppression**: Accurate TTS playback tracking (`total_samples / 24kHz - elapsed`) with delayed STT unmute prevents the assistant from hearing its own voice.
+- **Conversation Storage**: PostgreSQL session + turn history with intent, entities, latency, FSM state, and routing per turn.
 - **Real-time Metrics**: Live E2E, STT, LLM (TTFT + throughput), and TTS (TTFA + RTF) latency tracking.
 
 ## Tech Stack
 
 | Component | Technology | Details |
 | :--- | :--- | :--- |
-| **Gateway** | **FastAPI + FastRTC** | WebRTC (SDP) + WebSocket, FSM state machine, echo suppression |
-| **STT** | **Moonshine Voice (Medium)** | Streaming transcription with built-in VAD, ~0.5s latency |
+| **Gateway** | **FastAPI + FastRTC** | WebRTC (SDP) + WebSocket PCM streaming, FSM state machine, echo suppression |
+| **STT** | **Moonshine Voice (Medium)** | Streaming transcription with built-in VAD, ~0.5s latency. PCM fed via WebSocket ScriptProcessor |
+| **Storage** | **PostgreSQL + asyncpg** | Session + turn history: intent, entities, latency, FSM state per turn |
 | **LLM** | **OpenRouter (Nemotron 49B)** | Streaming tool calls, web search, local Qwen3.5-0.8B fallback |
 | **TTS** | **FasterQwen3TTS** | CUDA graphs, voice cloning, 12→24 kHz resampling. Pocket-TTS fallback |
 | **KWS** | **Google Speech Embeddings + MLP** | Custom wake-word detection with versioned model snapshots |
@@ -85,9 +87,11 @@ Nova includes a built-in enrollment UI:
 ## Prerequisites
 
 - **OS**: Linux
-- **Hardware**: NVIDIA GPU with >= 6GB VRAM (STT + TTS + KWS co-located)
+- **Hardware**: NVIDIA GPU with >= 4GB VRAM
+- **CUDA**: 13.0 (required for PyTorch GPU acceleration)
 - **Python**: 3.12+
 - **Tools**: [uv](https://docs.astral.sh/uv/)
+- **PostgreSQL**: 16+ (for conversation storage)
 
 ## Quick Start
 
@@ -100,33 +104,66 @@ Nova includes a built-in enrollment UI:
    git submodule update --init --recursive
    ```
 
-2. **Set OpenRouter API Key**:
+2. **Set environment variables**:
 
    ```bash
    cp .env.example .env
-   # Edit .env and add your OPENROUTER_API_KEY
+   # Edit .env and add your OPENROUTER_API_KEY and NOVA_DB_URL
    ```
 
-3. **Patch pocket-tts submodule** (forces CUDA PyTorch):
+3. **Set up PostgreSQL** (conversation storage):
+
+   ```bash
+   # Create DB and user
+   sudo -u postgres psql -c "CREATE USER nova WITH PASSWORD 'nova_dev';"
+   sudo -u postgres psql -c "CREATE DATABASE nova_db OWNER nova;"
+
+   # Create schema
+   psql postgresql://nova:nova_dev@localhost/nova_db <<'SQL'
+   CREATE TABLE sessions (
+     session_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+     driver_id  TEXT NOT NULL DEFAULT 'driver1',
+     started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+     ended_at   TIMESTAMPTZ
+   );
+   CREATE TABLE turns (
+     turn_id        UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+     session_id     UUID REFERENCES sessions(session_id) ON DELETE CASCADE,
+     turn_index     INT NOT NULL,
+     ts             TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+     user_text      TEXT,
+     intent         TEXT,
+     entities       JSONB,
+     nova_response  TEXT,
+     fsm_state      TEXT,
+     routing        TEXT,
+     stt_latency_ms INT
+   );
+   SQL
+   ```
+
+   Set `NOVA_DB_URL=postgresql://nova:nova_dev@localhost/nova_db` in `.env`. Storage is optional — Nova runs without it if `NOVA_DB_URL` is unset.
+
+4. **Patch pocket-tts submodule** (forces CUDA PyTorch):
 
    ```bash
    ./patch_pocket-tts_submodule.sh
    ```
 
-4. **Install dependencies**:
+5. **Install dependencies**:
 
    ```bash
    uv sync
    source .venv/bin/activate
    ```
 
-5. **Optional: Record a voice reference** for TTS (see `nova/backend/voices/SETUP.md`):
+6. **Optional: Record a voice reference** for Faster Qwen3-TTS (see `nova/backend/voices/SETUP.md`):
 
    ```bash
    arecord -d 8 -f cd -r 24000 -c 1 nova/backend/voices/nova_ref.wav
    ```
 
-6. **Start Nova**:
+7. **Start Nova**:
 
    ```bash
    # With KWS wake-word detection:
@@ -136,7 +173,7 @@ Nova includes a built-in enrollment UI:
    uv run nova/backend/main.py --no-kws
    ```
 
-7. **Open Dashboard**: Navigate to `http://localhost:8000`
+8. **Open Dashboard**: Navigate to `http://localhost:8000`
 
 ## Directory Structure
 

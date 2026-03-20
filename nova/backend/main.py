@@ -11,6 +11,7 @@ from pathlib import Path
 from contextlib import asynccontextmanager
 from queue import Empty
 import numpy as np
+import asyncpg
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File, Form, Request
 from fastrtc import AsyncStreamHandler, Stream, wait_for_item
 from fastapi.staticfiles import StaticFiles
@@ -50,13 +51,18 @@ pipeline_state = {
     "ws_out_queue": None,
     "processes": {}, # Now a dict: component -> process
     "fsm_state": "IDLE",
-    "current_llm": "qwen/qwen3.5-9b",
+    "current_llm": "auto",  # "auto" = query router decides local vs cloud per-query
     "current_voice": "alba",
+    "current_tts_engine": "pocket-tts",  # default low-VRAM; "faster-qwen3" loaded on demand
     # Echo suppression: when to stop blocking mic input
     # Computed as: last_audio_out_time + remaining_playback_duration + tail
     "tts_suppress_until": 0.0,
     # Running count of 24kHz int16 samples buffered but not yet "played" by browser
     "_tts_pending_samples": 0,
+    # When the first audio_out chunk of the current TTS response arrived
+    "_tts_start_time": 0.0,
+    # Total samples in the current TTS response
+    "_tts_total_samples": 0,
     "_tts_last_chunk_time": 0.0,
     # E2E latency: start timer on KWS/PTT, inject into tts_metrics
     "e2e_start_time": 0.0,
@@ -74,6 +80,14 @@ VOICEPRINT_DIR  = Path(__file__).parent / "nova-l7" / "L-3" / "data" / "voicepri
 active_websockets = set()
 active_rtc_handlers = set()
 
+# Postgres connection pool (initialized in lifespan)
+nova_db: asyncpg.Pool | None = None
+
+# Per-turn accumulator for DB writes
+_pending_turn: dict = {}
+_turn_index: int = 0
+_current_session_id: str | None = None
+
 # NVML for metrics
 try:
     pynvml.nvmlInit()
@@ -84,7 +98,8 @@ except Exception:
 def get_metrics():
     cpu_usage = psutil.cpu_percent()
     ram_usage = psutil.virtual_memory().percent
-    gpu_mem_total = gpu_util = 0
+    gpu_mem_used = gpu_util = 0
+    gpu_mem_total_mb = 0
 
     # Map component name to its PID
     pid_map = {name: p.pid for name, p in pipeline_state["processes"].items() if p and p.pid}
@@ -93,7 +108,8 @@ def get_metrics():
     if nvml_handle:
         try:
             info = pynvml.nvmlDeviceGetMemoryInfo(nvml_handle)
-            gpu_mem_total = info.used / 1024 ** 2
+            gpu_mem_used = info.used / 1024 ** 2
+            gpu_mem_total_mb = info.total / 1024 ** 2
             gpu_util = pynvml.nvmlDeviceGetUtilizationRates(nvml_handle).gpu
 
             # NVML compute processes (misses ONNX-RT which uses cudaMallocAsync)
@@ -128,8 +144,10 @@ def get_metrics():
             pass
 
     # Determine if using OpenRouter (API) or local LLM
-    using_openrouter = os.environ.get("OPENROUTER_API_KEY") is not None
-    current_llm = pipeline_state.get("current_llm", "qwen/qwen3.5-9b")
+    current_llm = pipeline_state.get("current_llm", "auto")
+    using_openrouter = not current_llm.startswith("local:") and current_llm != "auto"
+    if current_llm == "auto":
+        using_openrouter = os.environ.get("OPENROUTER_API_KEY") is not None
     current_voice = pipeline_state.get("current_voice", "alba")
 
     def get_comp_info(comp_key, display_name, is_gpu_component):
@@ -149,18 +167,93 @@ def get_metrics():
             "is_gpu": actual_is_gpu
         }
 
+    current_tts_engine = pipeline_state.get("current_tts_engine", "pocket-tts")
+    if current_tts_engine == "faster-qwen3":
+        tts_display = "FasterQwen3TTS"
+    else:
+        tts_display = f"Pocket-TTS ({current_voice})"
+
     return {
         "cpu": cpu_usage,
         "ram": ram_usage,
-        "gpu_mem": round(gpu_mem_total, 1),
+        "gpu_mem": round(gpu_mem_used, 1),
+        "gpu_mem_total": round(gpu_mem_total_mb, 1),
         "gpu_util": round(gpu_util, 1),
+        "tts_engine": current_tts_engine,
         "components": {
             "stt": get_comp_info("stt", "Moonshine (Medium)", True),
             "llm": get_comp_info("llm", current_llm, not using_openrouter),
-            "tts": get_comp_info("tts", f"Pocket-TTS ({current_voice})", True),
+            "tts": get_comp_info("tts", tts_display, True),
             "kws": get_comp_info("kws", "StreamingKWS V2", True),
         },
     }
+
+
+async def _open_session(driver_id: str = "driver1") -> str | None:
+    """Insert a new session row and return its session_id."""
+    global _current_session_id, _turn_index
+    if nova_db is None:
+        return None
+    try:
+        row = await nova_db.fetchrow(
+            "INSERT INTO sessions (driver_id) VALUES ($1) RETURNING session_id::text",
+            driver_id,
+        )
+        _current_session_id = row["session_id"]
+        _turn_index = 0
+        logger.info(f"[DB] Session opened: {_current_session_id}")
+        return _current_session_id
+    except Exception as e:
+        logger.warning(f"[DB] open_session failed: {e}")
+        return None
+
+
+async def _close_session() -> None:
+    global _current_session_id
+    if nova_db is None or _current_session_id is None:
+        return
+    try:
+        await nova_db.execute(
+            "UPDATE sessions SET ended_at = NOW() WHERE session_id = $1",
+            _current_session_id,
+        )
+        logger.info(f"[DB] Session closed: {_current_session_id}")
+    except Exception as e:
+        logger.warning(f"[DB] close_session failed: {e}")
+    _current_session_id = None
+
+
+async def _flush_turn() -> None:
+    """Write the accumulated _pending_turn to the turns table."""
+    global _pending_turn, _turn_index, _current_session_id
+    if nova_db is None or not _pending_turn:
+        return
+    # Open a session on first turn if none exists
+    if _current_session_id is None:
+        await _open_session()
+    try:
+        import json as _json
+        entities = _pending_turn.get("entities")
+        await nova_db.execute(
+            """INSERT INTO turns
+               (session_id, turn_index, user_text, intent, entities,
+                nova_response, fsm_state, routing, stt_latency_ms)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)""",
+            _current_session_id,
+            _turn_index,
+            _pending_turn.get("user_text"),
+            _pending_turn.get("intent"),
+            _json.dumps(entities) if entities else None,
+            _pending_turn.get("nova_response"),
+            _pending_turn.get("fsm_state"),
+            _pending_turn.get("routing"),
+            _pending_turn.get("stt_latency_ms"),
+        )
+        _turn_index += 1
+        logger.info(f"[DB] Turn {_turn_index} written: intent={_pending_turn.get('intent')}")
+    except Exception as e:
+        logger.warning(f"[DB] flush_turn failed: {e}")
+    _pending_turn = {}
 
 
 async def ws_queue_reader():
@@ -185,6 +278,8 @@ async def ws_queue_reader():
                         for h in list(active_rtc_handlers):
                             h.audio_queue = asyncio.Queue()
                         pipeline_state["_tts_pending_samples"] = 0
+                        pipeline_state["_tts_start_time"] = 0.0
+                        pipeline_state["_tts_total_samples"] = 0
                         pipeline_state["_tts_last_chunk_time"] = 0.0
                         pipeline_state["tts_suppress_until"] = 0.0
                     pipeline_state["fsm_state"] = "LISTENING"
@@ -199,6 +294,8 @@ async def ws_queue_reader():
                         for h in list(active_rtc_handlers):
                             h.audio_queue = asyncio.Queue()
                         pipeline_state["_tts_pending_samples"] = 0
+                        pipeline_state["_tts_start_time"] = 0.0
+                        pipeline_state["_tts_total_samples"] = 0
                         pipeline_state["_tts_last_chunk_time"] = 0.0
                         pipeline_state["tts_suppress_until"] = 0.0
                     pipeline_state["fsm_state"] = "LISTENING"
@@ -215,6 +312,22 @@ async def ws_queue_reader():
                         pipeline_state["e2e_start_time"] = time.time()
                         pipeline_state["kws_in_queue"].put({"type": "set_state", "state": "LISTENING"})
                         # Forward speech_started to UI (handled there directly)
+
+                elif msg.get("type") == "transcript":
+                    latency = msg.get("latency", {})
+                    stt_ms = int(latency.get("stt_ttfb", 0) * 1000) or None
+                    _pending_turn["user_text"] = msg.get("data")
+                    _pending_turn["stt_latency_ms"] = stt_ms
+
+                elif msg.get("type") == "dm_state":
+                    d = msg.get("data", {})
+                    _pending_turn.update({
+                        "intent":       d.get("intent"),
+                        "entities":     d.get("entities"),
+                        "nova_response": d.get("nova_says"),
+                        "fsm_state":    d.get("fsm_state"),
+                        "routing":      d.get("routing"),
+                    })
 
                 elif msg.get("type") == "generation_start":
                     pipeline_state["fsm_state"] = "GENERATING"
@@ -234,6 +347,7 @@ async def ws_queue_reader():
                         pipeline_state["e2e_start_time"] = 0.0
 
                 elif msg.get("type") == "generation_done":
+                    asyncio.ensure_future(_flush_turn())
                     # Only honour if we're still in GENERATING — ignore stale done from an interrupted TTS
                     if pipeline_state["fsm_state"] == "GENERATING":
                         # Calculate remaining browser playback time before unmuting STT.
@@ -241,12 +355,14 @@ async def ws_queue_reader():
                         # causes moonshine to transcribe TTS speaker output (echo).
                         now = time.time()
                         remaining_play = 0.0
-                        if pipeline_state["_tts_last_chunk_time"] > 0:
-                            elapsed = now - pipeline_state["_tts_last_chunk_time"]
-                            pending = max(0, pipeline_state["_tts_pending_samples"] - int(elapsed * 24000))
-                            remaining_play = pending / 24000.0
-                        suppress_delay = remaining_play + 1.0  # +1s safety margin for speaker reverb
+                        if pipeline_state["_tts_start_time"] > 0:
+                            total_dur = pipeline_state["_tts_total_samples"] / 24000.0
+                            elapsed = now - pipeline_state["_tts_start_time"]
+                            remaining_play = max(0.0, total_dur - elapsed)
+                        suppress_delay = remaining_play + 0.4  # +400ms safety margin for speaker reverb
                         pipeline_state["_tts_pending_samples"] = 0
+                        pipeline_state["_tts_start_time"] = 0.0
+                        pipeline_state["_tts_total_samples"] = 0
                         pipeline_state["_tts_last_chunk_time"] = 0.0
                         pipeline_state["tts_suppress_until"] = now + suppress_delay
                         # Schedule unmute + STT restart after playback finishes
@@ -264,7 +380,9 @@ async def ws_queue_reader():
                             pipeline_state["stt_in_queue"].put({"type": "stop"})
 
                 elif msg.get("type") == "recording_stopped":
-                    # STT found nothing — always return to IDLE (no interrupt scenario)
+                    # STT found nothing — return to IDLE/LISTENING.
+                    # Also escape if somehow stuck in GENERATING (e.g. empty transcript
+                    # was sent to LLM which never responded with generation_done).
                     if pipeline_state["fsm_state"] != "GENERATING":
                         pipeline_state["kws_in_queue"].put({"type": "set_state", "state": "IDLE"})
                         if os.environ.get("NOVA_NO_KWS") == "1":
@@ -272,6 +390,9 @@ async def ws_queue_reader():
                             pipeline_state["stt_in_queue"].put({"type": "start", "ptt": False})
                         else:
                             pipeline_state["fsm_state"] = "IDLE"
+
+                elif msg.get("type") == "stt_variant_changed":
+                    pipeline_state["current_stt_variant"] = msg.get("data", {}).get("variant", "small")
 
                 elif msg.get("type") == "interrupted":
                     pipeline_state["stt_in_queue"].put({"type": "tts_unmute"})
@@ -286,17 +407,19 @@ async def ws_queue_reader():
                 if msg.get("type") == "audio_out":
                     audio_bytes = msg.get("bytes")
                     audio_arr = np.frombuffer(audio_bytes, dtype=np.int16)
-                    # Echo suppression: track how long audio will play in browser.
-                    # TTS is 24kHz int16 (2 bytes/sample).  Accumulate pending samples
-                    # and recompute suppress_until = now + remaining_play_time + 500ms tail.
+                    # Echo suppression: track total TTS duration and when it started.
+                    # remaining_play = total_duration - elapsed_since_first_chunk (accurate even
+                    # when generation_done fires mid-stream while browser is still playing).
                     now = time.time()
                     new_samples = len(audio_arr)
-                    elapsed = now - pipeline_state["_tts_last_chunk_time"] if pipeline_state["_tts_last_chunk_time"] else 0.0
-                    played_samples = int(elapsed * 24000)
-                    pending = max(0, pipeline_state["_tts_pending_samples"] - played_samples) + new_samples
-                    pipeline_state["_tts_pending_samples"] = pending
+                    if pipeline_state["_tts_start_time"] == 0.0:
+                        pipeline_state["_tts_start_time"] = now
+                    pipeline_state["_tts_total_samples"] += new_samples
+                    total_dur = pipeline_state["_tts_total_samples"] / 24000.0
+                    elapsed = now - pipeline_state["_tts_start_time"]
+                    remaining = max(0.0, total_dur - elapsed)
                     pipeline_state["_tts_last_chunk_time"] = now
-                    pipeline_state["tts_suppress_until"] = now + (pending / 24000.0) + 0.5
+                    pipeline_state["tts_suppress_until"] = now + remaining + 0.5
                     to_remove = set()
                     for ws in active_websockets:
                         try:
@@ -388,6 +511,16 @@ class NovaRTCHandler(AsyncStreamHandler):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global nova_db
+    db_url = os.environ.get("NOVA_DB_URL")
+    if db_url:
+        try:
+            nova_db = await asyncpg.create_pool(db_url, min_size=1, max_size=5)
+            logger.info("Postgres pool connected.")
+        except Exception as e:
+            logger.warning(f"Postgres unavailable — conversation storage disabled: {e}")
+            nova_db = None
+
     mp.set_start_method("spawn", force=True)
     
     pipeline_state["stop_event"] = mp.Event()
@@ -454,6 +587,9 @@ async def lifespan(app: FastAPI):
         p.join(timeout=3)
         if p.is_alive():
             p.terminate()
+    await _close_session()
+    if nova_db:
+        await nova_db.close()
     logger.info("Shutdown complete.")
 
 
@@ -489,14 +625,137 @@ async def handle_ui_event(req: Request):
     elif msg_type == "change_voice":
         pipeline_state["current_voice"] = data.get("data")
         pipeline_state["tts_in_queue"].put({"type": "change_voice", "data": data.get("data")})
+    elif msg_type == "change_tts_engine":
+        pipeline_state["current_tts_engine"] = data.get("data")
+        pipeline_state["tts_in_queue"].put({"type": "change_tts_engine", "data": data.get("data")})
     elif msg_type == "change_llm":
         pipeline_state["current_llm"] = data.get("data")
         pipeline_state["llm_in_queue"].put({"type": "change_llm", "data": data.get("data")})
+    elif msg_type == "change_stt_variant":
+        pipeline_state["current_stt_variant"] = data.get("data")
+        pipeline_state["stt_in_queue"].put({"type": "change_stt_variant", "data": data.get("data")})
     return {"status": "ok"}
 
 @app.get("/metrics")
 async def metrics_endpoint():
     return get_metrics()
+
+@app.get("/tts/info")
+async def tts_info():
+    """Return available TTS engines, voices, VRAM estimates, and current selection."""
+    from pipeline_mp.llm_config import TTS_VRAM_ESTIMATES
+
+    engines = []
+    # Discover voice refs in voices/ dir
+    voices_dir = Path(__file__).parent / "voices"
+    qwen_voices = []
+    if voices_dir.exists():
+        for wav in sorted(voices_dir.glob("*.wav")):
+            qwen_voices.append({"id": wav.stem, "name": wav.stem.replace("_", " ").title()})
+
+    engines.append({
+        "id": "faster-qwen3",
+        "name": "FasterQwen3TTS",
+        "vram_mb": TTS_VRAM_ESTIMATES.get("faster-qwen3", 2750),
+        "voices": qwen_voices,
+    })
+
+    pocket_voices = ["alba", "marius", "javert", "jean", "fantine", "cosette", "eponine", "azelma"]
+    engines.append({
+        "id": "pocket-tts",
+        "name": "Pocket-TTS",
+        "vram_mb": TTS_VRAM_ESTIMATES.get("pocket-tts", 150),
+        "voices": [{"id": v, "name": v.title()} for v in pocket_voices],
+    })
+
+    # GPU total VRAM for budget calculations
+    gpu_total_mb = 0
+    if nvml_handle:
+        try:
+            info = pynvml.nvmlDeviceGetMemoryInfo(nvml_handle)
+            gpu_total_mb = round(info.total / 1024 ** 2)
+        except Exception:
+            pass
+
+    return {
+        "current_engine": pipeline_state.get("current_tts_engine", "pocket-tts"),
+        "current_voice": pipeline_state.get("current_voice", "alba"),
+        "engines": engines,
+        "gpu_total_mb": gpu_total_mb,
+    }
+
+
+@app.get("/llm/info")
+async def llm_info():
+    """Return available LLM backends (cloud + local) with VRAM estimates."""
+    from pipeline_mp.llm_config import LOCAL_LLM_REGISTRY, BASELINE_VRAM_MB
+
+    has_api_key = os.environ.get("OPENROUTER_API_KEY") is not None
+
+    cloud_models = []
+    if has_api_key:
+        cloud_models = [
+            {"id": "nvidia/llama-3.3-nemotron-super-49b-v1.5", "name": "Nemotron 49B", "vram_mb": 0},
+            {"id": "qwen/qwen3.5-9b", "name": "Qwen 3.5 9B", "vram_mb": 0},
+            {"id": "google/gemini-2.5-flash", "name": "Gemini 2.5 Flash", "vram_mb": 0},
+            {"id": "meta-llama/llama-3.1-8b-instruct", "name": "Llama 3.1 8B", "vram_mb": 0},
+        ]
+
+    local_models = []
+    for key, cfg in LOCAL_LLM_REGISTRY.items():
+        local_models.append({
+            "id": f"local:{key}",
+            "name": cfg.display_name,
+            "vram_mb": cfg.vram_mb,
+            "supports_tools": cfg.supports_tools,
+        })
+
+    # GPU total for client-side budget math
+    gpu_total_mb = 0
+    if nvml_handle:
+        try:
+            info = pynvml.nvmlDeviceGetMemoryInfo(nvml_handle)
+            gpu_total_mb = round(info.total / 1024 ** 2)
+        except Exception:
+            pass
+
+    return {
+        "has_api_key": has_api_key,
+        "current_llm": pipeline_state.get("current_llm", "nvidia/llama-3.3-nemotron-super-49b-v1.5"),
+        "cloud_models": cloud_models,
+        "local_models": local_models,
+        "gpu_total_mb": gpu_total_mb,
+        "baseline_vram_mb": BASELINE_VRAM_MB,
+    }
+
+@app.get("/stt/info")
+async def stt_info():
+    """Return available STT variants with VRAM estimates and current selection."""
+    from pipeline_mp.stt_config import STT_VARIANT_REGISTRY
+
+    variants = []
+    for key, cfg in STT_VARIANT_REGISTRY.items():
+        variants.append({
+            "id": key,
+            "name": cfg.display_name,
+            "vram_mb": cfg.vram_mb,
+            "rtf_target": cfg.rtf_target,
+        })
+
+    gpu_total_mb = 0
+    if nvml_handle:
+        try:
+            info = pynvml.nvmlDeviceGetMemoryInfo(nvml_handle)
+            gpu_total_mb = round(info.total / 1024 ** 2)
+        except Exception:
+            pass
+
+    return {
+        "current_variant": pipeline_state.get("current_stt_variant", "small"),
+        "variants": variants,
+        "gpu_total_mb": gpu_total_mb,
+    }
+
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
@@ -551,10 +810,14 @@ async def websocket_endpoint(websocket: WebSocket):
                     pipeline_state["current_voice"] = msg["data"]
                     pipeline_state["tts_in_queue"].put({"type": "change_voice", "data": msg["data"]})
                     
+                elif msg["type"] == "change_tts_engine":
+                    pipeline_state["current_tts_engine"] = msg["data"]
+                    pipeline_state["tts_in_queue"].put({"type": "change_tts_engine", "data": msg["data"]})
+
                 elif msg["type"] == "change_llm":
                     pipeline_state["current_llm"] = msg["data"]
                     pipeline_state["llm_in_queue"].put({"type": "change_llm", "data": msg["data"]})
-                    
+
     except (WebSocketDisconnect, RuntimeError) as e:
         logger.info(f"WebSocket closed: {e}")
     finally:
@@ -636,7 +899,24 @@ async def _run_enrollment_task():
     # 1. Update KWS Engine (with datetime version tag for rollback)
     from datetime import datetime
     version_tag = datetime.now().strftime("%Y%m%d_%H%M%S")
-    if pipeline_state["kws_in_queue"]:
+    bypass_kws = os.environ.get("NOVA_NO_KWS") == "1"
+    if bypass_kws:
+        # KWS worker is in sleep loop when bypassed — run enrollment directly
+        try:
+            from kws.kws_engine_v2 import StreamingKWSv2, GoogleEmbeddingModel
+            kws_model_path = str(Path(__file__).parent / "kws" / "google_speech_embedding.onnx")
+            kws_engine = StreamingKWSv2(model_path=None)
+            kws_engine.model = GoogleEmbeddingModel(kws_model_path)
+            refs_dir = Path(__file__).parent / "kws" / "refs"
+            ref_paths = sorted(str(p) for p in refs_dir.glob("nova_*.wav"))
+            noise_paths = sorted(str(p) for p in refs_dir.glob("noise_*.wav"))
+            if ref_paths:
+                logger.info("Running KWS enrollment directly (KWS worker bypassed)...")
+                await asyncio.to_thread(kws_engine.enroll, ref_paths, noise_paths, version_tag)
+                logger.info("KWS enrollment completed directly.")
+        except Exception as e:
+            logger.error(f"Direct KWS enrollment failed: {e}", exc_info=True)
+    elif pipeline_state["kws_in_queue"]:
         pipeline_state["kws_in_queue"].put({"type": "enroll", "version_tag": version_tag})
 
     # 2. KWS enrollment done — skip L-3 voiceprint here; use /enroll/voice-sample instead.
@@ -765,21 +1045,49 @@ async def list_kws_versions():
     """List saved KWS model versions (datetime-stamped directories)."""
     versions_dir = KWS_MODELS_DIR / "versions"
     if not versions_dir.exists():
-        return {"versions": []}
+        return {"versions": [], "active_version": None}
     versions = sorted(
         (d.name for d in versions_dir.iterdir() if d.is_dir() and (d / "mlp_weights.pth").exists()),
         reverse=True
     )
-    return {"versions": versions}
+    # Read the persisted active version tag
+    active_tag_file = KWS_MODELS_DIR / "active_version.txt"
+    active_version = active_tag_file.read_text().strip() if active_tag_file.exists() else None
+    # Fall back to most recent if tag not recorded or no longer exists
+    if active_version not in versions and versions:
+        active_version = versions[0]
+    return {"versions": versions, "active_version": active_version}
 
 
 @app.post("/enroll/kws-activate/{version}")
 async def activate_kws_version(version: str):
     """Switch the active KWS model to a previously saved version."""
+    import shutil
     v_dir = KWS_MODELS_DIR / "versions" / version
     if not (v_dir / "mlp_weights.pth").exists():
         from fastapi import HTTPException
         raise HTTPException(status_code=404, detail=f"Version {version} not found.")
+
+    # Persist the active version tag so /enroll/kws-models can report it
+    (KWS_MODELS_DIR / "active_version.txt").write_text(version)
+
+    bypass_kws = os.environ.get("NOVA_NO_KWS") == "1"
+    if bypass_kws:
+        # KWS worker is in sleep loop — it won't read the queue.
+        # Copy the version files directly to the active model path.
+        for fname in ("mlp_weights.pth", "refs.pkl"):
+            src = v_dir / fname
+            if src.exists():
+                shutil.copy2(src, KWS_MODELS_DIR / fname)
+        # Notify all clients immediately (no worker round-trip needed)
+        msg = json.dumps({"type": "kws_version_activated", "version": version, "success": True})
+        for ws in list(active_websockets):
+            try:
+                await ws.send_text(msg)
+            except Exception:
+                pass
+        return {"status": "activated", "version": version}
+
     if pipeline_state["kws_in_queue"]:
         pipeline_state["kws_in_queue"].put({"type": "activate_version", "version": version})
     return {"status": "activating", "version": version}
