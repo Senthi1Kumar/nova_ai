@@ -108,7 +108,10 @@ Nova includes a built-in enrollment UI:
 
    ```bash
    cp .env.example .env
-   # Edit .env and add your OPENROUTER_API_KEY and NOVA_DB_URL
+   # Edit .env and add your keys:
+   #   OPENROUTER_API_KEY  — from https://openrouter.ai/keys
+   #   MAPS_DEMO_KEY       — from https://developers.google.com/maps/documentation/javascript/demo-key
+   #   NOVA_DB_URL         — PostgreSQL connection string (optional)
    ```
 
 3. **Set up PostgreSQL** (conversation storage):
