@@ -1,0 +1,1863 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Nova AI — Cockpit</title>
+    <!-- Tailwind for settings drawer / modal dynamic HTML -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+        let MAPS_API_KEY = '';
+        fetch('/config').then(r => r.json()).then(cfg => {
+            MAPS_API_KEY = cfg.maps_api_key || '';
+            if (!MAPS_API_KEY) return;
+            const s = document.createElement('script');
+            s.src = `https://maps.googleapis.com/maps/api/js?key=${MAPS_API_KEY}&callback=initMap`;
+            s.async = true; s.defer = true;
+            document.head.appendChild(s);
+        });
+    </script>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Rajdhani:wght@400;500;600;700&family=IBM+Plex+Mono:ital,wght@0,400;0,500;1,400&display=swap" rel="stylesheet">
+    <style>
+        /* ─── Design Tokens ─────────────────────────────── */
+        :root {
+            --bg:            #060c1a;
+            --bg-card:       rgba(8,16,36,0.82);
+            --bg-card2:      rgba(5,10,20,0.95);
+            --accent:        #00ffcc;
+            --accent-dim:    rgba(0,255,204,0.12);
+            --accent-glow:   rgba(0,255,204,0.35);
+            --blue:          #00aaff;
+            --amber:         #ffaa00;
+            --purple:        #a855f7;
+            --danger:        #ff4466;
+            --text-primary:  #dff0f0;
+            --text-muted:    rgba(170,205,215,0.48);
+            --border:        rgba(0,255,204,0.13);
+            --border-active: rgba(0,255,204,0.55);
+            --ff-display:    'Rajdhani', sans-serif;
+            --ff-data:       'IBM Plex Mono', monospace;
+        }
+
+        /* ─── Reset ─────────────────────────────────────── */
+        *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+        html, body { height: 100%; overflow: hidden; }
+        ::-webkit-scrollbar { width: 3px; height: 3px; }
+        ::-webkit-scrollbar-track { background: transparent; }
+        ::-webkit-scrollbar-thumb { background: rgba(0,255,204,0.28); border-radius: 2px; }
+
+        /* ─── Body Grid ──────────────────────────────────── */
+        body {
+            background: var(--bg);
+            background-image:
+                radial-gradient(ellipse 90% 50% at 50% -5%, rgba(0,90,110,0.26) 0%, transparent 55%),
+                radial-gradient(ellipse 40% 35% at 8% 92%, rgba(0,20,80,0.32) 0%, transparent 60%),
+                radial-gradient(ellipse 30% 28% at 93% 88%, rgba(40,0,80,0.18) 0%, transparent 60%);
+            color: var(--text-primary);
+            font-family: var(--ff-display);
+            display: grid;
+            grid-template-rows: 52px 1fr 38px;
+        }
+
+        /* ─── Header ─────────────────────────────────────── */
+        .topbar {
+            display: grid;
+            grid-template-columns: auto 1fr auto auto auto;
+            align-items: center;
+            gap: 14px;
+            padding: 0 16px;
+            background: rgba(4,8,18,0.90);
+            border-bottom: 1px solid var(--border);
+            backdrop-filter: blur(8px);
+        }
+        .logo-group { display: flex; align-items: center; gap: 10px; }
+        .logo-diamond { font-size: 22px; color: var(--accent); text-shadow: 0 0 16px var(--accent-glow); line-height: 1; user-select: none; }
+        .logo-name { font-family: var(--ff-display); font-size: 19px; font-weight: 700; letter-spacing: 0.26em; color: var(--accent); text-shadow: 0 0 20px var(--accent-glow); line-height: 1; }
+        .logo-sub { font-family: var(--ff-data); font-size: 8px; letter-spacing: 0.16em; color: var(--text-muted); margin-top: 2px; }
+        .hud-center { display: flex; align-items: baseline; justify-content: center; gap: 12px; }
+        .speed-value { font-family: var(--ff-data); font-size: 17px; font-weight: 500; color: var(--text-primary); letter-spacing: 0.04em; }
+        .hud-divider { color: var(--text-muted); font-size: 13px; }
+        .clock-value { font-family: var(--ff-data); font-size: 14px; color: var(--text-muted); letter-spacing: 0.08em; }
+        .conn-group { display: flex; align-items: center; gap: 6px; }
+        .conn-dot { width: 7px; height: 7px; border-radius: 50%; background: #ef4444; box-shadow: 0 0 6px #ef4444; transition: all 0.4s; }
+        .conn-dot.online { background: var(--accent); box-shadow: 0 0 8px var(--accent-glow); }
+        #connection-status { font-family: var(--ff-data); font-size: 11px; font-weight: 700; letter-spacing: 0.16em; color: #ef4444; transition: color 0.4s; }
+        #connection-status.conn-online { color: var(--accent); }
+        .kws-toggle-wrap { display: flex; align-items: center; gap: 6px; cursor: pointer; }
+        .kws-label { font-family: var(--ff-data); font-size: 9px; letter-spacing: 0.14em; color: var(--text-muted); }
+        .toggle-track { width: 34px; height: 18px; border-radius: 9px; background: rgba(255,255,255,0.08); border: 1px solid var(--border); position: relative; transition: background 0.25s; }
+        .toggle-thumb { width: 12px; height: 12px; border-radius: 50%; background: rgba(255,255,255,0.35); position: absolute; top: 2px; left: 2px; transition: transform 0.25s, background 0.25s; }
+        #always-listening-toggle { display: none; }
+        #always-listening-toggle:checked ~ .toggle-track { background: var(--accent); }
+        #always-listening-toggle:checked ~ .toggle-track .toggle-thumb { transform: translateX(16px); background: #fff; }
+        .settings-btn-top { background: transparent; border: 1px solid var(--border); border-radius: 8px; width: 34px; height: 34px; display: flex; align-items: center; justify-content: center; color: var(--accent); cursor: pointer; transition: background 0.2s, border-color 0.2s; flex-shrink: 0; }
+        .settings-btn-top:hover { background: var(--accent-dim); border-color: var(--border-active); }
+
+        /* ─── Cockpit Main ───────────────────────────────── */
+        .cockpit { display: grid; grid-template-columns: 248px 1fr 274px; grid-template-rows: 1fr; gap: 10px; padding: 10px 12px; overflow: hidden; min-height: 0; height: 100%; }
+
+        /* ─── Card Base ──────────────────────────────────── */
+        .card {
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: 14px;
+            backdrop-filter: blur(14px);
+            -webkit-backdrop-filter: blur(14px);
+            box-shadow: 0 0 0 0.5px rgba(0,255,204,0.05) inset, 0 10px 40px rgba(0,0,0,0.58), 0 1px 0 rgba(255,255,255,0.03) inset;
+            position: relative;
+            overflow: hidden;
+        }
+        .card::before { content: ""; position: absolute; top: 0; left: 12%; right: 12%; height: 1px; background: linear-gradient(90deg, transparent, rgba(0,255,204,0.18), transparent); pointer-events: none; }
+        .card-title { font-family: var(--ff-data); font-size: 9px; letter-spacing: 0.22em; color: var(--text-muted); padding: 11px 13px 0; margin-bottom: 9px; display: block; }
+
+        /* ─── Left Panel ─────────────────────────────────── */
+        .panel-left { display: flex; flex-direction: column; gap: 9px; min-height: 0; overflow: hidden; height: 100%; }
+        .metrics-card { flex-shrink: 0; padding: 11px 13px 13px; }
+        .metric-row { margin-bottom: 10px; }
+        .metric-row:last-child { margin-bottom: 0; }
+        .metric-header { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 4px; }
+        .metric-label { font-family: var(--ff-data); font-size: 9px; letter-spacing: 0.14em; color: var(--text-muted); }
+        .metric-value { font-family: var(--ff-data); font-size: 11px; font-weight: 500; color: var(--accent); }
+        .prog-track { height: 3px; background: rgba(0,255,204,0.09); border-radius: 2px; overflow: hidden; }
+        .prog-fill { height: 100%; background: linear-gradient(90deg, var(--blue), var(--accent)); border-radius: 2px; transition: width 0.5s ease; }
+        .enroll-card { flex-shrink: 0; padding: 10px 13px 12px; }
+        .enroll-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; margin-bottom: 6px; }
+        .enroll-btn { border: 1px solid rgba(0,255,204,0.3); border-radius: 6px; padding: 6px 4px; background: transparent; color: var(--accent); font-family: var(--ff-data); font-size: 9px; letter-spacing: 0.08em; cursor: pointer; position: relative; overflow: hidden; transition: background 0.18s; text-align: center; width: 100%; }
+        .enroll-btn:hover { background: rgba(0,255,204,0.06); }
+        .enroll-btn:disabled { opacity: 0.45; cursor: not-allowed; }
+        .enroll-progress { position: absolute; left: 0; top: 0; bottom: 0; background: rgba(0,255,204,0.18); width: 0%; }
+        .enroll-btn-text { position: relative; z-index: 1; }
+        #enroll-status { font-family: var(--ff-data); font-size: 8px; font-style: italic; color: var(--text-muted); }
+        .component-card { flex: 1 1 0; min-height: 0; overflow-y: auto; padding: 0 13px 13px; }
+        .comp-item { border-left: 2px solid rgba(0,255,204,0.28); padding-left: 8px; margin-bottom: 11px; }
+        .comp-name { font-family: var(--ff-data); font-size: 9px; letter-spacing: 0.12em; color: var(--accent); font-weight: 500; }
+        .comp-sub { font-family: var(--ff-data); font-size: 8px; color: var(--text-muted); margin-top: 2px; line-height: 1.5; }
+
+        /* ─── Center Panel ───────────────────────────────── */
+        .panel-center { display: flex; flex-direction: column; min-height: 0; overflow: hidden; gap: 8px; height: 100%; }
+        /* Top row: mic (fixed width) + map (fill) — height is 40% of available space */
+        .voice-card { flex: 0 0 42%; display: flex; flex-direction: row; align-items: stretch; padding: 0; gap: 0; overflow: hidden; }
+        .mic-col { flex: 0 0 180px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 12px;
+                   background: var(--bg-card2); border-right: 1px solid var(--border); padding: 16px 12px; }
+        .map-col { flex: 1 1 0; min-width: 0; overflow: hidden; min-height: 0; border-radius: 14px 0 0 14px; }
+        /* Shrink Google Maps type control (Map|Satellite) */
+        .map-col .gm-style-mtc button { font-size: 9px !important; padding: 2px 6px !important; line-height: 1.2 !important; }
+        .map-col .gm-style-mtc { margin: 4px 0 0 4px !important; }
+        /* Bottom row: conversation fills remaining ~58% */
+        .conv-card { flex: 1 1 0; min-height: 0; overflow: hidden; display: flex; flex-direction: column; }
+
+        /* ─── Voice Ring ─────────────────────────────────── */
+        #voice-ring { width: 120px; height: 120px; border-radius: 50%; position: relative; flex-shrink: 0; }
+        .ring-track { position: absolute; inset: 0; border-radius: 50%; border: 2.5px solid rgba(0,255,204,0.11); }
+        .ring-arc { position: absolute; inset: 0; border-radius: 50%; border: 2.5px solid transparent; }
+        .ring-core { position: absolute; inset: 12px; border-radius: 50%; background: rgba(6,12,26,0.93); display: flex; align-items: center; justify-content: center; transition: box-shadow 0.4s ease; }
+        .ring-icon { width: 34px; height: 34px; transition: color 0.4s, opacity 0.3s; }
+
+        @keyframes idleRotate { to { transform: rotate(360deg); } }
+        .ring-idle .ring-arc { border-top-color: rgba(0,255,204,0.20); border-right-color: rgba(0,255,204,0.05); animation: idleRotate 9s linear infinite; }
+        .ring-idle .ring-core { box-shadow: 0 0 16px rgba(0,255,204,0.06) inset; }
+        .ring-idle .ring-icon { color: rgba(0,255,204,0.38); }
+
+        @keyframes listenRotate { to { transform: rotate(360deg); } }
+        @keyframes listenPulse { 0%,100% { box-shadow: 0 0 0 0 rgba(0,255,204,0.42), 0 0 20px rgba(0,255,204,0.09) inset; } 50% { box-shadow: 0 0 0 11px rgba(0,255,204,0), 0 0 26px rgba(0,255,204,0.17) inset; } }
+        .ring-listening .ring-arc { border-top-color: var(--accent); border-right-color: rgba(0,255,204,0.38); animation: listenRotate 1.1s linear infinite; }
+        .ring-listening .ring-core { animation: listenPulse 0.95s ease-out infinite; }
+        .ring-listening .ring-icon { color: var(--accent); }
+
+        @keyframes thinkSweep { 0% { transform: rotate(0deg); border-top-color: var(--amber); } 50% { transform: rotate(240deg); border-top-color: rgba(255,170,0,0.28); } 100% { transform: rotate(720deg); border-top-color: var(--amber); } }
+        .ring-thinking .ring-arc { border-top-color: var(--amber); border-right-color: rgba(255,170,0,0.22); animation: thinkSweep 1.7s ease-in-out infinite; }
+        .ring-thinking .ring-core { box-shadow: 0 0 22px rgba(255,170,0,0.11) inset; }
+        .ring-thinking .ring-icon { color: var(--amber); }
+
+        @keyframes speakOuter { to { transform: rotate(360deg); } }
+        @keyframes speakInner { to { transform: rotate(-360deg); } }
+        .ring-speaking .ring-arc { border-top-color: var(--purple); border-left-color: rgba(168,85,247,0.28); animation: speakOuter 1.8s linear infinite; }
+        .ring-speaking .ring-track::after { content: ""; position: absolute; inset: 5px; border-radius: 50%; border: 1.5px solid transparent; border-bottom-color: var(--purple); opacity: 0.42; animation: speakInner 2.5s linear infinite; }
+        .ring-speaking .ring-core { box-shadow: 0 0 26px rgba(168,85,247,0.15) inset; }
+        .ring-speaking .ring-icon { color: var(--purple); }
+
+        #state-label { font-family: var(--ff-data); font-size: 10px; letter-spacing: 0.28em; color: var(--text-muted); flex-shrink: 0; margin-top: -2px; }
+
+        /* Visualizer */
+        #visualizer { width: 100%; flex-shrink: 0; border-radius: 4px; display: block; }
+
+        /* Conversation */
+        .conversation { flex: 1 1 0; width: 100%; min-height: 0; overflow-y: auto; display: flex; flex-direction: column; gap: 6px; word-break: break-word; padding: 8px 12px; }
+        .utterance { padding: 8px 10px; border-radius: 8px; }
+        .utterance-label { font-family: var(--ff-data); font-size: 8px; letter-spacing: 0.22em; color: var(--text-muted); display: block; margin-bottom: 3px; }
+        .utterance p { font-family: var(--ff-data); font-size: 11px; line-height: 1.55; margin: 0; word-break: break-word; }
+        .user-utt { background: rgba(0,170,255,0.05); border-left: 2px solid rgba(0,170,255,0.33); }
+        .user-utt p { color: rgba(195,225,240,0.80); }
+        .nova-utt { background: rgba(0,255,204,0.04); border-left: 2px solid rgba(0,255,204,0.23); flex: 1 1 0; min-height: 0; overflow-y: auto; }
+        .nova-utt p { color: var(--accent); }
+
+        /* PTT */
+        #ptt-button { width: 100%; padding: 12px; background: rgba(0,255,204,0.04); border: 1.5px solid rgba(0,255,204,0.30); border-radius: 10px; color: var(--accent); font-family: var(--ff-display); font-size: 13px; font-weight: 600; letter-spacing: 0.22em; cursor: pointer; transition: background 0.18s, box-shadow 0.18s, border-color 0.18s; user-select: none; display: flex; align-items: center; justify-content: center; gap: 9px; flex-shrink: 0; }
+        #ptt-button:hover { background: rgba(0,255,204,0.09); box-shadow: 0 0 20px rgba(0,255,204,0.13); border-color: rgba(0,255,204,0.52); }
+        #ptt-button:active { background: rgba(0,255,204,0.18); box-shadow: 0 0 28px rgba(0,255,204,0.22); border-color: var(--accent); }
+
+        /* ─── Right Panel ────────────────────────────────── */
+        .panel-right { display: flex; flex-direction: column; gap: 9px; min-height: 0; height: 100%; }
+        .car-card { flex-shrink: 0; display: flex; flex-direction: column; align-items: center; padding: 10px 13px 11px; gap: 9px; }
+
+        /* SVG car transitions */
+        .car-light { transition: fill 0.4s ease, filter 0.4s ease; }
+        #svg-sunroof { transition: fill 0.55s ease, stroke 0.4s ease, filter 0.4s ease; }
+        #svg-heater-glow { transition: opacity 0.5s ease; }
+        /* Cabin lights */
+        [id^="svg-cabin-light-"] { transition: fill 0.4s ease, filter 0.4s ease; }
+        [id^="svg-cabin-halo-"]  { transition: opacity 0.4s ease; }
+
+        /* AC airflow waves */
+        :root { --ac-wave-dur: 2.2s; --ac-wave-color: #47c8e8; }
+        #svg-ac-airflow .ac-wave {
+            fill: none; stroke-width: 1.5; stroke-linecap: round;
+            stroke: var(--ac-wave-color);
+            opacity: 0;
+            transition: stroke 0.5s ease;
+        }
+        #svg-ac-airflow.ac-on .ac-wave {
+            animation: acWaveFlow var(--ac-wave-dur) ease-in-out infinite;
+        }
+        #svg-ac-airflow.ac-on .ac-wave:nth-child(1) { animation-delay: 0s; }
+        #svg-ac-airflow.ac-on .ac-wave:nth-child(2) { animation-delay: calc(var(--ac-wave-dur) * -0.2); }
+        #svg-ac-airflow.ac-on .ac-wave:nth-child(3) { animation-delay: calc(var(--ac-wave-dur) * -0.4); }
+        #svg-ac-airflow.ac-on .ac-wave:nth-child(4) { animation-delay: calc(var(--ac-wave-dur) * -0.6); }
+        #svg-ac-airflow.ac-on .ac-wave:nth-child(5) { animation-delay: calc(var(--ac-wave-dur) * -0.8); }
+        @keyframes acWaveFlow {
+            0%   { transform: translateY(-18px); opacity: 0; }
+            15%  { opacity: 0.9; }
+            80%  { opacity: 0.6; }
+            100% { transform: translateY(40px);  opacity: 0; }
+        }
+        /* Mid/comfort: alternating wave colors (odd=warm red, even=dark cyan) */
+        #svg-ac-airflow.ac-mid .ac-wave:nth-child(odd)  { stroke: #ff8c69; }
+        #svg-ac-airflow.ac-mid .ac-wave:nth-child(even) { stroke: #00c4d4; }
+        /* Hot: red-orange waves */
+        #svg-ac-airflow.ac-hot .ac-wave { stroke: #ff5e5b; }
+        /* Ice crystals (cold range + AC ON only) */
+        .ice-crystal { font-size: 7px; fill: #a8e6ff; opacity: 0; font-family: monospace; }
+        #svg-ac-airflow.ac-on.ac-cold .ice-crystal {
+            animation: icePop 2.8s ease-in-out infinite;
+        }
+        #svg-ac-airflow.ac-cold .ice-crystal:nth-child(7)  { animation-delay: 0s; }
+        #svg-ac-airflow.ac-cold .ice-crystal:nth-child(8)  { animation-delay: 0.9s; }
+        #svg-ac-airflow.ac-cold .ice-crystal:nth-child(9)  { animation-delay: 1.8s; }
+        @keyframes icePop {
+            0%   { opacity: 0; transform: translateY(0) scale(0.6); }
+            25%  { opacity: 1; transform: translateY(-6px) scale(1); }
+            60%  { opacity: 0.7; transform: translateY(-14px) scale(0.9); }
+            100% { opacity: 0; transform: translateY(-22px) scale(0.5); }
+        }
+
+        /* Control pills */
+        .car-controls-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 7px; width: 100%; }
+        .ctrl-pill { border: 1px solid var(--border); border-radius: 9px; padding: 7px 10px; display: flex; justify-content: space-between; align-items: center; transition: border-color 0.3s, background 0.3s, box-shadow 0.3s; }
+        .ctrl-pill:hover { border-color: rgba(0,255,204,0.28); }
+        .ctrl-name { font-family: var(--ff-display); font-size: 11px; font-weight: 600; letter-spacing: 0.12em; color: var(--text-muted); }
+        .ctrl-state { font-family: var(--ff-data); font-size: 10px; font-weight: 500; color: rgba(0,255,204,0.33); transition: color 0.3s; }
+        .ctrl-active { border-color: rgba(0,255,204,0.50) !important; background: rgba(0,255,204,0.05); box-shadow: 0 0 12px rgba(0,255,204,0.07); }
+        .ctrl-active .ctrl-state { color: var(--accent) !important; }
+
+        /* Config card */
+        .config-card { flex: 1 1 0; min-height: 0; overflow-y: auto; padding: 0 13px 13px; }
+        .selector-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 7px; }
+        .sel-label { display: block; font-family: var(--ff-data); font-size: 8px; letter-spacing: 0.16em; color: var(--text-muted); margin-bottom: 3px; }
+        .nova-select { width: 100%; background: rgba(4,10,24,0.94); border: 1px solid var(--border); border-radius: 6px; color: var(--accent); font-family: var(--ff-data); font-size: 10px; padding: 5px 7px; outline: none; cursor: pointer; transition: border-color 0.18s; -webkit-appearance: none; }
+        .nova-select:focus { border-color: var(--border-active); }
+        .nova-select option { background: #060c1a; color: var(--text-primary); }
+        #vram-warning { font-family: var(--ff-data); font-size: 9px; color: var(--amber); margin-top: 6px; line-height: 1.4; }
+
+        /* ─── Footer Status Bar ──────────────────────────── */
+        .status-bar { display: flex; align-items: center; justify-content: center; gap: 18px; padding: 0 18px; background: rgba(3,7,16,0.92); border-top: 1px solid var(--border); font-family: var(--ff-data); font-size: 10px; }
+        .sb-metric { display: flex; align-items: center; gap: 5px; }
+        .sb-label { color: var(--text-muted); letter-spacing: 0.10em; }
+        .sb-value { color: var(--accent); font-weight: 500; }
+        .sb-value.dim { color: var(--text-muted); }
+        .sb-sep { color: rgba(0,255,204,0.14); font-size: 12px; }
+
+        /* ─── Settings Drawer ────────────────────────────── */
+        #settings-drawer { position: fixed; top: 0; right: 0; height: 100%; width: 296px; background: rgba(5,10,20,0.97); border-left: 1px solid var(--border); backdrop-filter: blur(16px); z-index: 50; transform: translateX(100%); transition: transform 0.3s ease; overflow-y: auto; box-shadow: -4px 0 30px rgba(0,0,0,0.65); }
+        #settings-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.58); z-index: 40; }
+        #settings-overlay.hidden { display: none; }
+
+        /* ─── Onboarding Modal ───────────────────────────── */
+        #onboarding-modal { position: fixed; inset: 0; background: rgba(0,0,0,0.92); display: flex; align-items: center; justify-content: center; z-index: 60; backdrop-filter: blur(4px); }
+        #onboarding-modal.hidden { display: none; }
+
+        /* ─── Utility ────────────────────────────────────── */
+        .hidden { display: none !important; }
+        select option { background: #060c1a; }
+        @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.5; } }
+        @keyframes spin { to { transform: rotate(360deg); } }
+        .animate-pulse { animation: pulse 2s ease-in-out infinite; }
+        .animate-spin { animation: spin 1s linear infinite; }
+    </style>
+</head>
+<body>
+
+<!-- ── Header ──────────────────────────────────────────── -->
+<header class="topbar">
+    <div class="logo-group">
+        <span class="logo-diamond">◈</span>
+        <div>
+            <div class="logo-name">NOVA AI</div>
+            <div class="logo-sub">EV VOICE ASSISTANT · v1.2</div>
+        </div>
+    </div>
+
+    <div class="hud-center">
+        <span id="speed-readout" class="speed-value">— km/h</span>
+        <span class="hud-divider">|</span>
+        <span id="clock-readout" class="clock-value">--:--</span>
+        <span class="hud-divider">|</span>
+        <span id="weather-icon" style="font-size:15px;line-height:1">—</span>
+        <span id="weather-temp" class="clock-value">--°C</span>
+    </div>
+
+    <div class="conn-group">
+        <span class="conn-dot" id="conn-dot"></span>
+        <span id="connection-status">OFFLINE</span>
+    </div>
+
+    <label class="kws-toggle-wrap">
+        <span class="kws-label">LISTEN</span>
+        <input type="checkbox" id="always-listening-toggle">
+        <div class="toggle-track"><div class="toggle-thumb"></div></div>
+    </label>
+
+    <button id="settings-btn" class="settings-btn-top" title="Enrollment & Settings">
+        <svg viewBox="0 0 20 20" width="15" height="15" fill="currentColor">
+            <path fill-rule="evenodd" d="M11.49 3.17c-.38-1.56-2.6-1.56-2.98 0a1.532 1.532 0 01-2.286.948c-1.372-.836-2.942.734-2.106 2.106.54.886.061 2.042-.947 2.287-1.561.379-1.561 2.6 0 2.978a1.532 1.532 0 01.947 2.287c-.836 1.372.734 2.942 2.106 2.106a1.532 1.532 0 012.287.947c.379 1.561 2.6 1.561 2.978 0a1.533 1.533 0 012.287-.947c1.372.836 2.942-.734 2.106-2.106a1.533 1.533 0 01.947-2.287c1.561-.379 1.561-2.6 0-2.978a1.532 1.532 0 01-.947-2.287c.836-1.372-.734-2.942-2.106-2.106a1.532 1.532 0 01-2.287-.947zM10 13a3 3 0 100-6 3 3 0 000 6z" clip-rule="evenodd"/>
+        </svg>
+    </button>
+</header>
+
+<!-- ── Settings Drawer ──────────────────────────────────── -->
+<div id="settings-drawer" class="flex flex-col">
+    <div class="flex justify-between items-center p-5 border-b border-[#00ffcc]/20">
+        <h2 class="text-sm font-bold tracking-widest text-[#00ffcc]">ENROLLMENT & SETTINGS</h2>
+        <button id="settings-close" class="text-[#00ffcc] hover:opacity-60 text-xl leading-none">✕</button>
+    </div>
+    <div class="p-5 border-b border-[#00ffcc]/10">
+        <h3 class="text-[9px] font-bold tracking-widest opacity-50 mb-3">ENROLLED USERS</h3>
+        <div id="driver-list" class="flex flex-col gap-2 mb-3"></div>
+        <button id="add-family-btn"
+            class="w-full border border-dashed border-[#00ffcc]/40 rounded-lg py-2 text-[10px]
+                   tracking-widest text-[#00ffcc]/60 hover:text-[#00ffcc] hover:border-[#00ffcc]/70
+                   transition-all hidden">
+            + ADD FAMILY MEMBER
+        </button>
+        <div id="family-enroll-panel" class="hidden mt-3">
+            <p class="text-[9px] opacity-60 mb-2 tracking-widest">RECORD 5 PHRASES FOR FAMILY MEMBER</p>
+            <div id="family-voice-prompts" class="flex flex-col gap-2"></div>
+            <p id="family-voice-status" class="text-[9px] opacity-50 mt-2"></p>
+        </div>
+    </div>
+    <div class="p-5">
+        <h3 class="text-[9px] font-bold tracking-widest opacity-50 mb-3">KWS WAKE-WORD MODEL</h3>
+        <div id="kws-version-list" class="flex flex-col gap-2 mb-3"></div>
+        <button id="add-kws-samples-btn"
+            class="w-full border border-[#00ffcc]/40 rounded-lg py-2 text-[10px] tracking-widest
+                   text-[#00ffcc] hover:bg-[#00ffcc]/10 transition-all">
+            + ADD NOVA SAMPLES & RETRAIN
+        </button>
+        <div id="kws-extra-panel" class="hidden mt-3">
+            <p class="text-[9px] opacity-60 mb-2 tracking-widest">SAY "NOVA" — RECORD 3 MORE SAMPLES</p>
+            <div class="flex gap-2 flex-wrap" id="kws-extra-btns"></div>
+            <p id="kws-extra-status" class="text-[9px] opacity-50 mt-2"></p>
+        </div>
+    </div>
+</div>
+<div id="settings-overlay" class="hidden"></div>
+
+<!-- ── Main 3-Column Cockpit ─────────────────────────────── -->
+<main class="cockpit">
+
+    <!-- ── Left Panel: Metrics + Enrollment + Components ── -->
+    <div class="panel-left">
+
+        <!-- System Metrics -->
+        <div class="card metrics-card">
+            <span class="card-title">SYSTEM METRICS</span>
+            <div class="metric-row">
+                <div class="metric-header">
+                    <span class="metric-label">CPU</span>
+                    <span class="metric-value" id="cpu-val">0%</span>
+                </div>
+                <div class="prog-track"><div class="prog-fill" id="cpu-bar" style="width:0%"></div></div>
+            </div>
+            <div class="metric-row">
+                <div class="metric-header">
+                    <span class="metric-label" id="gpu-vram-label">GPU VRAM</span>
+                    <span class="metric-value" id="gpu-mem-val">0 MB</span>
+                </div>
+                <div class="prog-track"><div class="prog-fill" id="gpu-mem-bar" style="width:0%"></div></div>
+            </div>
+            <div class="metric-row">
+                <div class="metric-header">
+                    <span class="metric-label">GPU CORE</span>
+                    <span class="metric-value" id="gpu-util-val">0%</span>
+                </div>
+                <div class="prog-track"><div class="prog-fill" id="gpu-util-bar" style="width:0%"></div></div>
+            </div>
+        </div>
+
+        <!-- KWS Enrollment -->
+        <div class="card enroll-card">
+            <span class="card-title">KWS ENROLLMENT</span>
+            <div class="enroll-grid">
+                <button id="record-nova-btn" class="enroll-btn">
+                    <div id="nova-progress" class="enroll-progress" style="width:0%;transition:width 2s linear;"></div>
+                    <span id="nova-btn-text" class="enroll-btn-text">RECORD "NOVA" (0/5)</span>
+                </button>
+                <button id="record-noise-btn" class="enroll-btn">
+                    <div id="noise-progress" class="enroll-progress" style="width:0%;transition:width 2s linear;"></div>
+                    <span id="noise-btn-text" class="enroll-btn-text">RECORD NOISE (0/5)</span>
+                </button>
+                <button id="record-face-btn" class="enroll-btn">
+                    <span id="face-btn-text" class="enroll-btn-text">FACE ID</span>
+                </button>
+                <button id="record-pin-btn" class="enroll-btn">
+                    <span id="pin-btn-text" class="enroll-btn-text">SET PIN</span>
+                </button>
+            </div>
+            <p id="enroll-status">Record 5 wake-word + 5 noise + Face ID + PIN for best accuracy.</p>
+        </div>
+
+        <!-- Component Insights -->
+        <div class="card component-card">
+            <span class="card-title">COMPONENT INSIGHTS</span>
+            <div id="component-container">
+                <div class="comp-sub" style="margin-top:4px">Loading telemetry…</div>
+            </div>
+        </div>
+    </div>
+
+    <!-- ── Center Panel: Mic + Map (top), Conversation (bottom) ── -->
+    <div class="panel-center">
+
+        <!-- Top row: voice ring  |  map -->
+        <div class="card voice-card">
+            <div class="mic-col">
+                <div id="voice-ring" class="ring-idle">
+                    <div class="ring-track"></div>
+                    <div class="ring-arc"></div>
+                    <div class="ring-core">
+                        <svg class="ring-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                            <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/>
+                            <path d="M19 10v2a7 7 0 0 1-14 0v-2"/>
+                            <line x1="12" y1="19" x2="12" y2="23"/>
+                            <line x1="8" y1="23" x2="16" y2="23"/>
+                        </svg>
+                    </div>
+                </div>
+                <p id="state-label">IDLE</p>
+                <button id="ptt-button">
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+                        <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/>
+                        <path d="M19 10v2a7 7 0 0 1-14 0v-2"/>
+                    </svg>
+                    HOLD TO SPEAK
+                </button>
+            </div>
+
+            <div class="map-col">
+                <div id="map-container" style="width:100%;height:100%;"></div>
+            </div>
+        </div>
+
+        <!-- Bottom row: YOU | NOVA conversation -->
+        <div class="card conv-card">
+            <div class="conversation">
+                <div class="utterance user-utt">
+                    <span class="utterance-label">YOU</span>
+                    <p id="last-user">—</p>
+                </div>
+                <div class="utterance nova-utt">
+                    <span class="utterance-label">NOVA</span>
+                    <p id="last-assistant">—</p>
+                </div>
+            </div>
+        </div>
+
+    </div>
+
+    <!-- ── Right Panel: Car SVG + Controls + Config ──────── -->
+    <div class="panel-right">
+
+        <!-- Car SVG + control pills -->
+        <div class="card car-card">
+            <span class="card-title" style="padding:11px 13px 0;align-self:flex-start">VEHICLE</span>
+
+            <!-- Top-down EV SVG -->
+            <div class="car-svg-wrap">
+                <svg id="car-svg" viewBox="0 0 160 276" xmlns="http://www.w3.org/2000/svg" width="148" height="236">
+                    <defs>
+                        <filter id="glow-yellow" x="-50%" y="-50%" width="200%" height="200%">
+                            <feGaussianBlur stdDeviation="3" result="b"/>
+                            <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+                        </filter>
+                        <filter id="glow-red" x="-50%" y="-50%" width="200%" height="200%">
+                            <feGaussianBlur stdDeviation="3" result="b"/>
+                            <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+                        </filter>
+                        <filter id="glow-gold" x="-100%" y="-100%" width="300%" height="300%">
+                            <feGaussianBlur stdDeviation="5" result="b"/>
+                            <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+                        </filter>
+                        <filter id="glow-green" x="-100%" y="-100%" width="300%" height="300%">
+                            <feGaussianBlur stdDeviation="3" result="b"/>
+                            <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+                        </filter>
+                        <radialGradient id="cabin-light-grad-fl" cx="50%" cy="50%" r="50%">
+                            <stop offset="0%" stop-color="#ffd060" stop-opacity="0.55"/>
+                            <stop offset="100%" stop-color="#ffd060" stop-opacity="0"/>
+                        </radialGradient>
+                        <radialGradient id="cabin-light-grad-fr" cx="50%" cy="50%" r="50%">
+                            <stop offset="0%" stop-color="#ffd060" stop-opacity="0.55"/>
+                            <stop offset="100%" stop-color="#ffd060" stop-opacity="0"/>
+                        </radialGradient>
+                        <radialGradient id="cabin-light-grad-rl" cx="50%" cy="50%" r="50%">
+                            <stop offset="0%" stop-color="#ffd060" stop-opacity="0.55"/>
+                            <stop offset="100%" stop-color="#ffd060" stop-opacity="0"/>
+                        </radialGradient>
+                        <radialGradient id="cabin-light-grad-rr" cx="50%" cy="50%" r="50%">
+                            <stop offset="0%" stop-color="#ffd060" stop-opacity="0.55"/>
+                            <stop offset="100%" stop-color="#ffd060" stop-opacity="0"/>
+                        </radialGradient>
+                        <filter id="glow-cyan" x="-50%" y="-50%" width="200%" height="200%">
+                            <feGaussianBlur stdDeviation="4" result="b"/>
+                            <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+                        </filter>
+                        <radialGradient id="heater-grad" cx="50%" cy="50%" r="50%">
+                            <stop offset="0%" stop-color="#ff6020" stop-opacity="0.36"/>
+                            <stop offset="100%" stop-color="#ff6020" stop-opacity="0"/>
+                        </radialGradient>
+                        <radialGradient id="headlamp-grad-l" cx="50%" cy="50%" r="50%">
+                            <stop offset="0%" stop-color="#fff5b0" stop-opacity="0.5"/>
+                            <stop offset="100%" stop-color="#fff5b0" stop-opacity="0"/>
+                        </radialGradient>
+                        <radialGradient id="headlamp-grad-r" cx="50%" cy="50%" r="50%">
+                            <stop offset="0%" stop-color="#fff5b0" stop-opacity="0.5"/>
+                            <stop offset="100%" stop-color="#fff5b0" stop-opacity="0"/>
+                        </radialGradient>
+                    </defs>
+
+                    <!-- Body shadow -->
+                    <ellipse cx="80" cy="140" rx="60" ry="126" fill="rgba(0,0,0,0.30)"/>
+
+                    <!-- Main car body -->
+                    <rect x="22" y="18" width="116" height="240" rx="28" fill="#0b1628" stroke="#1b2a42" stroke-width="1"/>
+
+                    <!-- Hood -->
+                    <rect x="26" y="20" width="108" height="62" rx="22" fill="#0d1a2e"/>
+
+                    <!-- Front headlamps (very dim yellow — brighten when lights ON) -->
+                    <rect id="svg-headlamp-l" x="27" y="21" width="26" height="5" rx="2"
+                          fill="rgba(255,230,90,0.12)" stroke="rgba(255,220,70,0.28)" stroke-width="0.5"/>
+                    <rect id="svg-headlamp-r" x="107" y="21" width="26" height="5" rx="2"
+                          fill="rgba(255,230,90,0.12)" stroke="rgba(255,220,70,0.28)" stroke-width="0.5"/>
+                    <!-- headlamp glow halos -->
+                    <ellipse id="svg-headlamp-halo-l" cx="40" cy="20" rx="18" ry="8" fill="url(#headlamp-grad-l)" opacity="0"/>
+                    <ellipse id="svg-headlamp-halo-r" cx="120" cy="20" rx="18" ry="8" fill="url(#headlamp-grad-r)" opacity="0"/>
+
+                    <!-- Front windshield -->
+                    <rect x="32" y="38" width="96" height="34" rx="6" fill="#091420" stroke="rgba(0,180,255,0.13)" stroke-width="0.5"/>
+
+                    <!-- Cabin floor (extended) -->
+                    <rect x="22" y="78" width="116" height="122" rx="4" fill="#0a1420"/>
+
+                    <!-- Sunroof (extended) -->
+                    <rect id="svg-sunroof" x="44" y="84" width="72" height="108" rx="6"
+                          fill="#0d1a2a" stroke="rgba(0,180,255,0.17)" stroke-width="1"/>
+                    <line x1="80" y1="84" x2="80" y2="192" stroke="rgba(0,180,255,0.07)" stroke-width="0.5"/>
+                    <line x1="44" y1="138" x2="116" y2="138" stroke="rgba(0,180,255,0.07)" stroke-width="0.5"/>
+
+                    <!-- Rear windshield -->
+                    <rect x="32" y="202" width="96" height="26" rx="5" fill="#091420" stroke="rgba(0,180,255,0.10)" stroke-width="0.5"/>
+
+                    <!-- Trunk -->
+                    <rect x="26" y="194" width="108" height="60" rx="22" fill="#0d1a2e"/>
+
+                    <!-- AC vent slits (static indicators) -->
+                    <rect x="44" y="74" width="20" height="3" rx="1.5" fill="rgba(0,200,255,0.18)"/>
+                    <rect x="47" y="74" width="14" height="2" rx="1" fill="rgba(0,200,255,0.10)"/>
+                    <rect x="96" y="74" width="20" height="3" rx="1.5" fill="rgba(0,200,255,0.18)"/>
+                    <rect x="99" y="74" width="14" height="2" rx="1" fill="rgba(0,200,255,0.10)"/>
+
+                    <!-- AC airflow waves -->
+                    <g id="svg-ac-airflow">
+                        <path class="ac-wave" d="M48,78 Q52,86 48,94 Q44,102 48,110"/>
+                        <path class="ac-wave" d="M55,78 Q59,87 55,96 Q51,105 55,114"/>
+                        <path class="ac-wave" d="M80,78 Q85,88 80,98 Q75,108 80,118"/>
+                        <path class="ac-wave" d="M105,78 Q109,87 105,96 Q101,105 105,114"/>
+                        <path class="ac-wave" d="M112,78 Q116,86 112,94 Q108,102 112,110"/>
+                        <text class="ice-crystal" x="56"  y="88">❄</text>
+                        <text class="ice-crystal" x="78"  y="84">❄</text>
+                        <text class="ice-crystal" x="100" y="88">❄</text>
+                    </g>
+
+                    <!-- Heater glow -->
+                    <ellipse id="svg-heater-glow" cx="80" cy="140" rx="52" ry="44"
+                             fill="url(#heater-grad)" opacity="0"/>
+
+                    <!-- Cabin corner lights (4x — gold glow when ON) -->
+                    <circle id="svg-cabin-halo-fl" cx="30" cy="92"  r="14" fill="url(#cabin-light-grad-fl)" opacity="0"/>
+                    <circle id="svg-cabin-halo-fr" cx="130" cy="92" r="14" fill="url(#cabin-light-grad-fr)" opacity="0"/>
+                    <circle id="svg-cabin-halo-rl" cx="30" cy="186" r="14" fill="url(#cabin-light-grad-rl)" opacity="0"/>
+                    <circle id="svg-cabin-halo-rr" cx="130" cy="186" r="14" fill="url(#cabin-light-grad-rr)" opacity="0"/>
+                    <circle id="svg-cabin-light-fl" cx="30" cy="92"  r="3.5" fill="rgba(180,130,30,0.22)"/>
+                    <circle id="svg-cabin-light-fr" cx="130" cy="92" r="3.5" fill="rgba(180,130,30,0.22)"/>
+                    <circle id="svg-cabin-light-rl" cx="30" cy="186" r="3.5" fill="rgba(180,130,30,0.22)"/>
+                    <circle id="svg-cabin-light-rr" cx="130" cy="186" r="3.5" fill="rgba(180,130,30,0.22)"/>
+
+                    <!-- Rear taillights (very dim red — brighten when lights ON) -->
+                    <rect id="svg-taillight-l" x="27" y="248" width="28" height="5" rx="2"
+                          fill="rgba(255,55,55,0.14)" stroke="rgba(255,40,40,0.28)" stroke-width="0.5"/>
+                    <rect id="svg-taillight-r" x="105" y="248" width="28" height="5" rx="2"
+                          fill="rgba(255,55,55,0.14)" stroke="rgba(255,40,40,0.28)" stroke-width="0.5"/>
+
+                    <!-- Rear camera (between taillights, animated on/off) -->
+                    <circle id="svg-rearcam-ring" cx="80" cy="251" r="4.5" fill="#060e1c" stroke="rgba(0,200,80,0.45)" stroke-width="1"/>
+                    <circle id="svg-rearcam-dot"  cx="80" cy="251" r="1.8" fill="rgba(0,200,80,0.55)"/>
+
+                    <!-- Wheels — Front-left -->
+                    <rect x="7"   y="37"  width="17" height="44" rx="6" fill="#142030" stroke="rgba(70,120,180,0.75)" stroke-width="1.5"/>
+                    <circle cx="15.5" cy="59"  r="7"   fill="none" stroke="rgba(110,160,220,0.55)" stroke-width="1.3"/>
+                    <circle cx="15.5" cy="59"  r="2.5" fill="rgba(140,190,230,0.55)"/>
+                    <line x1="15.5" y1="52" x2="15.5" y2="66" stroke="rgba(110,160,220,0.35)" stroke-width="0.8"/>
+                    <line x1="8.5"  y1="59" x2="22.5" y2="59" stroke="rgba(110,160,220,0.35)" stroke-width="0.8"/>
+                    <!-- Front-right -->
+                    <rect x="136" y="37"  width="17" height="44" rx="6" fill="#142030" stroke="rgba(70,120,180,0.75)" stroke-width="1.5"/>
+                    <circle cx="144.5" cy="59"  r="7"   fill="none" stroke="rgba(110,160,220,0.55)" stroke-width="1.3"/>
+                    <circle cx="144.5" cy="59"  r="2.5" fill="rgba(140,190,230,0.55)"/>
+                    <line x1="144.5" y1="52" x2="144.5" y2="66" stroke="rgba(110,160,220,0.35)" stroke-width="0.8"/>
+                    <line x1="137.5" y1="59" x2="151.5" y2="59" stroke="rgba(110,160,220,0.35)" stroke-width="0.8"/>
+                    <!-- Rear-left -->
+                    <rect x="7"   y="195" width="17" height="44" rx="6" fill="#142030" stroke="rgba(70,120,180,0.75)" stroke-width="1.5"/>
+                    <circle cx="15.5" cy="217" r="7"   fill="none" stroke="rgba(110,160,220,0.55)" stroke-width="1.3"/>
+                    <circle cx="15.5" cy="217" r="2.5" fill="rgba(140,190,230,0.55)"/>
+                    <line x1="15.5" y1="210" x2="15.5" y2="224" stroke="rgba(110,160,220,0.35)" stroke-width="0.8"/>
+                    <line x1="8.5"  y1="217" x2="22.5" y2="217" stroke="rgba(110,160,220,0.35)" stroke-width="0.8"/>
+                    <!-- Rear-right -->
+                    <rect x="136" y="195" width="17" height="44" rx="6" fill="#142030" stroke="rgba(70,120,180,0.75)" stroke-width="1.5"/>
+                    <circle cx="144.5" cy="217" r="7"   fill="none" stroke="rgba(110,160,220,0.55)" stroke-width="1.3"/>
+                    <circle cx="144.5" cy="217" r="2.5" fill="rgba(140,190,230,0.55)"/>
+                    <line x1="144.5" y1="210" x2="144.5" y2="224" stroke="rgba(110,160,220,0.35)" stroke-width="0.8"/>
+                    <line x1="137.5" y1="217" x2="151.5" y2="217" stroke="rgba(110,160,220,0.35)" stroke-width="0.8"/>
+                </svg>
+            </div>
+
+            <!-- Control pills -->
+            <div class="car-controls-grid">
+                <div class="ctrl-pill" id="ctrl-ac">
+                    <span class="ctrl-name">AC</span>
+                    <span class="ctrl-state" id="ctrl-ac-state">OFF</span>
+                </div>
+                <div class="ctrl-pill" id="ctrl-heater">
+                    <span class="ctrl-name">HEAT</span>
+                    <span class="ctrl-state" id="ctrl-heater-state">OFF</span>
+                </div>
+                <div class="ctrl-pill" id="ctrl-sunroof">
+                    <span class="ctrl-name">ROOF</span>
+                    <span class="ctrl-state" id="ctrl-sunroof-state">CLOSED</span>
+                </div>
+                <div class="ctrl-pill" id="ctrl-lights">
+                    <span class="ctrl-name">LIGHTS</span>
+                    <span class="ctrl-state" id="ctrl-lights-state">OFF</span>
+                </div>
+                <div class="ctrl-pill" id="ctrl-rear_camera">
+                    <span class="ctrl-name">CAMERA</span>
+                    <span class="ctrl-state" id="ctrl-rear_camera-state">OFF</span>
+                </div>
+            </div>
+        </div>
+
+        <!-- Pipeline Config -->
+        <div class="card config-card">
+            <span class="card-title">PIPELINE CONFIG</span>
+            <div class="selector-grid">
+                <div>
+                    <label class="sel-label">TTS ENGINE</label>
+                    <select id="tts-engine-select" class="nova-select">
+                        <option value="faster-qwen3" selected>FasterQwen3TTS</option>
+                        <option value="pocket-tts">Pocket-TTS</option>
+                    </select>
+                </div>
+                <div>
+                    <label class="sel-label">VOICE</label>
+                    <select id="voice-select" class="nova-select"></select>
+                </div>
+                <div>
+                    <label class="sel-label">LLM MODEL</label>
+                    <select id="llm-select" class="nova-select">
+                        <option value="auto" selected>Auto (smart routing)</option>
+                    </select>
+                </div>
+                <div>
+                    <label class="sel-label">STT MODEL</label>
+                    <select id="stt-variant-select" class="nova-select">
+                        <option value="tiny">Tiny (~200 MB)</option>
+                        <option value="small" selected>Small (~400 MB)</option>
+                        <option value="medium">Medium (~800 MB)</option>
+                    </select>
+                </div>
+            </div>
+            <p id="vram-warning" class="hidden"></p>
+        </div>
+    </div>
+</main>
+
+<!-- ── Footer Latency Bar ──────────────────────────────── -->
+<footer class="status-bar">
+    <div class="sb-metric"><span class="sb-label">KWS</span><span class="sb-value" id="kws-latency">-- ms</span></div>
+    <span class="sb-sep">·</span>
+    <div class="sb-metric"><span class="sb-label">STT</span><span class="sb-value" id="stt-latency">-- ms</span></div>
+    <div class="sb-metric"><span class="sb-label">RTF</span><span class="sb-value dim" id="stt-rtf">-- x</span></div>
+    <span class="sb-sep">·</span>
+    <div class="sb-metric"><span class="sb-label">LLM</span><span class="sb-value" id="llm-latency">-- ms</span></div>
+    <div class="sb-metric"><span class="sb-label">THPT</span><span class="sb-value dim" id="llm-throughput">-- t/s</span></div>
+    <span class="sb-sep">·</span>
+    <div class="sb-metric"><span class="sb-label">TTS</span><span class="sb-value" id="tts-latency">-- ms</span></div>
+    <div class="sb-metric"><span class="sb-label">RTF</span><span class="sb-value dim" id="tts-rtf">-- x</span></div>
+    <span class="sb-sep">·</span>
+    <div class="sb-metric"><span class="sb-label">E2E</span><span class="sb-value" id="e2e-latency">-- ms</span></div>
+</footer>
+
+<!-- ── Onboarding Modal ─────────────────────────────────── -->
+<div id="onboarding-modal" class="hidden">
+    <div class="card" style="padding:2rem;max-width:480px;width:100%;margin:0 16px;border-radius:18px;">
+        <h2 style="font-family:var(--ff-display);font-size:22px;font-weight:700;letter-spacing:0.22em;color:var(--accent);text-shadow:0 0 20px var(--accent-glow);margin-bottom:4px;">WELCOME TO NOVA AI</h2>
+        <p style="font-family:var(--ff-data);font-size:9px;letter-spacing:0.18em;color:var(--text-muted);margin-bottom:24px;">EV VOICE ASSISTANT SETUP</p>
+
+        <!-- Step KWS -->
+        <div id="ob-step-kws">
+            <p class="text-[11px] opacity-70 mb-4 leading-relaxed">
+                First, teach Nova your wake word. Record yourself saying <strong class="text-[#00ffcc]">"Nova"</strong>
+                5 times, then record 5 background noise samples.
+            </p>
+            <div class="flex gap-3 mb-3">
+                <button id="ob-nova-btn"
+                    class="flex-1 border border-[#00ffcc] text-[#00ffcc] py-2 rounded text-[10px]
+                           tracking-widest hover:bg-[#00ffcc]/20 transition-all relative overflow-hidden">
+                    <div id="ob-nova-progress" class="absolute left-0 top-0 bottom-0 bg-[#00ffcc] opacity-20" style="width:0%;transition:width 2s linear;"></div>
+                    <span id="ob-nova-text" class="relative z-10">RECORD "NOVA" (0/5)</span>
+                </button>
+                <button id="ob-noise-btn"
+                    class="flex-1 border border-[#00ffcc] text-[#00ffcc] py-2 rounded text-[10px]
+                           tracking-widest hover:bg-[#00ffcc]/20 transition-all relative overflow-hidden">
+                    <div id="ob-noise-progress" class="absolute left-0 top-0 bottom-0 bg-[#00ffcc] opacity-20" style="width:0%;transition:width 2s linear;"></div>
+                    <span id="ob-noise-text" class="relative z-10">RECORD NOISE (0/5)</span>
+                </button>
+            </div>
+            <p id="ob-kws-status" class="text-[9px] opacity-40 italic">Record 5 of each to enable wake word detection.</p>
+        </div>
+
+        <!-- Step Training -->
+        <div id="ob-step-training" class="hidden text-center py-4">
+            <div class="text-2xl mb-3 animate-spin inline-block">⚙️</div>
+            <p id="ob-training-msg" class="text-[11px] opacity-70 tracking-widest">Training wake word model…</p>
+            <div class="mt-3 h-1 bg-[#00ffcc]/20 rounded overflow-hidden">
+                <div id="ob-training-bar" class="h-full bg-[#00ffcc] transition-all" style="width:0%"></div>
+            </div>
+        </div>
+
+        <!-- Step Voice -->
+        <div id="ob-step-voice" class="hidden">
+            <p class="text-[11px] opacity-70 mb-4 leading-relaxed">
+                Now record your voice fingerprint. Speak naturally — say the prompted phrase clearly.
+            </p>
+            <div id="ob-voice-prompts" class="space-y-2 mb-4"></div>
+            <p id="ob-voice-status" class="text-[9px] opacity-40 italic">Say each phrase clearly. Takes ~3 seconds each.</p>
+        </div>
+
+        <!-- Step Done -->
+        <div id="ob-step-done" class="hidden text-center py-4">
+            <div class="text-3xl mb-3">✅</div>
+            <p class="text-[11px] text-[#00ffcc] tracking-widest mb-1">SETUP COMPLETE</p>
+            <p class="text-[9px] opacity-50">Nova knows your voice. Say "Nova" to get started.</p>
+            <button id="ob-done-btn"
+                class="mt-5 px-8 py-2 border border-[#00ffcc] rounded text-[10px]
+                       tracking-widest hover:bg-[#00ffcc] hover:text-black transition-all">
+                START NOVA
+            </button>
+        </div>
+    </div>
+</div>
+
+<script>
+// ── State ───────────────────────────────────────────────────────────────────
+let ws, isRecordingUI = false, novaCount = 0, noiseCount = 0, lastAssistantText = '';
+const carState = { ac: false, heater: false, sunroof: false, lights: false, rear_camera: false };
+
+// ── Clock ────────────────────────────────────────────────────────────────────
+function updateClock() {
+    const n = new Date();
+    document.getElementById('clock-readout').textContent =
+        String(n.getHours()).padStart(2,'0') + ':' + String(n.getMinutes()).padStart(2,'0');
+}
+setInterval(updateClock, 10000);
+updateClock();
+
+// ── Connection status helper ─────────────────────────────────────────────────
+function setConnStatus(online) {
+    const el  = document.getElementById('connection-status');
+    const dot = document.getElementById('conn-dot');
+    el.textContent = online ? 'ONLINE' : 'OFFLINE';
+    el.classList.toggle('conn-online', online);
+    dot.classList.toggle('online', online);
+}
+
+// ── Voice Ring ────────────────────────────────────────────────────────────────
+const voiceRing = document.getElementById('voice-ring');
+function setUIState(state) {
+    const valid = { idle:1, listening:1, thinking:1, speaking:1 };
+    voiceRing.className = 'ring-' + (valid[state] ? state : 'idle');
+    document.getElementById('state-label').textContent = state.toUpperCase();
+}
+setUIState('idle');
+
+// ── Google Maps ───────────────────────────────────────────────────────────────
+let gmap = null;
+let userLat = null, userLng = null;
+
+function initMap() {
+    navigator.geolocation.getCurrentPosition(pos => {
+        userLat = pos.coords.latitude;
+        userLng = pos.coords.longitude;
+        const center = { lat: userLat, lng: userLng };
+        gmap = new google.maps.Map(document.getElementById('map-container'), {
+            center,
+            zoom: 14,
+            mapId: 'DEMO_MAP_ID',
+            disableDefaultUI: true,
+            mapTypeControl: true,
+            mapTypeControlOptions: {
+                style: google.maps.MapTypeControlStyle.HORIZONTAL_BAR,
+                position: google.maps.ControlPosition.TOP_LEFT,
+                mapTypeIds: ['roadmap', 'satellite']
+            },
+            gestureHandling: 'greedy',
+            styles: [
+                { elementType: 'geometry',        stylers: [{ color: '#060c1a' }] },
+                { elementType: 'labels.text.fill', stylers: [{ color: '#4a8fa8' }] },
+                { elementType: 'labels.text.stroke', stylers: [{ color: '#060c1a' }] },
+                { featureType: 'road', elementType: 'geometry', stylers: [{ color: '#0d2035' }] },
+                { featureType: 'road', elementType: 'geometry.stroke', stylers: [{ color: '#00ffcc22' }] },
+                { featureType: 'water', elementType: 'geometry', stylers: [{ color: '#020b18' }] },
+                { featureType: 'poi', stylers: [{ visibility: 'off' }] },
+            ]
+        });
+        new google.maps.Marker({ position: center, map: gmap,
+            icon: { path: google.maps.SymbolPath.CIRCLE,
+                    scale: 7, fillColor: '#00ffcc', fillOpacity: 0.9,
+                    strokeColor: '#00ffcc', strokeWeight: 2 }
+        });
+        fetchWeather(userLat, userLng);
+    }, () => {
+        // Geolocation denied — show placeholder
+        document.getElementById('map-container').style.cssText +=
+            ';display:flex;align-items:center;justify-content:center;color:var(--text-muted);font-size:11px;letter-spacing:.08em;';
+        document.getElementById('map-container').textContent = 'LOCATION ACCESS DENIED';
+    });
+}
+
+// ── Weather API ───────────────────────────────────────────────────────────────
+const WEATHER_CONDITION_ICONS = {
+    CLEAR: '☀️', PARTLY_CLOUDY: '⛅', CLOUDY: '☁️', OVERCAST: '☁️',
+    FOGGY: '🌫️', DRIZZLE: '🌦️', RAIN: '🌧️', HEAVY_RAIN: '🌧️',
+    THUNDERSTORM: '⛈️', SNOW: '❄️', SLEET: '🌨️', HAIL: '🌨️',
+    WINDY: '💨', TORNADO: '🌪️', UNKNOWN: '🌡️',
+};
+
+async function fetchWeather(lat, lng) {
+    try {
+        const url = `https://weather.googleapis.com/v1/currentConditions:lookup` +
+                    `?key=${MAPS_API_KEY}&location.latitude=${lat}&location.longitude=${lng}&unitsSystem=METRIC`;
+        const res  = await fetch(url);
+        const data = await res.json();
+
+        const temp      = data.temperature?.degrees ?? null;
+        const feelsLike = data.feelsLikeTemperature?.degrees ?? temp;
+        const condType  = data.weatherCondition?.type ?? 'UNKNOWN';
+        const icon      = WEATHER_CONDITION_ICONS[condType] || '🌡️';
+
+        if (temp !== null) {
+            document.getElementById('weather-icon').textContent = icon;
+            document.getElementById('weather-temp').textContent = `${Math.round(temp)}°C`;
+        }
+
+        // Auto climate suggestion based on feels-like
+        if (feelsLike !== null) {
+            if (feelsLike < 10 && !carState.heater && !carState.ac) {
+                showToast(`🥶 ${Math.round(feelsLike)}°C outside — activating heater`);
+                sendUIEvent('vehicle_control', { component: 'heater', action: 'on' });
+                updateCarControl('heater', true);
+            } else if (feelsLike > 30 && !carState.ac && !carState.heater) {
+                showToast(`🌡️ ${Math.round(feelsLike)}°C outside — activating AC`);
+                sendUIEvent('vehicle_control', { component: 'ac', action: 'on' });
+                updateCarControl('ac', true);
+            }
+        }
+    } catch (e) {
+        console.warn('[Weather] fetch failed:', e);
+    }
+}
+
+// Refresh weather every 10 minutes
+setInterval(() => { if (userLat) fetchWeather(userLat, userLng); }, 10 * 60 * 1000);
+
+// ── WebSocket ──────────────────────────────────────────────────────────────────
+let localStream;
+let audioContext, input;
+let playbackCtx, gainNode, nextPlayTime = 0;
+
+function stopAllAudio() {
+    if (gainNode) {
+        try { gainNode.disconnect(); } catch(_) {}
+        gainNode = playbackCtx.createGain();
+        gainNode.connect(playbackCtx.destination);
+    }
+    nextPlayTime = 0;
+}
+
+function stopWebSocket() {
+    if (ws) { ws.close(); ws = null; }
+    if (localStream) localStream.getTracks().forEach(t => t.stop());
+    setConnStatus(false);
+    setUIState('idle');
+}
+
+const sendUIEvent = (type, data=null) => {
+    if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type, data }));
+    } else {
+        fetch('/ui-event', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({ type, data })
+        });
+    }
+};
+
+async function setupWebSocket() {
+    try {
+        try {
+            localStream = await navigator.mediaDevices.getUserMedia({
+                audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }
+            });
+            audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
+            input = audioContext.createMediaStreamSource(localStream);
+
+            // Stream 16kHz PCM to server via WebSocket for STT
+            const pcmProcessor = audioContext.createScriptProcessor(4096, 1, 1);
+            pcmProcessor.onaudioprocess = (e) => {
+                if (!ws || ws.readyState !== WebSocket.OPEN) return;
+                const float32 = e.inputBuffer.getChannelData(0);
+                const int16 = new Int16Array(float32.length);
+                for (let i = 0; i < float32.length; i++) {
+                    int16[i] = Math.max(-32768, Math.min(32767, float32[i] * 32768));
+                }
+                ws.send(int16.buffer);
+            };
+            input.connect(pcmProcessor);
+            pcmProcessor.connect(audioContext.destination);
+        } catch (micErr) {
+            console.warn('Mic not available for visualizer:', micErr);
+        }
+
+        playbackCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 24000 });
+        gainNode = playbackCtx.createGain();
+        gainNode.connect(playbackCtx.destination);
+        nextPlayTime = 0;
+
+        const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+        ws = new WebSocket(`${proto}//${location.host}/ws`);
+        ws.binaryType = 'arraybuffer';
+
+        ws.onopen = () => {
+            setConnStatus(true);
+            setUIState('idle');
+            sendUIEvent("change_tts_engine", document.getElementById('tts-engine-select').value);
+            sendUIEvent("change_voice",      document.getElementById('voice-select').value);
+            sendUIEvent("change_llm",        document.getElementById('llm-select').value);
+            // Don't send variant on connect — server reports active variant via stt_variants_available
+        };
+
+        ws.onmessage = (event) => {
+            if (event.data instanceof ArrayBuffer) {
+                const int16  = new Int16Array(event.data);
+                const float32 = new Float32Array(int16.length);
+                for (let i = 0; i < int16.length; i++) float32[i] = int16[i] / 32768.0;
+                const buffer = playbackCtx.createBuffer(1, float32.length, 24000);
+                buffer.getChannelData(0).set(float32);
+                const source = playbackCtx.createBufferSource();
+                source.buffer = buffer;
+                source.connect(gainNode);
+                const now = playbackCtx.currentTime;
+                if (nextPlayTime < now) nextPlayTime = now;
+                source.start(nextPlayTime);
+                nextPlayTime += buffer.duration;
+            } else {
+                try { handleJsonMessage(JSON.parse(event.data)); }
+                catch (e) { console.warn('Bad JSON from server:', e); }
+            }
+        };
+
+        ws.onclose = () => setConnStatus(false);
+        ws.onerror = (err) => console.error('WebSocket error:', err);
+
+    } catch (err) {
+        console.error('WebSocket setup error:', err);
+        stopWebSocket();
+    }
+}
+
+function handleJsonMessage(msg) {
+    switch (msg.type) {
+        case 'kws_detected':
+            document.getElementById('kws-latency').textContent = `${msg.data.latency.toFixed(0)} ms`;
+            isRecordingUI = true;
+            setUIState('listening');
+            break;
+        case 'speech_started':
+            isRecordingUI = true;
+            setUIState('listening');
+            break;
+        case 'transcript_partial':
+            if (msg.data) document.getElementById('last-user').textContent = '▸ ' + msg.data + ' …';
+            break;
+        case 'transcript':
+            if (msg.data) document.getElementById('last-user').textContent = '▸ ' + msg.data;
+            if (msg.latency?.stt_ttfb) document.getElementById('stt-latency').textContent = `${(msg.latency.stt_ttfb*1000).toFixed(0)} ms`;
+            if (msg.latency?.stt_rtf)  document.getElementById('stt-rtf').textContent = `${msg.latency.stt_rtf.toFixed(2)}x`;
+            break;
+        case 'assistant_start':
+            lastAssistantText = '';
+            document.getElementById('last-assistant').textContent = '…';
+            setUIState('thinking');
+            break;
+        case 'llm_token':
+            if (!msg.data.includes('<think>') && !msg.data.includes('</think>'))
+                lastAssistantText += msg.data;
+            document.getElementById('last-assistant').textContent = lastAssistantText.trim();
+            if (msg.latency?.llm_ttft)       document.getElementById('llm-latency').textContent   = `${(msg.latency.llm_ttft*1000).toFixed(0)} ms`;
+            if (msg.latency?.llm_throughput) document.getElementById('llm-throughput').textContent = `${msg.latency.llm_throughput.toFixed(1)} t/s`;
+            break;
+        case 'tts_metrics':
+            setUIState('speaking');
+            if (msg.data?.ttfa)    document.getElementById('tts-latency').textContent = `${(msg.data.ttfa*1000).toFixed(0)} ms`;
+            if (msg.data?.tts_rtf) document.getElementById('tts-rtf').textContent     = `${msg.data.tts_rtf.toFixed(2)}x`;
+            if (msg.data?.e2e)     document.getElementById('e2e-latency').textContent  = `${(msg.data.e2e*1000).toFixed(0)} ms`;
+            break;
+        case 'recording_stopped':
+            isRecordingUI = false;
+            setUIState('idle');
+            break;
+        case 'ptt_started':
+            isRecordingUI = true;
+            setUIState('listening');
+            break;
+        case 'interrupted':
+            stopAllAudio();
+            isRecordingUI = true;
+            setUIState('listening');
+            break;
+        case 'generation_start':
+            setUIState('thinking');
+            break;
+        case 'generation_done':
+            setUIState('idle');
+            break;
+        case 'dm_state':
+            if (msg.data?.nova_says) {
+                document.getElementById('last-assistant').textContent = msg.data.nova_says;
+                lastAssistantText = msg.data.nova_says;
+            }
+            if (msg.data?.intent === 'vehicle_control' && msg.data?.entities) {
+                const e = msg.data.entities;
+                if (e.commands && e.commands.length > 1) {
+                    for (const cmd of e.commands) updateCarControl(cmd.component, cmd.action !== 'off');
+                } else if (e.component) {
+                    updateCarControl(e.component, e.action !== 'off');
+                }
+                if (e.ac_temp_range) setACTemp(e.ac_temp_range);
+                if (e.fan_speed)     setACFanSpeed(e.fan_speed);
+            }
+            break;
+        case 'enrollment_done':
+            if (!document.getElementById('onboarding-modal').classList.contains('hidden')) showObStep('voice');
+            break;
+        case 'enrollment_check':
+            if (msg.fully_enrolled) {
+                localStorage.setItem('nova_setup_done', '1');
+                document.getElementById('onboarding-modal').classList.add('hidden');
+            }
+            break;
+        case 'kws_version_activated':
+            if (msg.success) refreshKwsVersionList();
+            break;
+        case 'stt_variant_changed': {
+            const sel = document.getElementById('stt-variant-select');
+            if (sel && msg.data?.variant) sel.value = msg.data.variant;
+            break;
+        }
+        case 'stt_variant_loading': {
+            const d = msg.data || {};
+            if (d.status === 'loading') console.log(`[STT] Loading ${d.variant} on ${d.device}…`);
+            else if (d.status === 'ready') console.log(`[STT] ${d.variant} ready on ${d.device}`);
+            else if (d.status === 'error') console.warn(`[STT] Failed to load ${d.variant}: ${d.error}`);
+            break;
+        }
+    }
+}
+
+// ── Controls ──────────────────────────────────────────────────────────────────
+document.getElementById('always-listening-toggle').onchange = (e) => {
+    if (e.target.checked) setupWebSocket();
+    else stopWebSocket();
+};
+
+const pttBtn  = document.getElementById('ptt-button');
+const sendPTT = (type) => sendUIEvent(type);
+pttBtn.addEventListener('mousedown',  () => sendPTT('start_ptt'));
+pttBtn.addEventListener('mouseup',    () => sendPTT('stop_ptt'));
+pttBtn.addEventListener('mouseleave', () => sendPTT('stop_ptt'));
+pttBtn.addEventListener('touchstart', (e) => { e.preventDefault(); sendPTT('start_ptt'); });
+pttBtn.addEventListener('touchend',   (e) => { e.preventDefault(); sendPTT('stop_ptt'); });
+
+// ── TTS Engine / Voice ─────────────────────────────────────────────────────────
+let ttsInfo = null;
+
+async function loadTTSInfo() {
+    try {
+        ttsInfo = await (await fetch('/tts/info')).json();
+        const engineSel = document.getElementById('tts-engine-select');
+        engineSel.value = ttsInfo.current_engine;
+        populateVoices(ttsInfo.current_engine);
+    } catch (_) {}
+}
+
+function populateVoices(engineId) {
+    const voiceSel = document.getElementById('voice-select');
+    voiceSel.innerHTML = '';
+    if (!ttsInfo) return;
+    const engine = ttsInfo.engines.find(e => e.id === engineId);
+    if (!engine || !engine.voices.length) {
+        voiceSel.innerHTML = '<option value="">— no voices —</option>';
+        voiceSel.disabled = true;
+        return;
+    }
+    voiceSel.disabled = false;
+    for (const v of engine.voices) {
+        const opt = document.createElement('option');
+        opt.value = v.id;
+        opt.textContent = v.name;
+        voiceSel.appendChild(opt);
+    }
+    if (ttsInfo.current_engine === engineId && engine.voices.some(v => v.id === ttsInfo.current_voice))
+        voiceSel.value = ttsInfo.current_voice;
+}
+
+document.getElementById('tts-engine-select').onchange = (e) => {
+    const engineId = e.target.value;
+    sendUIEvent('change_tts_engine', engineId);
+    populateVoices(engineId);
+    const voiceSel = document.getElementById('voice-select');
+    if (voiceSel.value) sendUIEvent('change_voice', voiceSel.value);
+    checkVramBudget();
+};
+document.getElementById('voice-select').onchange      = (e) => sendUIEvent('change_voice', e.target.value);
+document.getElementById('llm-select').onchange        = (e) => { sendUIEvent('change_llm', e.target.value); checkVramBudget(); };
+document.getElementById('stt-variant-select').onchange = (e) => sendUIEvent('change_stt_variant', e.target.value);
+loadTTSInfo();
+
+// ── LLM Info + VRAM Budget ─────────────────────────────────────────────────────
+let llmInfo = null;
+
+async function loadLLMInfo() {
+    try {
+        llmInfo = await (await fetch('/llm/info')).json();
+        const sel = document.getElementById('llm-select');
+        sel.innerHTML = '<option value="auto">Auto (smart routing)</option>';
+        if (llmInfo.cloud_models.length) {
+            const grp1 = document.createElement('optgroup');
+            grp1.label = 'Cloud (OpenRouter)';
+            for (const m of llmInfo.cloud_models) {
+                const opt = document.createElement('option');
+                opt.value = m.id; opt.textContent = m.name;
+                grp1.appendChild(opt);
+            }
+            sel.appendChild(grp1);
+        }
+        if (llmInfo.local_models.length) {
+            const grp2 = document.createElement('optgroup');
+            grp2.label = 'Local (on-device)';
+            for (const m of llmInfo.local_models) {
+                const opt = document.createElement('option');
+                opt.value = m.id; opt.textContent = `${m.name} (~${m.vram_mb} MB)`;
+                grp2.appendChild(opt);
+            }
+            sel.appendChild(grp2);
+        }
+        sel.value = llmInfo.current_llm;
+    } catch (_) {}
+}
+
+function checkVramBudget() {
+    const warn = document.getElementById('vram-warning');
+    if (!ttsInfo || !llmInfo || !llmInfo.gpu_total_mb) { warn.classList.add('hidden'); return; }
+    const gpuTotal = llmInfo.gpu_total_mb;
+    const baseline = llmInfo.baseline_vram_mb || 850;
+    const ttsEngine = document.getElementById('tts-engine-select').value;
+    const llmModel  = document.getElementById('llm-select').value;
+    const ttsEntry  = ttsInfo.engines.find(e => e.id === ttsEngine);
+    const ttsVram   = ttsEntry ? (ttsEntry.vram_mb || 0) : 0;
+    let llmVram = 0;
+    if (llmModel.startsWith('local:')) {
+        const lm = llmInfo.local_models.find(m => m.id === llmModel);
+        llmVram = lm ? lm.vram_mb : 0;
+    } else if (llmModel === 'auto') {
+        const def = llmInfo.local_models[0];
+        llmVram = def ? def.vram_mb : 0;
+    }
+    const total = baseline + ttsVram + llmVram;
+    if (total > gpuTotal) {
+        warn.textContent = `VRAM: ${ttsEngine}(${ttsVram}MB) + LLM(${llmVram}MB) + base(${baseline}MB) = ${total}MB > ${gpuTotal}MB`;
+        warn.classList.remove('hidden');
+    } else {
+        warn.classList.add('hidden');
+    }
+}
+loadLLMInfo();
+
+// ── SVG Car Controls ──────────────────────────────────────────────────────────
+const SVG_CTRL = {
+    lights: (on) => {
+        // Cabin corner lights only (4 interior dome lights)
+        ['fl','fr','rl','rr'].forEach(pos => {
+            const bulb = document.getElementById(`svg-cabin-light-${pos}`);
+            const halo = document.getElementById(`svg-cabin-halo-${pos}`);
+            bulb.setAttribute('fill', on ? '#ffd060' : 'rgba(180,130,30,0.22)');
+            bulb.style.filter = on ? 'url(#glow-gold)' : '';
+            halo.style.opacity = on ? '1' : '0';
+        });
+    },
+    sunroof: (on) => {
+        const el = document.getElementById('svg-sunroof');
+        el.setAttribute('fill', on ? 'rgba(0,200,240,0.17)' : '#0d1a2a');
+        el.setAttribute('stroke', on ? 'rgba(0,255,204,0.50)' : 'rgba(0,180,255,0.17)');
+        el.style.filter = on ? 'url(#glow-cyan)' : '';
+    },
+    ac: (on) => {
+        document.getElementById('svg-ac-airflow').classList.toggle('ac-on', on);
+        applyACVisual();
+    },
+    heater: (on) => {
+        document.getElementById('svg-heater-glow').style.opacity = on ? '1' : '0';
+    },
+    rear_camera: (on) => {
+        const ring = document.getElementById('svg-rearcam-ring');
+        const dot  = document.getElementById('svg-rearcam-dot');
+        if (!ring || !dot) return;
+        ring.setAttribute('stroke', on ? 'rgba(0,255,100,0.85)' : 'rgba(0,200,80,0.45)');
+        ring.style.filter = on ? 'url(#glow-cyan)' : '';
+        dot.setAttribute('fill', on ? 'rgba(0,255,100,0.95)' : 'rgba(0,200,80,0.55)');
+    }
+};
+
+// ── AC Fan Speed & Temperature Config ────────────────────────────────────────
+const acConfig = { fan: 'low', temp: 'cold' };
+
+const AC_FAN_DUR  = { low: '2.2s', medium: '1.3s', high: '0.7s' };
+// cold=≤18°C ice blue, mid=19-22°C comfort (CSS handles alternating), hot=≥23°C red
+const AC_TEMP_CLR = { cold: '#47c8e8', mid: '#00c4d4', hot: '#ff5e5b' };
+
+function applyACVisual() {
+    const root = document.documentElement;
+    root.style.setProperty('--ac-wave-dur',   AC_FAN_DUR[acConfig.fan]   || '2.2s');
+    root.style.setProperty('--ac-wave-color', AC_TEMP_CLR[acConfig.temp] || '#47c8e8');
+    // Toggle temp-range class on airflow group (drives per-range CSS)
+    const ag = document.getElementById('svg-ac-airflow');
+    if (ag) {
+        ag.classList.remove('ac-cold', 'ac-mid', 'ac-hot');
+        ag.classList.add('ac-' + acConfig.temp);
+    }
+}
+
+function setACFanSpeed(speed) {
+    // speed: 'low' | 'medium' | 'high'
+    if (!(speed in AC_FAN_DUR)) return;
+    acConfig.fan = speed;
+    applyACVisual();
+}
+
+function setACTemp(temp) {
+    // temp: 'cold' (≤18°C) | 'mid' (19-22°C) | 'hot' (≥23°C)
+    // also accept legacy aliases
+    const alias = { 'mid-cold': 'mid', 'normal': 'mid', 'warm': 'hot' };
+    const t = alias[temp] || temp;
+    if (!(t in AC_TEMP_CLR)) return;
+    acConfig.temp = t;
+    applyACVisual();
+}
+
+const CAR_CTRL_LABELS = { sunroof: ['CLOSED','OPEN'], ac: ['OFF','ON'], heater: ['OFF','ON'], lights: ['OFF','ON'], rear_camera: ['OFF','ON'] };
+
+function showToast(msg, type = 'warn') {
+    let t = document.getElementById('nova-toast');
+    if (!t) {
+        t = document.createElement('div');
+        t.id = 'nova-toast';
+        t.style.cssText = 'position:fixed;bottom:54px;left:50%;transform:translateX(-50%);' +
+            'background:#0d1a2e;border:1px solid rgba(0,255,204,0.3);border-radius:8px;' +
+            'padding:7px 16px;font-size:11px;font-family:Rajdhani,sans-serif;letter-spacing:.06em;' +
+            'color:#00ffcc;z-index:9999;transition:opacity .3s;pointer-events:none;';
+        document.body.appendChild(t);
+    }
+    if (type === 'warn') t.style.borderColor = 'rgba(255,160,50,0.55)', t.style.color = '#ffb040';
+    else t.style.borderColor = 'rgba(0,255,204,0.3)', t.style.color = '#00ffcc';
+    t.textContent = msg;
+    t.style.opacity = '1';
+    clearTimeout(t._to);
+    t._to = setTimeout(() => { t.style.opacity = '0'; }, 3000);
+}
+
+function updateCarControl(component, isOn) {
+    const comp = component.toLowerCase().replace(/\s+/g, '_');
+    const key  = comp === 'window' ? 'sunroof'
+               : (comp === 'camera' || comp === 'rearcamera' || comp === 'rear_camera') ? 'rear_camera'
+               : comp;
+    if (!(key in carState)) return;
+
+    // AC ↔ Heater conflict: they can't both be ON
+    if (isOn) {
+        if (key === 'ac' && carState.heater) {
+            updateCarControl('heater', false);
+            showToast('⚠ Heater turned off — AC activated', 'warn');
+        } else if (key === 'heater' && carState.ac) {
+            updateCarControl('ac', false);
+            showToast('⚠ AC turned off — Heater activated', 'warn');
+        }
+    }
+
+    carState[key] = isOn;
+    const labels  = CAR_CTRL_LABELS[key];
+    const stateEl = document.getElementById(`ctrl-${key}-state`);
+    const cardEl  = document.getElementById(`ctrl-${key}`);
+    if (!stateEl || !cardEl) return;
+    stateEl.textContent = isOn ? labels[1] : labels[0];
+    cardEl.classList.toggle('ctrl-active', isOn);
+    if (SVG_CTRL[key]) SVG_CTRL[key](isOn);
+}
+
+// ── Settings Drawer ────────────────────────────────────────────────────────────
+const FAMILY_VOICE_PROMPTS = [
+    "Set the cabin temperature to twenty-two degrees.",
+    "How much driving range is left in the battery?",
+    "Open the sunroof and play some relaxing music.",
+    "Play some jazz music and turn up the volume.",
+    "What's the traffic like on the highway ahead?"
+];
+let familyEnrollCount = 0;
+
+document.getElementById('settings-btn').addEventListener('click', openSettingsDrawer);
+document.getElementById('settings-close').addEventListener('click', closeSettingsDrawer);
+document.getElementById('settings-overlay').addEventListener('click', closeSettingsDrawer);
+
+function openSettingsDrawer() {
+    document.getElementById('settings-drawer').style.transform = 'translateX(0)';
+    document.getElementById('settings-overlay').classList.remove('hidden');
+    loadDriverList();
+    refreshKwsVersionList();
+}
+function closeSettingsDrawer() {
+    document.getElementById('settings-drawer').style.transform = 'translateX(100%)';
+    document.getElementById('settings-overlay').classList.add('hidden');
+}
+
+async function loadDriverList() {
+    const res = await fetch('/enroll/drivers').then(r => r.json()).catch(() => ({ drivers: [] }));
+    const drivers = res.drivers || [];
+    const list = document.getElementById('driver-list');
+    list.innerHTML = '';
+    drivers.forEach(did => {
+        const isOwner = did === 'driver1';
+        list.innerHTML += `
+            <div class="flex items-center justify-between border border-[#00ffcc]/20 rounded-lg px-3 py-2">
+                <div>
+                    <p class="text-[11px] font-bold text-[#00ffcc]">${isOwner ? 'OWNER' : 'FAMILY MEMBER'}</p>
+                    <p class="text-[9px] opacity-40">${did} · voice ✓</p>
+                </div>
+                ${isOwner ? '' : `<button onclick="removeDriver('${did}')"
+                    class="text-[9px] text-red-400 hover:text-red-300 border border-red-400/30
+                           rounded px-2 py-1 transition-all">REMOVE</button>`}
+            </div>`;
+    });
+    const addBtn = document.getElementById('add-family-btn');
+    if (drivers.length < 2) {
+        addBtn.classList.remove('hidden');
+    } else {
+        addBtn.classList.add('hidden');
+        document.getElementById('family-enroll-panel').classList.add('hidden');
+    }
+}
+
+async function removeDriver(driverId) {
+    if (!confirm(`Remove family member (${driverId})?`)) return;
+    await fetch(`/enroll/drivers/${driverId}`, { method: 'DELETE' });
+    loadDriverList();
+}
+
+document.getElementById('add-family-btn').addEventListener('click', () => {
+    const panel = document.getElementById('family-enroll-panel');
+    panel.classList.toggle('hidden');
+    if (!panel.classList.contains('hidden')) buildFamilyVoicePrompts();
+});
+
+function buildFamilyVoicePrompts() {
+    familyEnrollCount = 0;
+    const container = document.getElementById('family-voice-prompts');
+    container.innerHTML = '';
+    FAMILY_VOICE_PROMPTS.forEach((phrase, i) => {
+        container.innerHTML += `
+            <div class="flex items-center gap-2">
+                <button id="fvp-btn-${i}"
+                    class="border border-[#00ffcc]/50 rounded px-2 py-1 text-[10px] text-[#00ffcc]
+                           hover:bg-[#00ffcc]/10 transition-all w-8 flex-shrink-0">▶</button>
+                <span id="fvp-label-${i}" class="text-[9px] opacity-50 flex-1">${phrase}</span>
+                <span id="fvp-check-${i}" class="text-[#00ffcc] text-[10px]"></span>
+            </div>`;
+    });
+    FAMILY_VOICE_PROMPTS.forEach((phrase, i) => {
+        document.getElementById(`fvp-btn-${i}`).addEventListener('click', async () => {
+            const btn = document.getElementById(`fvp-btn-${i}`);
+            const chk = document.getElementById(`fvp-check-${i}`);
+            btn.disabled = true; btn.textContent = '●';
+            document.getElementById('family-voice-status').textContent = `Recording: "${phrase}"`;
+            const stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
+            const rec = new MediaRecorder(stream);
+            const chunks = [];
+            rec.ondataavailable = e => chunks.push(e.data);
+            rec.onstop = async () => {
+                stream.getTracks().forEach(t => t.stop());
+                const blob = new Blob(chunks, { type: 'audio/webm' });
+                const fd = new FormData();
+                fd.append('file', blob, `family_${i+1}.webm`);
+                fd.append('index', i + 1);
+                fd.append('total', FAMILY_VOICE_PROMPTS.length);
+                fd.append('driver_id', 'driver2');
+                const data = await (await fetch('/enroll/voice-sample', { method: 'POST', body: fd })).json();
+                btn.textContent = '✓'; chk.textContent = '✓';
+                familyEnrollCount++;
+                document.getElementById('family-voice-status').textContent = `Recorded ${familyEnrollCount}/${FAMILY_VOICE_PROMPTS.length}`;
+                if (data.status === 'enrolled') {
+                    setTimeout(() => {
+                        document.getElementById('family-enroll-panel').classList.add('hidden');
+                        loadDriverList();
+                    }, 500);
+                }
+            };
+            rec.start();
+            setTimeout(() => rec.stop(), 3500);
+        });
+    });
+}
+
+async function refreshKwsVersionList() {
+    const res = await fetch('/enroll/kws-models').then(r => r.json()).catch(() => ({ versions: [], active_version: null }));
+    const versions = res.versions || [];
+    const activeVersion = res.active_version;
+    const list = document.getElementById('kws-version-list');
+    list.innerHTML = '';
+    if (versions.length === 0) {
+        list.innerHTML = '<p class="text-[9px] opacity-40">No saved versions yet.</p>';
+        return;
+    }
+    versions.forEach((v) => {
+        const isActive = v === activeVersion;
+        const label = `${v.slice(0,4)}-${v.slice(4,6)}-${v.slice(6,8)} ${v.slice(9,11)}:${v.slice(11,13)}`;
+        list.innerHTML += `
+            <div class="flex items-center justify-between border border-[#00ffcc]/20 rounded-lg px-3 py-2">
+                <div>
+                    <p class="text-[10px] font-bold text-[#00ffcc]">${isActive ? '● ' : ''}${label}</p>
+                    <p class="text-[9px] opacity-40">${isActive ? 'active' : 'saved'}</p>
+                </div>
+                <div class="flex gap-1">
+                    ${!isActive ? `<button onclick="activateKwsVersion('${v}')"
+                        class="text-[9px] border border-[#00ffcc]/40 rounded px-2 py-1
+                               text-[#00ffcc] hover:bg-[#00ffcc]/10 transition-all">USE</button>` : ''}
+                    ${!isActive ? `<button onclick="deleteKwsVersion('${v}')"
+                        class="text-[9px] border border-red-400/30 rounded px-2 py-1
+                               text-red-400 hover:text-red-300 transition-all">✕</button>` : ''}
+                </div>
+            </div>`;
+    });
+}
+
+async function activateKwsVersion(version) {
+    await fetch(`/enroll/kws-activate/${version}`, { method: 'POST' });
+    document.getElementById('kws-version-list').innerHTML =
+        '<p class="text-[9px] opacity-40 animate-pulse">Activating…</p>';
+}
+
+async function deleteKwsVersion(version) {
+    if (!confirm(`Delete KWS version ${version}?`)) return;
+    await fetch(`/enroll/kws-models/${version}`, { method: 'DELETE' });
+    refreshKwsVersionList();
+}
+
+// ── Extra KWS Samples ─────────────────────────────────────────────────────────
+let kwsExtraCount = 0;
+const KWS_EXTRA_TARGET = 3;
+document.getElementById('add-kws-samples-btn').addEventListener('click', () => {
+    const panel = document.getElementById('kws-extra-panel');
+    panel.classList.toggle('hidden');
+    if (!panel.classList.contains('hidden')) buildKwsExtraBtns();
+});
+
+function buildKwsExtraBtns() {
+    kwsExtraCount = 0;
+    const container = document.getElementById('kws-extra-btns');
+    container.innerHTML = '';
+    for (let i = 0; i < KWS_EXTRA_TARGET; i++) {
+        container.innerHTML += `
+            <button id="kws-extra-${i}"
+                class="border border-[#00ffcc]/50 rounded px-3 py-1 text-[10px] text-[#00ffcc]
+                       hover:bg-[#00ffcc]/10 transition-all">▶ ${i+1}</button>`;
+    }
+    for (let i = 0; i < KWS_EXTRA_TARGET; i++) {
+        document.getElementById(`kws-extra-${i}`).addEventListener('click', async () => {
+            const btn = document.getElementById(`kws-extra-${i}`);
+            btn.disabled = true; btn.textContent = '●';
+            document.getElementById('kws-extra-status').textContent = 'Recording "Nova"…';
+            const stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
+            const rec = new MediaRecorder(stream);
+            const chunks = [];
+            rec.ondataavailable = e => chunks.push(e.data);
+            rec.onstop = async () => {
+                stream.getTracks().forEach(t => t.stop());
+                const blob = new Blob(chunks, { type: 'audio/webm' });
+                const fd = new FormData();
+                fd.append('file', blob, `nova_extra_${i+1}.webm`);
+                fd.append('sample_type', 'nova');
+                fd.append('index', `extra_${Date.now()}_${i}`);
+                await fetch('/enroll/upload', { method: 'POST', body: fd });
+                btn.textContent = '✓';
+                kwsExtraCount++;
+                document.getElementById('kws-extra-status').textContent = `Uploaded ${kwsExtraCount}/${KWS_EXTRA_TARGET}`;
+                if (kwsExtraCount >= KWS_EXTRA_TARGET) {
+                    document.getElementById('kws-extra-status').textContent = 'Retraining…';
+                    await fetch('/enroll/re-enroll', { method: 'POST' });
+                    document.getElementById('kws-extra-panel').classList.add('hidden');
+                    const poll = setInterval(async () => {
+                        const s = await (await fetch('/enroll/status')).json();
+                        if (s.state === 'done') { clearInterval(poll); refreshKwsVersionList(); }
+                    }, 1500);
+                }
+            };
+            rec.start();
+            setTimeout(() => rec.stop(), 2000);
+        });
+    }
+}
+
+// ── Enrollment (KWS + Face + PIN) ─────────────────────────────────────────────
+async function recordSample(type, limit, btn) {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
+    const rec    = new MediaRecorder(stream);
+    const chunks = [];
+    const progressBar = document.getElementById(`${type}-progress`);
+    const btnText     = document.getElementById(`${type}-btn-text`);
+    btnText.textContent = 'RECORDING…';
+    btn.disabled = true;
+    progressBar.style.transition = 'none';
+    progressBar.style.width = '0%';
+    void progressBar.offsetWidth;
+    progressBar.style.transition = 'width 2s linear';
+    progressBar.style.width = '100%';
+    rec.ondataavailable = (e) => chunks.push(e.data);
+    rec.onstop = async () => {
+        const fd = new FormData();
+        fd.append('file', new Blob(chunks, { type: 'audio/wav' }));
+        fd.append('sample_type', type);
+        const idx = type === 'nova' ? ++novaCount : ++noiseCount;
+        fd.append('index', idx);
+        document.getElementById('enroll-status').textContent = `Uploading ${type}_${idx}…`;
+        btnText.textContent = 'SAVING...';
+        await fetch('/enroll/upload', { method: 'POST', body: fd });
+        progressBar.style.transition = 'width 0.2s ease-out';
+        progressBar.style.width = '0%';
+        btnText.textContent = `RECORD ${type.toUpperCase()} (${idx}/${limit})`;
+        btn.disabled = false;
+        if (novaCount >= 5 && noiseCount >= 5) {
+            document.getElementById('enroll-status').textContent = 'Re-enrolling KWS…';
+            await fetch('/enroll/re-enroll', { method: 'POST' });
+            document.getElementById('enroll-status').textContent = 'Enrollment complete ✓';
+        } else {
+            document.getElementById('enroll-status').textContent =
+                `Saved ${type}_${idx}. (nova: ${novaCount}/5, noise: ${noiseCount}/5)`;
+        }
+        stream.getTracks().forEach(t => t.stop());
+    };
+    rec.start();
+    setTimeout(() => rec.stop(), 2000);
+}
+
+document.getElementById('record-nova-btn').onclick  = (e) => recordSample('nova',  5, e.currentTarget);
+document.getElementById('record-noise-btn').onclick = (e) => recordSample('noise', 5, e.currentTarget);
+
+document.getElementById('record-pin-btn').onclick = async (e) => {
+    const pin = prompt("Enter a 4-digit PIN:");
+    if (!pin || !/^\d{4}$/.test(pin)) { alert("Please enter exactly 4 digits."); return; }
+    const btn = e.currentTarget;
+    const btnText = document.getElementById('pin-btn-text');
+    btn.disabled = true;
+    btnText.textContent = 'SAVING…';
+    const fd = new FormData();
+    fd.append('pin', pin);
+    try {
+        const data = await (await fetch('/enroll/pin', { method: 'POST', body: fd })).json();
+        if (data.status === 'success') {
+            btnText.textContent = 'PIN SET ✓';
+            document.getElementById('enroll-status').textContent = 'PIN enrollment complete.';
+            btn.style.opacity = '0.5';
+        } else {
+            btnText.textContent = 'PIN FAILED';
+            document.getElementById('enroll-status').textContent = 'Failed: ' + data.error;
+            btn.disabled = false;
+        }
+    } catch (err) {
+        btnText.textContent = 'ERROR';
+        document.getElementById('enroll-status').textContent = 'Server connection error.';
+        btn.disabled = false;
+    }
+};
+
+document.getElementById('record-face-btn').onclick = async (e) => {
+    const btn = e.currentTarget;
+    const btnText = document.getElementById('face-btn-text');
+    btn.disabled = true;
+    btnText.textContent = 'CAPTURING…';
+    document.getElementById('enroll-status').textContent = 'Look directly at the webcam...';
+    try {
+        const data = await (await fetch('/enroll/face', { method: 'POST' })).json();
+        if (data.status === 'success') {
+            btnText.textContent = 'FACE ✓';
+            document.getElementById('enroll-status').textContent = 'Face ID enrollment complete.';
+            btn.style.opacity = '0.5';
+        } else {
+            btnText.textContent = 'FACE FAILED';
+            document.getElementById('enroll-status').textContent = 'Failed: ' + data.error;
+            btn.disabled = false;
+        }
+    } catch (err) {
+        btnText.textContent = 'ERROR';
+        document.getElementById('enroll-status').textContent = 'Server connection error.';
+        btn.disabled = false;
+    }
+};
+
+// ── Onboarding Modal ──────────────────────────────────────────────────────────
+const VOICE_PROMPTS = [
+    "The quick brown fox jumps over the lazy dog.",
+    "Nova, navigate me home and play some music.",
+    "What is the weather forecast for tomorrow?",
+    "Turn on the AC and set temperature to twenty-two degrees.",
+    "Order me a coffee from the nearest café.",
+];
+let obNovaCount = 0, obNoiseCount = 0, obVoiceCount = 0;
+
+function showObStep(step) {
+    ['kws','training','voice','done'].forEach(s =>
+        document.getElementById(`ob-step-${s}`).classList.add('hidden'));
+    document.getElementById(`ob-step-${step}`).classList.remove('hidden');
+    if (step === 'voice') buildVoicePrompts();
+}
+
+async function obRecordSample(type, limit, btn, textEl, progressEl, countRef, onComplete) {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
+    const rec = new MediaRecorder(stream);
+    const chunks = [];
+    textEl.textContent = 'RECORDING…';
+    btn.disabled = true;
+    progressEl.style.transition = 'none';
+    progressEl.style.width = '0%';
+    void progressEl.offsetWidth;
+    progressEl.style.transition = 'width 2s linear';
+    progressEl.style.width = '100%';
+    rec.ondataavailable = e => chunks.push(e.data);
+    rec.onstop = async () => {
+        const fd = new FormData();
+        fd.append('file', new Blob(chunks, { type: 'audio/wav' }));
+        fd.append('sample_type', type);
+        const idx = ++countRef.val;
+        fd.append('index', idx);
+        textEl.textContent = 'SAVING…';
+        await fetch('/enroll/upload', { method: 'POST', body: fd });
+        progressEl.style.transition = 'width 0.2s ease-out';
+        progressEl.style.width = '0%';
+        textEl.textContent = `RECORD ${type.toUpperCase()} (${idx}/${limit})`;
+        btn.disabled = false;
+        document.getElementById('ob-kws-status').textContent =
+            `Saved ${type}_${idx}. (nova: ${obNovaRef.val}/${limit}, noise: ${obNoiseRef.val}/${limit})`;
+        stream.getTracks().forEach(t => t.stop());
+        if (onComplete) onComplete(idx, limit);
+    };
+    rec.start();
+    setTimeout(() => rec.stop(), 2000);
+}
+
+const obNovaRef = { val: 0 }, obNoiseRef = { val: 0 };
+
+function checkObKWSComplete() {
+    if (obNovaRef.val >= 5 && obNoiseRef.val >= 5) {
+        showObStep('training');
+        document.getElementById('ob-kws-status').textContent = 'Training wake word model…';
+        fetch('/enroll/re-enroll', { method: 'POST' });
+        let prog = 0;
+        const bar = document.getElementById('ob-training-bar');
+        const msg = document.getElementById('ob-training-msg');
+        const poll = setInterval(async () => {
+            prog = Math.min(prog + 2, 95);
+            bar.style.width = prog + '%';
+            try {
+                const s = await (await fetch('/enroll/status')).json();
+                if (s.state === 'done') {
+                    clearInterval(poll);
+                    bar.style.width = '100%';
+                    msg.textContent = 'Wake word trained! Now enroll your voice fingerprint.';
+                    setTimeout(() => showObStep('voice'), 800);
+                } else if (s.message) { msg.textContent = s.message; }
+            } catch (_) {}
+        }, 1500);
+    }
+}
+
+document.getElementById('ob-nova-btn').addEventListener('click', e =>
+    obRecordSample('nova', 5, e.currentTarget,
+        document.getElementById('ob-nova-text'),
+        document.getElementById('ob-nova-progress'),
+        obNovaRef, checkObKWSComplete));
+
+document.getElementById('ob-noise-btn').addEventListener('click', e =>
+    obRecordSample('noise', 5, e.currentTarget,
+        document.getElementById('ob-noise-text'),
+        document.getElementById('ob-noise-progress'),
+        obNoiseRef, checkObKWSComplete));
+
+function buildVoicePrompts() {
+    const container = document.getElementById('ob-voice-prompts');
+    container.innerHTML = '';
+    VOICE_PROMPTS.forEach((phrase, i) => {
+        container.innerHTML += `
+            <div class="flex items-center gap-3">
+                <button type="button" id="ob-vp-btn-${i}"
+                    class="flex-shrink-0 border border-[#00ffcc]/40 text-[10px] px-3 py-1 rounded
+                           tracking-widest hover:bg-[#00ffcc]/20 transition-all">REC</button>
+                <span id="ob-vp-label-${i}" class="text-[9px] opacity-50 italic flex-1">"${phrase}"</span>
+                <span id="ob-vp-check-${i}" class="text-[10px]"></span>
+            </div>`;
+    });
+    VOICE_PROMPTS.forEach((phrase, i) => {
+        document.getElementById(`ob-vp-btn-${i}`).addEventListener('click', async () => {
+            const btn = document.getElementById(`ob-vp-btn-${i}`);
+            const lbl = document.getElementById(`ob-vp-label-${i}`);
+            const chk = document.getElementById(`ob-vp-check-${i}`);
+            btn.disabled = true; btn.textContent = '●';
+            lbl.classList.remove('opacity-50'); lbl.classList.add('text-[#00ffcc]');
+            const stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
+            const rec = new MediaRecorder(stream);
+            const chunks = [];
+            rec.ondataavailable = e => chunks.push(e.data);
+            rec.onstop = async () => {
+                btn.textContent = '…';
+                const fd = new FormData();
+                fd.append('file', new Blob(chunks, { type: 'audio/wav' }));
+                fd.append('index', i + 1);
+                fd.append('total', VOICE_PROMPTS.length);
+                const res = await fetch('/enroll/voice-sample', { method: 'POST', body: fd });
+                const data = await res.json();
+                stream.getTracks().forEach(t => t.stop());
+                btn.textContent = '✓'; chk.textContent = '✓';
+                lbl.classList.add('opacity-30');
+                document.getElementById('ob-voice-status').textContent = `Recorded ${i+1}/${VOICE_PROMPTS.length}`;
+                if (data.status === 'enrolled' || i+1 >= VOICE_PROMPTS.length)
+                    setTimeout(() => showObStep('done'), 400);
+            };
+            rec.start();
+            setTimeout(() => rec.stop(), 3500);
+        });
+    });
+}
+
+document.getElementById('ob-done-btn').addEventListener('click', () => {
+    document.getElementById('onboarding-modal').classList.add('hidden');
+    localStorage.setItem('nova_setup_done', '1');
+});
+
+async function checkEnrollmentAndInit() {
+    try {
+        const s = await (await fetch('/enroll/check')).json();
+        if (s.fully_enrolled) {
+            localStorage.setItem('nova_setup_done', '1');
+            document.getElementById('onboarding-modal').classList.add('hidden');
+        } else {
+            document.getElementById('onboarding-modal').classList.remove('hidden');
+            showObStep(s.kws_enrolled ? 'voice' : 'kws');
+        }
+    } catch {
+        if (!localStorage.getItem('nova_setup_done')) {
+            document.getElementById('onboarding-modal').classList.remove('hidden');
+            showObStep('kws');
+        }
+    }
+}
+checkEnrollmentAndInit();
+
+// ── Metrics Polling ────────────────────────────────────────────────────────────
+async function pollMetrics() {
+    try {
+        const d = await (await fetch('/metrics')).json();
+
+        document.getElementById('cpu-val').textContent     = `${d.cpu.toFixed(0)}%`;
+        document.getElementById('cpu-bar').style.width     = `${d.cpu}%`;
+        document.getElementById('gpu-mem-val').textContent = `${d.gpu_mem.toFixed(0)} MB`;
+        const vramTotal = d.gpu_mem_total || 4096;
+        document.getElementById('gpu-vram-label').textContent = `GPU VRAM (${(vramTotal/1024).toFixed(0)} GB)`;
+        document.getElementById('gpu-mem-bar').style.width = `${Math.min((d.gpu_mem/vramTotal)*100,100)}%`;
+        document.getElementById('gpu-util-val').textContent = `${d.gpu_util.toFixed(0)}%`;
+        document.getElementById('gpu-util-bar').style.width = `${d.gpu_util}%`;
+
+        // Optional HUD fields (guarded)
+        if (d.speed_kmh != null) document.getElementById('speed-readout').textContent = `${d.speed_kmh} km/h`;
+
+        if (d.components) {
+            const c = document.getElementById('component-container');
+            c.innerHTML = '';
+            for (const [k, v] of Object.entries(d.components)) {
+                const vramText = v.vram_mb > 0 ? `${v.vram_mb} MB` : 'N/A';
+                let extras = [];
+                if (v.wer)      extras.push(`WER ${v.wer}`);
+                if (v.accuracy) extras.push(`Acc ${v.accuracy}`, `F1 ${v.f1}`);
+                if (v.far)      extras.push(`FAR ${v.far}`, `FRR ${v.frr}`, `TRR ${v.trr}`);
+                const loadColor = v.load === 'GPU' ? 'color:var(--accent)' : 'opacity:0.45';
+                c.innerHTML += `
+                    <div class="comp-item">
+                        <div style="display:flex;justify-content:space-between">
+                            <span class="comp-name">${k.toUpperCase()} — ${v.name}</span>
+                            <span style="font-family:var(--ff-data);font-size:9px;${loadColor}">${v.load} · ${vramText}</span>
+                        </div>
+                        ${extras.length ? `<div class="comp-sub">${extras.join(' · ')}</div>` : ''}
+                    </div>`;
+            }
+        }
+    } catch (_) {}
+}
+setInterval(pollMetrics, 2000);
+</script>
+</body>
+</html>

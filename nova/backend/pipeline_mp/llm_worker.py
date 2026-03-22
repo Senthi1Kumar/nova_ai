@@ -95,6 +95,41 @@ TOOL_MAPPING = {
 }
 
 
+def clean_for_tts(text: str) -> str:
+    """Strip markdown, URLs, and non-speakable chars so TTS gets clean prose."""
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
+    text = text.replace("<think>", "").replace("</think>", "")
+    # Remove markdown links: [text](url) → text
+    text = re.sub(r'\[([^\]]*)\]\([^)]*\)', r'\1', text)
+    # Remove bare URLs
+    text = re.sub(r'https?://\S+', '', text)
+    # Remove markdown bold/italic markers
+    text = re.sub(r'\*{1,3}', '', text)
+    text = re.sub(r'_{1,3}', ' ', text)
+    # Remove markdown headers
+    text = re.sub(r'^#{1,6}\s*', '', text, flags=re.MULTILINE)
+    # Remove bullet points and numbered list markers
+    text = re.sub(r'^\s*[-*•]\s*', '', text, flags=re.MULTILINE)
+    text = re.sub(r'^\s*\d+[.)]\s*', '', text, flags=re.MULTILINE)
+    # Remove inline code backticks
+    text = re.sub(r'`+', '', text)
+    # Remove stray markdown/special chars that produce noise
+    text = re.sub(r'[/\\|<>{}[\]~^]', ' ', text)
+    # Collapse multiple spaces/newlines
+    text = re.sub(r'\s+', ' ', text)
+    # Abbreviation expansions
+    text = re.sub(r'\bAC\b', 'A C', text, flags=re.IGNORECASE)
+    text = re.sub(r'\bEV\b', 'E V', text)
+    text = re.sub(r'\bUI\b', 'U I', text)
+    text = re.sub(r'\bAPI\b', 'A P I', text)
+    text = re.sub(r'([a-zA-Z]),([a-zA-Z])', r'\1, \2', text)
+    text = text.strip()
+    # Skip fragments that are too short or have no real words (e.g. '/', ')')
+    if len(text) < 3 or not re.search(r'[a-zA-Z]{2,}', text):
+        return ""
+    return text
+
+
 def run_llm_worker(llm_in_queue: "mp.Queue[dict]", tts_in_queue: "mp.Queue[dict]", ws_out_queue: "mp.Queue[dict]", stop_event: "mp.Event", tts_interrupt_event: "mp.Event | None" = None) -> None:
     import setproctitle
     setproctitle.setproctitle("nova-llm-worker")
@@ -293,40 +328,6 @@ def run_llm_worker(llm_in_queue: "mp.Queue[dict]", tts_in_queue: "mp.Queue[dict]
         logger.error(f"Failed to init Dialogue Manager: {e}")
         dm = None
 
-    def clean_for_tts(text: str) -> str:
-        """Strip markdown, URLs, and non-speakable chars so TTS gets clean prose."""
-        text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
-        text = text.replace("<think>", "").replace("</think>", "")
-        # Remove markdown links: [text](url) → text
-        text = re.sub(r'\[([^\]]*)\]\([^)]*\)', r'\1', text)
-        # Remove bare URLs
-        text = re.sub(r'https?://\S+', '', text)
-        # Remove markdown bold/italic markers
-        text = re.sub(r'\*{1,3}', '', text)
-        text = re.sub(r'_{1,3}', ' ', text)
-        # Remove markdown headers
-        text = re.sub(r'^#{1,6}\s*', '', text, flags=re.MULTILINE)
-        # Remove bullet points and numbered list markers
-        text = re.sub(r'^\s*[-*•]\s*', '', text, flags=re.MULTILINE)
-        text = re.sub(r'^\s*\d+[.)]\s*', '', text, flags=re.MULTILINE)
-        # Remove inline code backticks
-        text = re.sub(r'`+', '', text)
-        # Remove stray markdown/special chars that produce noise
-        text = re.sub(r'[/\\|<>{}[\]~^]', ' ', text)
-        # Collapse multiple spaces/newlines
-        text = re.sub(r'\s+', ' ', text)
-        # Abbreviation expansions
-        text = re.sub(r'\bAC\b', 'A C', text, flags=re.IGNORECASE)
-        text = re.sub(r'\bEV\b', 'E V', text)
-        text = re.sub(r'\bUI\b', 'U I', text)
-        text = re.sub(r'\bAPI\b', 'A P I', text)
-        text = re.sub(r'([a-zA-Z]),([a-zA-Z])', r'\1, \2', text)
-        text = text.strip()
-        # Skip fragments that are too short or have no real words (e.g. '/', ')')
-        if len(text) < 3 or not re.search(r'[a-zA-Z]{2,}', text):
-            return ""
-        return text
-
     def _stream_and_speak(stream, start_time):
         """Stream LLM response tokens to UI and TTS.
 
@@ -423,13 +424,15 @@ def run_llm_worker(llm_in_queue: "mp.Queue[dict]", tts_in_queue: "mp.Queue[dict]
 
         # System prompt — omit web_search mention for local models (no tool support or limited)
         system_base = (
-            "You are Nova, an ultra-fast AI voice assistant built into an EV dashboard. "
-            "You are directly connected to the car's CAN bus. "
-            "If asked about vehicle status (battery, gas, tire pressure, speed), you MUST invent a realistic reading (e.g., 'Battery is at 82%'). "
-            "NEVER say you are an AI, a language model, or that you lack access. "
-            "Keep answers incredibly concise and direct — 2-3 sentences max. "
-            "IMPORTANT: Your output is read aloud by TTS. NEVER use markdown, bullet points, "
-            "numbered lists, URLs, links, or special formatting. Write plain conversational sentences only."
+            "Your name is Nova. You are a voice assistant embedded in an electric vehicle dashboard. "
+            "The user is the driver — never address the driver as 'Nova'. "
+            "Keep answers concise and direct, 2-3 sentences max. "
+            "Vehicle controls like lights, AC, and windows are handled by a separate system. "
+            "If the driver asks about vehicle status you do not have access to, say so honestly. "
+            "Do not make up sensor readings or vehicle data. "
+            "Your output is read aloud by TTS. Never use markdown, bullet points, "
+            "numbered lists, URLs, links, or special formatting. Write plain conversational sentences only. "
+            "Stay on topic. If a question is outside your knowledge, say you are not sure rather than guessing."
         )
         if use_cloud:
             system_base += (

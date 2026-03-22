@@ -25,7 +25,7 @@ from pipeline_mp import run_stt_worker, run_kws_worker, run_llm_worker, run_tts_
 # Monkeypatch torchaudio for speechbrain compatibility
 import torchaudio
 if not hasattr(torchaudio, "list_audio_backends"):
-    torchaudio.list_audio_backends = lambda: ["ffmpeg"] # Dummy backend to satisfy speechbrain
+    torchaudio.list_audio_backends = lambda: ["ffmpeg"] # type: ignore
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("Nova-Gateway")
@@ -108,9 +108,9 @@ def get_metrics():
     if nvml_handle:
         try:
             info = pynvml.nvmlDeviceGetMemoryInfo(nvml_handle)
-            gpu_mem_used = info.used / 1024 ** 2
-            gpu_mem_total_mb = info.total / 1024 ** 2
-            gpu_util = pynvml.nvmlDeviceGetUtilizationRates(nvml_handle).gpu
+            gpu_mem_used = float(info.used) / 1024 ** 2
+            gpu_mem_total_mb = float(info.total) / 1024 ** 2
+            gpu_util = float(pynvml.nvmlDeviceGetUtilizationRates(nvml_handle).gpu)
 
             # NVML compute processes (misses ONNX-RT which uses cudaMallocAsync)
             procs = pynvml.nvmlDeviceGetComputeRunningProcesses(nvml_handle)
@@ -359,7 +359,9 @@ async def ws_queue_reader():
                             total_dur = pipeline_state["_tts_total_samples"] / 24000.0
                             elapsed = now - pipeline_state["_tts_start_time"]
                             remaining_play = max(0.0, total_dur - elapsed)
-                        suppress_delay = remaining_play + 0.4  # +400ms safety margin for speaker reverb
+                        # Minimum 1.5s suppress: short DM responses ("Done. AC on.")
+                        # finish TTS fast but browser still plays buffered audio.
+                        suppress_delay = max(remaining_play + 0.4, 1.5)
                         pipeline_state["_tts_pending_samples"] = 0
                         pipeline_state["_tts_start_time"] = 0.0
                         pipeline_state["_tts_total_samples"] = 0
@@ -405,7 +407,9 @@ async def ws_queue_reader():
                         pipeline_state["stt_in_queue"].put({"type": "stop"})
 
                 if msg.get("type") == "audio_out":
-                    audio_bytes = msg.get("bytes")
+                    audio_bytes: bytes | None = msg.get("bytes")
+                    if audio_bytes is None:
+                        continue
                     audio_arr = np.frombuffer(audio_bytes, dtype=np.int16)
                     # Echo suppression: track total TTS duration and when it started.
                     # remaining_play = total_duration - elapsed_since_first_chunk (accurate even
@@ -603,8 +607,13 @@ app.mount("/static", StaticFiles(directory="nova/frontend"), name="static")
 
 @app.get("/")
 async def get_index():
-    with open("nova/frontend/index.html") as f:
+    with open("nova/frontend/nova-dashboard.html") as f:
         return HTMLResponse(content=f.read())
+
+@app.get("/config")
+async def get_config():
+    """Public frontend config — only expose keys that are safe to be client-side."""
+    return {"maps_api_key": os.getenv("MAPS_DEMO_KEY", "")}
 
 @app.post("/ui-event")
 async def handle_ui_event(req: Request):
@@ -673,7 +682,7 @@ async def tts_info():
     if nvml_handle:
         try:
             info = pynvml.nvmlDeviceGetMemoryInfo(nvml_handle)
-            gpu_total_mb = round(info.total / 1024 ** 2)
+            gpu_total_mb = round(float(info.total) / 1024 ** 2)
         except Exception:
             pass
 
@@ -715,7 +724,7 @@ async def llm_info():
     if nvml_handle:
         try:
             info = pynvml.nvmlDeviceGetMemoryInfo(nvml_handle)
-            gpu_total_mb = round(info.total / 1024 ** 2)
+            gpu_total_mb = round(float(info.total) / 1024 ** 2)
         except Exception:
             pass
 
@@ -746,7 +755,7 @@ async def stt_info():
     if nvml_handle:
         try:
             info = pynvml.nvmlDeviceGetMemoryInfo(nvml_handle)
-            gpu_total_mb = round(info.total / 1024 ** 2)
+            gpu_total_mb = round(float(info.total) / 1024 ** 2)
         except Exception:
             pass
 
