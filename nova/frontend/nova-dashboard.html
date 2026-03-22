@@ -12,8 +12,8 @@
             MAPS_API_KEY = cfg.maps_api_key || '';
             if (!MAPS_API_KEY) return;
             const s = document.createElement('script');
-            s.src = `https://maps.googleapis.com/maps/api/js?key=${MAPS_API_KEY}&callback=initMap`;
-            s.async = true; s.defer = true;
+            s.src = `https://maps.googleapis.com/maps/api/js?key=${MAPS_API_KEY}&libraries=marker&loading=async&callback=initMap`;
+            s.async = true;
             document.head.appendChild(s);
         });
     </script>
@@ -143,7 +143,7 @@
                    background: var(--bg-card2); border-right: 1px solid var(--border); padding: 16px 12px; }
         .map-col { flex: 1 1 0; min-width: 0; overflow: hidden; min-height: 0; border-radius: 14px 0 0 14px; }
         /* Shrink Google Maps type control (Map|Satellite) */
-        .map-col .gm-style-mtc button { font-size: 9px !important; padding: 2px 6px !important; line-height: 1.2 !important; }
+        .map-col .gm-style-mtc button { font-size: 8px !important; padding: 1px 5px !important; height: 20px !important; line-height: 18px !important; min-width: 0 !important; }
         .map-col .gm-style-mtc { margin: 4px 0 0 4px !important; }
         /* Bottom row: conversation fills remaining ~58% */
         .conv-card { flex: 1 1 0; min-height: 0; overflow: hidden; display: flex; flex-direction: column; }
@@ -265,7 +265,7 @@
         .config-card { flex: 1 1 0; min-height: 0; overflow-y: auto; padding: 0 13px 13px; }
         .selector-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 7px; }
         .sel-label { display: block; font-family: var(--ff-data); font-size: 8px; letter-spacing: 0.16em; color: var(--text-muted); margin-bottom: 3px; }
-        .nova-select { width: 100%; background: rgba(4,10,24,0.94); border: 1px solid var(--border); border-radius: 6px; color: var(--accent); font-family: var(--ff-data); font-size: 10px; padding: 5px 7px; outline: none; cursor: pointer; transition: border-color 0.18s; -webkit-appearance: none; }
+        .nova-select { width: 100%; background: rgba(4,10,24,0.94); border: 1px solid var(--border); border-radius: 6px; color: var(--accent); font-family: var(--ff-data); font-size: 10px; padding: 5px 7px; outline: none; cursor: pointer; transition: border-color 0.18s; -webkit-appearance: none; appearance: none; }
         .nova-select:focus { border-color: var(--border-active); }
         .nova-select option { background: #060c1a; color: var(--text-primary); }
         #vram-warning { font-family: var(--ff-data); font-size: 9px; color: var(--amber); margin-top: 6px; line-height: 1.4; }
@@ -851,18 +851,63 @@ function initMap() {
                 { featureType: 'poi', stylers: [{ visibility: 'off' }] },
             ]
         });
-        new google.maps.Marker({ position: center, map: gmap,
-            icon: { path: google.maps.SymbolPath.CIRCLE,
-                    scale: 7, fillColor: '#00ffcc', fillOpacity: 0.9,
-                    strokeColor: '#00ffcc', strokeWeight: 2 }
+        const pin = new google.maps.marker.PinElement({
+            background: '#00ffcc',
+            borderColor: '#009e80',
+            glyphColor: '#060c1a',
+            scale: 1.1
+        });
+        new google.maps.marker.AdvancedMarkerElement({
+            map: gmap, position: center, content: pin.element
         });
         fetchWeather(userLat, userLng);
-    }, () => {
-        // Geolocation denied — show placeholder
-        document.getElementById('map-container').style.cssText +=
-            ';display:flex;align-items:center;justify-content:center;color:var(--text-muted);font-size:11px;letter-spacing:.08em;';
-        document.getElementById('map-container').textContent = 'LOCATION ACCESS DENIED';
-    });
+    }, (err) => {
+        // err.code: 1=PERMISSION_DENIED, 2=POSITION_UNAVAILABLE, 3=TIMEOUT
+        // Fallback: IP-based geolocation (works on Linux where WiFi/cell unavailable)
+        console.warn('Geolocation failed (code ' + err.code + ': ' + err.message + '), trying IP fallback...');
+        _ipFallbackMap();
+    }, { timeout: 8000, maximumAge: 300000 });
+}
+
+function _ipFallbackMap() {
+    fetch('https://ipapi.co/json/')
+        .then(r => r.json())
+        .then(d => {
+            if (d.latitude && d.longitude) {
+                userLat = d.latitude; userLng = d.longitude;
+                const center = { lat: userLat, lng: userLng };
+                gmap = new google.maps.Map(document.getElementById('map-container'), {
+                    center, zoom: 14, mapId: 'DEMO_MAP_ID',
+                    disableDefaultUI: true,
+                    mapTypeControl: true,
+                    mapTypeControlOptions: {
+                        style: google.maps.MapTypeControlStyle.HORIZONTAL_BAR,
+                        position: google.maps.ControlPosition.TOP_LEFT,
+                        mapTypeIds: ['roadmap', 'satellite']
+                    },
+                    gestureHandling: 'greedy',
+                    styles: [
+                        { elementType: 'geometry', stylers: [{ color: '#060c1a' }] },
+                        { elementType: 'labels.text.fill', stylers: [{ color: '#4a8fa8' }] },
+                        { elementType: 'labels.text.stroke', stylers: [{ color: '#060c1a' }] },
+                        { featureType: 'road', elementType: 'geometry', stylers: [{ color: '#0d2035' }] },
+                        { featureType: 'road', elementType: 'geometry.stroke', stylers: [{ color: '#00ffcc22' }] },
+                        { featureType: 'water', elementType: 'geometry', stylers: [{ color: '#020b18' }] },
+                        { featureType: 'poi', stylers: [{ visibility: 'off' }] },
+                    ]
+                });
+                const pin = new google.maps.marker.PinElement({
+                    background: '#00ffcc', borderColor: '#009e80', glyphColor: '#060c1a', scale: 1.1
+                });
+                new google.maps.marker.AdvancedMarkerElement({ map: gmap, position: center, content: pin.element });
+                fetchWeather(userLat, userLng);
+            } else throw new Error('no coords');
+        })
+        .catch(() => {
+            const el = document.getElementById('map-container');
+            el.style.cssText += ';display:flex;align-items:center;justify-content:center;color:var(--text-muted);font-size:11px;letter-spacing:.08em;';
+            el.textContent = 'LOCATION UNAVAILABLE';
+        });
 }
 
 // ── Weather API ───────────────────────────────────────────────────────────────
