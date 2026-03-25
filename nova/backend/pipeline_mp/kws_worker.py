@@ -27,19 +27,29 @@ def run_kws_worker(
             time.sleep(1)
         return
 
-    from kws.kws_engine_v2 import StreamingKWSv2
-    from kws.kws_engine_v2 import GoogleEmbeddingModel
+    kws_engine_type = os.environ.get("NOVA_KWS_ENGINE", "v2")  # "v2" or "micro"
 
-    kws_model_path = os.path.join(
-        os.path.dirname(os.path.abspath(__file__)), "..", "kws", "google_speech_embedding.onnx"
-    )
-    kws_engine = StreamingKWSv2(model_path=None)  # type: ignore[arg-type]
-    kws_engine.model = GoogleEmbeddingModel(kws_model_path)
-    
-    if not kws_engine.load_model():
-        logger.warning("KWS MLP/Refs not found. Please enroll first.")
+    if kws_engine_type == "micro":
+        from kws.micro_kws import MicroKWS
+        kws_engine = MicroKWS()
+        if not kws_engine.load_model():
+            logger.warning("MicroKWS model not found. Place .tflite in kws/models/")
+        else:
+            logger.info("MicroKWS loaded successfully.")
     else:
-        logger.info("KWS Model loaded successfully.")
+        from kws.kws_engine_v2 import StreamingKWSv2
+        from kws.kws_engine_v2 import GoogleEmbeddingModel
+
+        kws_model_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "..", "kws", "google_speech_embedding.onnx"
+        )
+        kws_engine = StreamingKWSv2(model_path=None)  # type: ignore[arg-type]
+        kws_engine.model = GoogleEmbeddingModel(kws_model_path)
+
+        if not kws_engine.load_model():
+            logger.warning("KWS MLP/Refs not found. Please enroll first.")
+        else:
+            logger.info("KWS Model loaded successfully.")
 
     state = "IDLE"
 

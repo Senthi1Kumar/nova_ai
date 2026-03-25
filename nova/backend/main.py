@@ -15,7 +15,7 @@ import asyncpg
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File, Form, Request
 from fastrtc import AsyncStreamHandler, Stream, wait_for_item
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from pydub import AudioSegment
 from dotenv import load_dotenv
 
@@ -272,6 +272,12 @@ async def ws_queue_reader():
                 # Update gateway state based on worker events
                 if msg.get("type") == "kws_detected":
                     if pipeline_state["fsm_state"] == "GENERATING":
+                        # Only allow barge-in once TTS audio is actually playing.
+                        # Before that, there's nothing to interrupt — the LLM is still
+                        # generating tokens and the user hears silence anyway.
+                        if pipeline_state["_tts_start_time"] == 0.0:
+                            logger.debug("KWS barge-in ignored (TTS not yet playing)")
+                            continue
                         # Hard interrupt: stop TTS immediately, clear buffered audio
                         pipeline_state["tts_interrupt_event"].set()
                         pipeline_state["stt_in_queue"].put({"type": "tts_unmute"})
@@ -473,7 +479,7 @@ class NovaRTCHandler(AsyncStreamHandler):
 
     async def start_up(self):
         active_rtc_handlers.add(self)
-        kws_ok   = (KWS_MODELS_DIR / "mlp_weights.pth").exists()
+        kws_ok   = (KWS_MODELS_DIR / "mlp_weights.pth").exists() or (KWS_MODELS_DIR / "micro_nova.tflite").exists()
         voice_ok = (VOICEPRINT_DIR / "driver1.enc").exists()
         pipeline_state["ws_out_queue"].put({
             "type": "enrollment_check",
@@ -607,13 +613,13 @@ app.mount("/static", StaticFiles(directory="nova/frontend"), name="static")
 
 @app.get("/")
 async def get_index():
-    with open("nova/frontend/nova-dashboard.html") as f:
+    with open("nova/frontend/index.html") as f:
         return HTMLResponse(content=f.read())
 
-@app.get("/config")
-async def get_config():
-    """Public frontend config — only expose keys that are safe to be client-side."""
-    return {"maps_api_key": os.getenv("MAPS_DEMO_KEY", "")}
+# @app.get("/config")
+# async def get_config():
+#     """Public frontend config — only expose keys that are safe to be client-side."""
+#     return {"maps_api_key": os.getenv("MAPS_DEMO_KEY", "")}
 
 @app.post("/ui-event")
 async def handle_ui_event(req: Request):
@@ -643,6 +649,13 @@ async def handle_ui_event(req: Request):
     elif msg_type == "change_stt_variant":
         pipeline_state["current_stt_variant"] = data.get("data")
         pipeline_state["stt_in_queue"].put({"type": "change_stt_variant", "data": data.get("data")})
+    # elif msg_type == "user_location":  # Grounding Lite — disabled for now
+    #     loc = data.get("data") or {}
+    #     pipeline_state["llm_in_queue"].put({
+    #         "type": "user_location",
+    #         "lat": loc.get("lat"),
+    #         "lng": loc.get("lng"),
+    #     })
     return {"status": "ok"}
 
 @app.get("/metrics")
@@ -771,7 +784,7 @@ async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     active_websockets.add(websocket)
     # Immediately inform this client about enrollment state
-    kws_ok   = (KWS_MODELS_DIR / "mlp_weights.pth").exists()
+    kws_ok   = (KWS_MODELS_DIR / "mlp_weights.pth").exists() or (KWS_MODELS_DIR / "micro_nova.tflite").exists()
     voice_ok = (VOICEPRINT_DIR / "driver1.enc").exists()
     await websocket.send_text(json.dumps({
         "type": "enrollment_check",
@@ -784,9 +797,12 @@ async def websocket_endpoint(websocket: WebSocket):
             data = await websocket.receive()
             if "bytes" in data:
                 audio_bytes = data["bytes"]
-                
+
+                # Echo suppression: block mic audio while TTS is playing in browser
+                if time.time() < pipeline_state["tts_suppress_until"]:
+                    pass
                 # If we are IDLE, feed KWS
-                if pipeline_state["fsm_state"] == "IDLE":
+                elif pipeline_state["fsm_state"] == "IDLE":
                     if os.environ.get("NOVA_NO_KWS") == "1":
                         pass # MicTranscriber handles VAD locally; ignore websocket audio bytes
                     else:
@@ -826,6 +842,14 @@ async def websocket_endpoint(websocket: WebSocket):
                 elif msg["type"] == "change_llm":
                     pipeline_state["current_llm"] = msg["data"]
                     pipeline_state["llm_in_queue"].put({"type": "change_llm", "data": msg["data"]})
+
+                # elif msg["type"] == "user_location":  # Grounding Lite — disabled for now
+                #     loc = msg.get("data") or {}
+                #     pipeline_state["llm_in_queue"].put({
+                #         "type": "user_location",
+                #         "lat": loc.get("lat"),
+                #         "lng": loc.get("lng"),
+                #     })
 
     except (WebSocketDisconnect, RuntimeError) as e:
         logger.info(f"WebSocket closed: {e}")
@@ -937,6 +961,11 @@ async def _run_enrollment_task():
 
 @app.post("/enroll/re-enroll")
 async def trigger_re_enroll():
+    if os.environ.get("NOVA_KWS_ENGINE") == "micro":
+        return JSONResponse(
+            status_code=400,
+            content={"error": "MicroKWS models are trained offline. See kws/train_micro_nova.py."},
+        )
     global enrollment_status
     enrollment_status = {"state": "running", "message": "Starting KWS enrollment..."}
     asyncio.create_task(_run_enrollment_task())
@@ -1023,7 +1052,7 @@ async def enroll_voice_sample(
 @app.get("/enroll/check")
 async def enrollment_check():
     """Returns whether KWS and voice fingerprint for driver1 are enrolled."""
-    kws_ok   = (KWS_MODELS_DIR / "mlp_weights.pth").exists()
+    kws_ok   = (KWS_MODELS_DIR / "mlp_weights.pth").exists() or (KWS_MODELS_DIR / "micro_nova.tflite").exists()
     voice_ok = (VOICEPRINT_DIR / "driver1.enc").exists()
     return {"kws_enrolled": kws_ok, "voice_enrolled": voice_ok, "fully_enrolled": kws_ok and voice_ok}
 

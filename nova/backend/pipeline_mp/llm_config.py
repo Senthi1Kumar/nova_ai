@@ -34,6 +34,8 @@ class LocalLLMConfig(BaseModel):
     load_in_4bit: bool = True
     compute_dtype: str = "bfloat16"      # bfloat16 recommended for LFM2.5; float16 for older GPUs
     sampling: SamplingParams = Field(default_factory=SamplingParams)
+    # Per-model system prompt override (None = use the default shared prompt)
+    system_prompt: Optional[str] = None
 
 
 # ── Model registry ────────────────────────────────────────────────────────────
@@ -74,6 +76,12 @@ LOCAL_LLM_REGISTRY: dict[str, LocalLLMConfig] = {
             top_k=50,
             repetition_penalty=1.05,
             do_sample=True,
+        ),
+        system_prompt=(
+            "Assistant name: Nova. You help the driver of an electric vehicle. "
+            "Reply in 1-2 plain sentences. Address the driver as 'driver' or use no name. "
+            "Do not use the name Nova when talking to the driver. "
+            "Do not invent vehicle data. Use plain text only, no formatting."
         ),
     ),
 

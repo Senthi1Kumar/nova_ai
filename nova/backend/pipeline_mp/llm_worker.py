@@ -15,6 +15,9 @@ if not hasattr(torchaudio, "list_audio_backends"):
 logger = logging.getLogger("LLMWorker")
 
 
+# # Grounding Lite — disabled for now
+# _user_location = {"lat": None, "lng": None}
+
 # ── Tool definitions for OpenRouter function calling ─────────────────────────
 
 TOOLS = [
@@ -44,6 +47,31 @@ TOOLS = [
             },
         },
     },
+    # {  # Grounding Lite — disabled for now
+    #     "type": "function",
+    #     "function": {
+    #         "name": "lookup_weather",
+    #         "description": (
+    #             "Get current weather conditions for a location. Use for weather questions "
+    #             "like 'what is the weather', 'is it raining', 'temperature outside'. "
+    #             "Returns temperature, humidity, wind, precipitation, and conditions."
+    #         ),
+    #         "parameters": {
+    #             "type": "object",
+    #             "properties": {
+    #                 "latitude": {
+    #                     "type": "number",
+    #                     "description": "Latitude of the location (uses user's current location if omitted)",
+    #                 },
+    #                 "longitude": {
+    #                     "type": "number",
+    #                     "description": "Longitude of the location (uses user's current location if omitted)",
+    #                 },
+    #             },
+    #             "required": [],
+    #         },
+    #     },
+    # },
 ]
 
 # Models that support tool/function calling via OpenRouter
@@ -90,8 +118,51 @@ def _execute_web_search(query: str, max_results: int = 5) -> str:
         return json.dumps({"error": str(e), "query": query})
 
 
+# def _execute_lookup_weather(latitude: float = None, longitude: float = None) -> str:
+#     """Fetch current weather from Google Weather API."""  # Grounding Lite — disabled for now
+#     lat = latitude or _user_location["lat"]
+#     lng = longitude or _user_location["lng"]
+#     if not lat or not lng:
+#         return json.dumps({"error": "No location available. Ask user to enable location."})
+#
+#     api_key = os.getenv("MAPS_DEMO_KEY", "")
+#     if not api_key:
+#         return json.dumps({"error": "Weather API key not configured."})
+#
+#     try:
+#         import urllib.request
+#         import urllib.error
+#         url = (
+#             f"https://weather.googleapis.com/v1/currentConditions:lookup"
+#             f"?key={api_key}"
+#             f"&location.latitude={lat}"
+#             f"&location.longitude={lng}"
+#         )
+#         req = urllib.request.Request(url, headers={"Content-Type": "application/json"})
+#         with urllib.request.urlopen(req, timeout=5) as resp:
+#             data = json.loads(resp.read())
+#         temp = data.get("temperature", {}).get("degrees")
+#         feels = data.get("feelsLikeTemperature", {}).get("degrees")
+#         humidity = data.get("relativeHumidity")
+#         condition = data.get("weatherCondition", {}).get("description", {}).get("text", "Unknown")
+#         wind_speed = data.get("wind", {}).get("speed", {}).get("value")
+#         wind_dir = data.get("wind", {}).get("direction", {}).get("degrees")
+#         precip = data.get("precipitation", {}).get("probability", {}).get("percent", 0)
+#         uv = data.get("uvIndex")
+#         return json.dumps({
+#             "temperature_c": temp, "feels_like_c": feels, "humidity_percent": humidity,
+#             "condition": condition, "wind_speed_kmh": wind_speed,
+#             "wind_direction_deg": wind_dir, "precipitation_percent": precip,
+#             "uv_index": uv, "location": f"({lat}, {lng})",
+#         }, ensure_ascii=False)
+#     except Exception as e:
+#         logger.error(f"Weather lookup failed: {e}")
+#         return json.dumps({"error": str(e)})
+
+
 TOOL_MAPPING = {
     "web_search": _execute_web_search,
+    # "lookup_weather": _execute_lookup_weather,  # Grounding Lite — disabled for now
 }
 
 
@@ -149,6 +220,7 @@ def run_llm_worker(llm_in_queue: "mp.Queue[dict]", tts_in_queue: "mp.Queue[dict]
         openai_client = OpenAI(
             base_url="https://openrouter.ai/api/v1",
             api_key=api_key,
+            timeout=30.0,  # connection + read timeout (seconds)
         )
         logger.info("OpenRouter initialized in LLM worker.")
 
@@ -422,18 +494,21 @@ def run_llm_worker(llm_in_queue: "mp.Queue[dict]", tts_in_queue: "mp.Queue[dict]
         else:
             logger.warning(f"No LLM backend available for query: '{prompt[:50]}'")
 
-        # System prompt — omit web_search mention for local models (no tool support or limited)
-        system_base = (
-            "Your name is Nova. You are a voice assistant embedded in an electric vehicle dashboard. "
-            "The user is the driver — never address the driver as 'Nova'. "
-            "Keep answers concise and direct, 2-3 sentences max. "
-            "Vehicle controls like lights, AC, and windows are handled by a separate system. "
-            "If the driver asks about vehicle status you do not have access to, say so honestly. "
-            "Do not make up sensor readings or vehicle data. "
-            "Your output is read aloud by TTS. Never use markdown, bullet points, "
-            "numbered lists, URLs, links, or special formatting. Write plain conversational sentences only. "
-            "Stay on topic. If a question is outside your knowledge, say you are not sure rather than guessing."
-        )
+        # System prompt — use per-model prompt for local models, shared prompt for cloud
+        if use_local and local_cfg and local_cfg.system_prompt:
+            system_base = local_cfg.system_prompt
+        else:
+            system_base = (
+                "You are Nova, a voice assistant in an electric vehicle. "
+                "The driver is talking to you. Address the driver as 'driver' or simply reply without a name. "
+                "Only 'Nova' refers to you, the assistant. Never say your own name 'Nova' in your responses. "
+                "Keep answers to 1-2 sentences. "
+                "Vehicle controls like lights, AC, and windows are handled by a separate system — do not act on those. "
+                "If asked about vehicle data you lack, say so honestly. Do not invent sensor readings. "
+                "Output is read aloud by TTS: use plain conversational sentences only, "
+                "no markdown, bullets, numbered lists, URLs, or formatting. "
+                "If a question is outside your knowledge, say you are not sure."
+            )
         if use_cloud:
             system_base += (
                 " You have a web_search tool — use it for any question about current events, "
@@ -558,123 +633,122 @@ def run_llm_worker(llm_in_queue: "mp.Queue[dict]", tts_in_queue: "mp.Queue[dict]
                         text_prompt, return_tensors="pt", add_special_tokens=False
                     ).to("cuda")
 
-                    if use_local_tools:
-                        # Non-streaming first pass so we can inspect for tool calls
-                        import torch
-                        with torch.no_grad():
-                            output_ids = llm_model.generate(**inputs, **_gen_base)
-                        input_len = inputs["input_ids"].shape[1]
-                        generated = llm_tokenizer.decode(
-                            output_ids[0][input_len:], skip_special_tokens=False
-                        )
+                    # Streaming generation for ALL local models (tool-capable or not).
+                    # Tool calls are detected inline — if <|tool_call_start|> appears,
+                    # we switch to accumulation mode; otherwise tokens stream to TTS
+                    # immediately for low TTFT.
+                    streamer = TextIteratorStreamer(
+                        llm_tokenizer, skip_prompt=True, skip_special_tokens=False
+                    )
+                    gen_thread = threading.Thread(
+                        target=llm_model.generate,
+                        kwargs=dict(**inputs, streamer=streamer, **_gen_base),
+                    )
+                    gen_thread.start()
 
-                        if TC_START in generated and TC_END in generated:
-                            # ── Tool call round ──────────────────────────────
-                            tc_raw = generated[
-                                generated.index(TC_START) + len(TC_START):
-                                generated.index(TC_END)
-                            ].strip()
+                    ttft_llm = None
+                    is_thinking = False
+                    sentence_buffer = ""
+                    tokens_count = 0
+                    full_text = ""
+                    tool_call_detected = False
+                    _re_special = re.compile(r"<\|[^|]+\|>")
 
+                    for new_text in streamer:
+                        if stop_event.is_set():
+                            break
+                        full_text += new_text
+
+                        # Detect tool call start — switch to accumulation mode
+                        if use_local_tools and TC_START in full_text and not tool_call_detected:
+                            tool_call_detected = True
                             ws_out_queue.put({
                                 "type": "llm_token",
                                 "data": "[searching...] ",
                                 "latency": {"llm_ttft": time.time() - start_time},
                             })
+                        if tool_call_detected:
+                            continue  # accumulate silently until generation ends
 
-                            # Parse Pythonic list: [func(arg="val"), ...]
-                            tool_results = []
-                            try:
-                                tree = ast.parse(tc_raw, mode="eval")
-                                calls = (
-                                    tree.body.elts
-                                    if isinstance(tree.body, ast.List)
-                                    else [tree.body]
+                        # Strip special tokens for display/TTS
+                        clean_text = _re_special.sub("", new_text)
+                        if not clean_text:
+                            continue
+
+                        tokens_count += 1
+                        if ttft_llm is None:
+                            ttft_llm = time.time() - start_time
+
+                        elapsed = time.time() - (start_time + (ttft_llm or 0))
+                        latency_data = {"llm_ttft": ttft_llm}
+                        if elapsed > 0:
+                            latency_data["llm_throughput"] = tokens_count / elapsed
+
+                        ws_out_queue.put({"type": "llm_token", "data": clean_text, "latency": latency_data})
+
+                        if "<think>" in clean_text:
+                            is_thinking = True
+                        if not is_thinking:
+                            sentence_buffer += clean_text
+                            if any(p in clean_text for p in [".", "!", "?", "\n", ","]):
+                                clean = clean_for_tts(sentence_buffer)
+                                if clean:
+                                    tts_in_queue.put({"type": "text_to_speak", "text": clean})
+                                sentence_buffer = ""
+                        if "</think>" in clean_text:
+                            is_thinking = False
+                            sentence_buffer = ""
+
+                    gen_thread.join()
+
+                    if tool_call_detected and TC_END in full_text:
+                        # ── Tool call round — parse & execute ─────────────
+                        tc_raw = full_text[
+                            full_text.index(TC_START) + len(TC_START):
+                            full_text.index(TC_END)
+                        ].strip()
+
+                        tool_results = []
+                        try:
+                            tree = ast.parse(tc_raw, mode="eval")
+                            calls = (
+                                tree.body.elts
+                                if isinstance(tree.body, ast.List)
+                                else [tree.body]
+                            )
+                            for call in calls:
+                                fn_name = call.func.id  # type: ignore[attr-defined]
+                                fn_args = {
+                                    kw.arg: ast.literal_eval(kw.value)
+                                    for kw in call.keywords
+                                }
+                                logger.info(f"Local tool call: {fn_name}({fn_args})")
+                                result = (
+                                    TOOL_MAPPING[fn_name](**fn_args)
+                                    if fn_name in TOOL_MAPPING
+                                    else json.dumps({"error": f"Unknown tool: {fn_name}"})
                                 )
-                                for call in calls:
-                                    fn_name = call.func.id  # type: ignore[attr-defined]
-                                    fn_args = {
-                                        kw.arg: ast.literal_eval(kw.value)
-                                        for kw in call.keywords
-                                    }
-                                    logger.info(f"Local tool call: {fn_name}({fn_args})")
-                                    result = (
-                                        TOOL_MAPPING[fn_name](**fn_args)
-                                        if fn_name in TOOL_MAPPING
-                                        else json.dumps({"error": f"Unknown tool: {fn_name}"})
-                                    )
-                                    tool_results.append(result)
-                            except Exception as parse_err:
-                                logger.warning(f"Tool call parse error '{tc_raw}': {parse_err}")
-                                tool_results.append(json.dumps({"error": "parse failure"}))
+                                tool_results.append(result)
+                        except Exception as parse_err:
+                            logger.warning(f"Tool call parse error '{tc_raw}': {parse_err}")
+                            tool_results.append(json.dumps({"error": "parse failure"}))
 
-                            messages.append({"role": "assistant", "content": generated})
-                            messages.append({"role": "tool", "content": "\n".join(tool_results)})
-                            continue  # re-generate with tool result in context
+                        messages.append({"role": "assistant", "content": full_text})
+                        messages.append({"role": "tool", "content": "\n".join(tool_results)})
+                        continue  # re-generate with tool result in context
 
-                        # No tool call — strip special tokens and stream as text
-                        clean_generated = re.sub(r"<\|[^|]+\|>", "", generated).strip()
-                        ttft_llm = time.time() - start_time
-                        ws_out_queue.put({
-                            "type": "llm_token",
-                            "data": clean_generated,
-                            "latency": {"llm_ttft": ttft_llm},
-                        })
-                        clean = clean_for_tts(clean_generated)
+                    # Normal response — flush any remaining buffer
+                    if sentence_buffer and not stop_event.is_set():
+                        clean = clean_for_tts(sentence_buffer)
                         if clean:
                             tts_in_queue.put({"type": "text_to_speak", "text": clean})
-                        break
-
-                    else:
-                        # No tool support — pure streaming
-                        streamer = TextIteratorStreamer(
-                            llm_tokenizer, skip_prompt=True, skip_special_tokens=True
-                        )
-                        gen_thread = threading.Thread(
-                            target=llm_model.generate,
-                            kwargs=dict(**inputs, streamer=streamer, **_gen_base),
-                        )
-                        gen_thread.start()
-
-                        ttft_llm = None
-                        is_thinking = False
-                        sentence_buffer = ""
-                        tokens_count = 0
-
-                        for new_text in streamer:
-                            if stop_event.is_set():
-                                break
-                            tokens_count += 1
-                            if ttft_llm is None:
-                                ttft_llm = time.time() - start_time
-
-                            elapsed = time.time() - (start_time + ttft_llm)
-                            latency_data = {"llm_ttft": ttft_llm}
-                            if elapsed > 0:
-                                latency_data["llm_throughput"] = tokens_count / elapsed
-
-                            ws_out_queue.put({"type": "llm_token", "data": new_text, "latency": latency_data})
-
-                            if "<think>" in new_text:
-                                is_thinking = True
-                            if not is_thinking:
-                                sentence_buffer += new_text
-                                if any(p in new_text for p in [".", "!", "?", "\n", ","]):
-                                    clean = clean_for_tts(sentence_buffer)
-                                    if clean:
-                                        tts_in_queue.put({"type": "text_to_speak", "text": clean})
-                                    sentence_buffer = ""
-                            if "</think>" in new_text:
-                                is_thinking = False
-                                sentence_buffer = ""
-
-                        if sentence_buffer and not stop_event.is_set():
-                            clean = clean_for_tts(sentence_buffer)
-                            if clean:
-                                tts_in_queue.put({"type": "text_to_speak", "text": clean})
-                        break
+                    break
 
         except Exception as e:
             logger.error(f"LLM generation error: {e}")
+            # Notify UI so the FSM can exit GENERATING state
+            ws_out_queue.put({"type": "llm_error", "data": str(e)})
+            tts_in_queue.put({"type": "text_to_speak", "text": "Sorry, I couldn't get a response. Please try again."})
 
         # EOF signal to TTS
         logger.info("LLM generation complete → sending eof to TTS queue")
@@ -691,6 +765,10 @@ def run_llm_worker(llm_in_queue: "mp.Queue[dict]", tts_in_queue: "mp.Queue[dict]
                     tts_in_queue.put({"type": "eof"})
             else:
                 logger.info("DM speaking_done: no queued response")
+
+    # # User GPS location — Grounding Lite, disabled for now
+    # user_lat = None
+    # user_lng = None
 
     while not stop_event.is_set():
         try:
@@ -726,6 +804,17 @@ def run_llm_worker(llm_in_queue: "mp.Queue[dict]", tts_in_queue: "mp.Queue[dict]
                 current_llm_name = new_name
             logger.info(f"LLM switched → mode={llm_mode}, name={current_llm_name}")
             continue
+
+        # if msg.get("type") == "user_location":  # Grounding Lite — disabled for now
+        #     user_lat = msg.get("lat")
+        #     user_lng = msg.get("lng")
+        #     _user_location["lat"] = user_lat
+        #     _user_location["lng"] = user_lng
+        #     if dm:
+        #         dm.user_lat = user_lat
+        #         dm.user_lng = user_lng
+        #     logger.debug(f"User location updated: ({user_lat}, {user_lng})")
+        #     continue
 
         if msg.get("type") == "text":
             transcript = msg.get("text")
@@ -767,12 +856,48 @@ def run_llm_worker(llm_in_queue: "mp.Queue[dict]", tts_in_queue: "mp.Queue[dict]
                         "intent": dm_response.get("intent"),
                         "routing": dm_response.get("routing"),
                         "entities": dm_response.get("entities"),
+                        "action": dm_response.get("action"),
                         "otp": dm_response.get("otp"),
                         "driver_name": dm_response.get("driver_name"),
                         "session_warning": dm_response.get("session_warning"),
                         "nova_says": dm_response.get("nova_says"),
                     }
                 })
+
+                # Send map_update for actions that need map rendering
+                dm_action = dm_response.get("action")
+                dm_entities = dm_response.get("entities") or {}
+                if dm_action == "show_merchant_on_map" and dm_entities.get("lat"):
+                    merchants = dm_entities.get("merchants") or []
+                    # Single merchant — wrap as list for frontend
+                    if not merchants and dm_entities.get("merchant_name"):
+                        merchants = [{
+                            "name": dm_entities["merchant_name"],
+                            "lat": dm_entities["lat"],
+                            "lng": dm_entities["lng"],
+                            "address": dm_entities.get("address", ""),
+                            "rating": dm_entities.get("rating"),
+                            "is_open": dm_entities.get("is_open"),
+                            "distance": dm_entities.get("distance"),
+                            "eta_drive": dm_entities.get("eta_drive"),
+                        }]
+                    if merchants:
+                        ws_out_queue.put({
+                            "type": "map_update",
+                            "data": {
+                                "action": "show_merchants",
+                                "merchants": merchants,
+                            }
+                        })
+                elif dm_action == "maps_api_call" and dm_entities.get("route"):
+                    ws_out_queue.put({
+                        "type": "map_update",
+                        "data": {
+                            "action": "show_route",
+                            "destination": dm_entities.get("destination", ""),
+                            "route": dm_entities["route"],
+                        }
+                    })
 
                 if dm_response.get("intent") == "emergency":
                     logger.info(f"DM routed as EMERGENCY → TTS: '{dm_response['nova_says'][:60]}'")

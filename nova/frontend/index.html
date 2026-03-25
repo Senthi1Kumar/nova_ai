@@ -511,29 +511,36 @@
 
     async function setupWebSocket() {
         try {
-            // Mic for visualizer only (STT uses sounddevice on server)
+            // Mic capture: native sample rate → AudioWorklet resamples to 16kHz
+            // noiseSuppression OFF: browser NS is trained on Western English and
+            //   clips Indian English phonemes (retroflex consonants, aspirated stops).
+            // autoGainControl OFF: AGC causes volume pumping that confuses VAD.
+            // echoCancellation ON: needed to prevent TTS echo feedback.
             try {
                 localStream = await navigator.mediaDevices.getUserMedia({
-                    audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }
+                    audio: { echoCancellation: true, noiseSuppression: false, autoGainControl: false }
                 });
-                audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
+                // Capture at native rate (typically 48kHz) — resampling happens in the worklet
+                audioContext = new (window.AudioContext || window.webkitAudioContext)();
                 input = audioContext.createMediaStreamSource(localStream);
+
+                // Visualizer uses AnalyserNode at native rate (fine, no quality impact)
                 analyser = audioContext.createAnalyser();
                 input.connect(analyser);
 
-                // Stream 16kHz PCM to server via WebSocket for STT
-                const pcmProcessor = audioContext.createScriptProcessor(4096, 1, 1);
-                pcmProcessor.onaudioprocess = (e) => {
-                    if (!ws || ws.readyState !== WebSocket.OPEN) return;
-                    const float32 = e.inputBuffer.getChannelData(0);
-                    const int16 = new Int16Array(float32.length);
-                    for (let i = 0; i < float32.length; i++) {
-                        int16[i] = Math.max(-32768, Math.min(32767, float32[i] * 32768));
+                // AudioWorklet: runs on dedicated audio thread (no main-thread glitches).
+                // Downsamples native→16kHz with a 127-tap windowed-sinc FIR low-pass filter
+                // to avoid aliasing artifacts from naive browser downsampling.
+                await audioContext.audioWorklet.addModule('/static/pcm-worklet.js');
+                const pcmWorklet = new AudioWorkletNode(audioContext, 'pcm-worklet-processor', {
+                    processorOptions: { nativeSampleRate: audioContext.sampleRate }
+                });
+                pcmWorklet.port.onmessage = (e) => {
+                    if (ws && ws.readyState === WebSocket.OPEN) {
+                        ws.send(e.data);
                     }
-                    ws.send(int16.buffer);
                 };
-                input.connect(pcmProcessor);
-                pcmProcessor.connect(audioContext.destination);
+                input.connect(pcmWorklet);
 
                 drawVisualizer();
             } catch (micErr) {
@@ -1433,7 +1440,7 @@
             }
         } catch (_) {}
     }
-    setInterval(pollMetrics, 2000);
+    setInterval(pollMetrics, 5000);
     </script>
 </body>
 </html>

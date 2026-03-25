@@ -20,6 +20,9 @@ class STTVariantConfig(BaseModel):
     vram_mb: int            # approximate GPU memory when loaded
     rtf_target: float       # typical real-time factor (lower = faster)
     language: str = "en"
+    vad_threshold: float = 0.3  # VAD sensitivity [0..1]. Lower = more sensitive
+                                # (catches softer speech / accented pauses).
+                                # Default 0.3 works better for Indian English than 0.5.
 
 
 STT_VARIANT_REGISTRY: dict[str, STTVariantConfig] = {

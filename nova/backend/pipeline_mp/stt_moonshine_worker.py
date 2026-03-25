@@ -93,7 +93,7 @@ def run_stt_worker(
                 model_arch=model_arch,
                 options={"return_audio_data": "1"},
             )
-            new_mic_stream = new_transcriber.create_stream(0.5)
+            new_mic_stream = new_transcriber.create_stream(cfg.vad_threshold)
             _transcriber_state["transcriber"] = new_transcriber
             _transcriber_state["mic_stream"]  = new_mic_stream
             _transcriber_state["variant"]     = variant_key
@@ -125,6 +125,36 @@ def run_stt_worker(
         logger.error("STT: initial model load failed — worker exiting.")
         return
 
+    # ── Audio preprocessing ──────────────────────────────────────────────────
+    # Pre-emphasis boosts high-frequency energy (consonants, fricatives) that
+    # are critical for speech recognition but often attenuated by cheap mics
+    # and in-car noise environments.  Coefficient 0.97 is the standard choice.
+    _preemph_coeff = 0.97
+    _preemph_prev = np.float32(0.0)   # carry-over sample across chunks
+    # RMS normalization target: -22 dBFS ≈ 0.08 RMS.  Ensures consistent
+    # input level regardless of mic gain or user distance from mic.
+    _rms_target = 0.08
+    _rms_floor  = 1e-6   # avoid divide-by-zero on silence
+
+    def preprocess_audio(pcm_f32: np.ndarray) -> np.ndarray:
+        """Pre-emphasis filter + RMS normalization on a float32 PCM chunk."""
+        nonlocal _preemph_prev
+        # Pre-emphasis: y[n] = x[n] - coeff * x[n-1]
+        out = np.empty_like(pcm_f32)
+        if len(pcm_f32) == 0:
+            return pcm_f32
+        out[0] = pcm_f32[0] - _preemph_coeff * _preemph_prev
+        out[1:] = pcm_f32[1:] - _preemph_coeff * pcm_f32[:-1]
+        _preemph_prev = pcm_f32[-1]
+
+        # RMS normalization — scale chunk so its RMS matches the target level.
+        rms = np.sqrt(np.mean(out ** 2))
+        if rms > _rms_floor:
+            out = out * (_rms_target / rms)
+            # Soft-clip to [-1, 1] to avoid digital clipping after gain
+            np.clip(out, -1.0, 1.0, out=out)
+        return out
+
     # ── Session state ─────────────────────────────────────────────────────────
     state = {
         "session_active": False,
@@ -138,6 +168,9 @@ def run_stt_worker(
     }
 
     PTT_DRAIN_TIMEOUT = 3.0
+    # Safety timeout: if KWS triggers but no speech is ever detected,
+    # end the session after this many seconds to avoid hanging in LISTENING.
+    NO_SPEECH_TIMEOUT = 8.0
 
     def _ensure_stream_started():
         if not state["stream_started"]:
@@ -234,6 +267,16 @@ def run_stt_worker(
                 logger.warning("PTT drain timeout — forcing session end.")
                 _end_session()
                 ws_out_queue.put({"type": "recording_stopped"})
+            elif (
+                state["session_active"]
+                and not state["is_ptt"]
+                and not state["ptt_stopping"]
+                and state["session_start_time"] > 0
+                and (time.time() - state["session_start_time"]) > NO_SPEECH_TIMEOUT
+            ):
+                logger.warning("No speech detected within timeout — ending session.")
+                _end_session()
+                ws_out_queue.put({"type": "recording_stopped"})
             continue
 
         if isinstance(msg, bytes):
@@ -241,6 +284,7 @@ def run_stt_worker(
                 mic_stream = _transcriber_state["mic_stream"]
                 if mic_stream is not None:
                     audio = np.frombuffer(msg, dtype=np.int16).astype(np.float32) / 32768.0
+                    audio = preprocess_audio(audio)
                     try:
                         mic_stream.add_audio(audio, 16000)
                     except Exception as e:
