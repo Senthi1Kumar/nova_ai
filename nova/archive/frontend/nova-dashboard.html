@@ -12,7 +12,7 @@
             MAPS_API_KEY = cfg.maps_api_key || '';
             if (!MAPS_API_KEY) return;
             const s = document.createElement('script');
-            s.src = `https://maps.googleapis.com/maps/api/js?key=${MAPS_API_KEY}&libraries=marker&loading=async&callback=initMap`;
+            s.src = `https://maps.googleapis.com/maps/api/js?key=${MAPS_API_KEY}&libraries=marker,geometry&loading=async&callback=initMap`;
             s.async = true;
             document.head.appendChild(s);
         });
@@ -71,6 +71,7 @@
             background: rgba(4,8,18,0.90);
             border-bottom: 1px solid var(--border);
             backdrop-filter: blur(8px);
+            position: relative; z-index: 1000;
         }
         .logo-group { display: flex; align-items: center; gap: 10px; }
         .logo-diamond { font-size: 22px; color: var(--accent); text-shadow: 0 0 16px var(--accent-glow); line-height: 1; user-select: none; }
@@ -80,6 +81,40 @@
         .speed-value { font-family: var(--ff-data); font-size: 17px; font-weight: 500; color: var(--text-primary); letter-spacing: 0.04em; }
         .hud-divider { color: var(--text-muted); font-size: 13px; }
         .clock-value { font-family: var(--ff-data); font-size: 14px; color: var(--text-muted); letter-spacing: 0.08em; }
+        /* Weather popup */
+        .weather-popup {
+            position: absolute; top: 100%; left: 50%; transform: translateX(-50%);
+            margin-top: 8px; width: 320px; z-index: 10000;
+            background: rgba(8,14,28,0.96); border: 1px solid rgba(0,255,204,0.2);
+            border-radius: 10px; padding: 12px 14px;
+            box-shadow: 0 8px 32px rgba(0,0,0,0.6), 0 0 16px rgba(0,255,204,0.06);
+            backdrop-filter: blur(12px);
+            font-family: var(--ff-data); color: var(--text-primary);
+        }
+        .weather-popup.hidden { display: none; }
+        .weather-popup::before {
+            content: ''; position: absolute; top: -6px; left: 50%; transform: translateX(-50%) rotate(45deg);
+            width: 10px; height: 10px; background: rgba(8,14,28,0.96);
+            border-top: 1px solid rgba(0,255,204,0.2); border-left: 1px solid rgba(0,255,204,0.2);
+        }
+        .wp-now { display: grid; grid-template-columns: auto 1fr; gap: 8px 12px; align-items: center; padding-bottom: 10px; border-bottom: 1px solid rgba(0,255,204,0.1); margin-bottom: 8px; }
+        .wp-now-icon { font-size: 28px; grid-row: span 2; }
+        .wp-now-temp { font-size: 18px; font-weight: 600; color: var(--accent); letter-spacing: 0.04em; }
+        .wp-now-desc { font-size: 10px; color: var(--text-muted); letter-spacing: 0.08em; }
+        .wp-details { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 6px; padding-bottom: 10px; border-bottom: 1px solid rgba(0,255,204,0.1); margin-bottom: 8px; }
+        .wp-detail { text-align: center; }
+        .wp-detail-val { font-size: 12px; font-weight: 600; color: var(--text-primary); }
+        .wp-detail-lbl { font-size: 8px; color: var(--text-muted); letter-spacing: 0.1em; margin-top: 1px; }
+        .wp-hours { display: flex; flex-direction: column; gap: 4px; }
+        .wp-hour { display: grid; grid-template-columns: 42px 22px 1fr 58px 58px; align-items: center; gap: 4px; font-size: 10px; padding: 3px 0; border-bottom: 1px solid rgba(0,255,204,0.04); }
+        .wp-hour:last-child { border-bottom: none; }
+        .wp-hour-time { color: var(--text-muted); letter-spacing: 0.06em; }
+        .wp-hour-icon { font-size: 13px; text-align: center; }
+        .wp-hour-temp { font-weight: 600; color: var(--accent); }
+        .wp-hour-rain { color: rgba(100,180,255,0.8); text-align: right; }
+        .wp-hour-wind { color: var(--text-muted); text-align: right; }
+        .wp-title { font-size: 8px; letter-spacing: 0.14em; color: var(--text-muted); margin-bottom: 6px; }
+
         .conn-group { display: flex; align-items: center; gap: 6px; }
         .conn-dot { width: 7px; height: 7px; border-radius: 50%; background: #ef4444; box-shadow: 0 0 6px #ef4444; transition: all 0.4s; }
         .conn-dot.online { background: var(--accent); box-shadow: 0 0 8px var(--accent-glow); }
@@ -313,8 +348,12 @@
         <span class="hud-divider">|</span>
         <span id="clock-readout" class="clock-value">--:--</span>
         <span class="hud-divider">|</span>
-        <span id="weather-icon" style="font-size:15px;line-height:1">—</span>
-        <span id="weather-temp" class="clock-value">--°C</span>
+        <span id="weather-btn" style="cursor:pointer;display:inline-flex;align-items:center;gap:4px;position:relative;" title="Click for 6-hour forecast">
+            <span id="weather-icon" style="font-size:15px;line-height:1">—</span>
+            <span id="weather-temp" class="clock-value">--°C</span>
+        </span>
+        <!-- Weather forecast popup -->
+        <div id="weather-popup" class="weather-popup hidden"></div>
     </div>
 
     <div class="conn-group">
@@ -840,16 +879,7 @@ function initMap() {
                 position: google.maps.ControlPosition.TOP_LEFT,
                 mapTypeIds: ['roadmap', 'satellite']
             },
-            gestureHandling: 'greedy',
-            styles: [
-                { elementType: 'geometry',        stylers: [{ color: '#060c1a' }] },
-                { elementType: 'labels.text.fill', stylers: [{ color: '#4a8fa8' }] },
-                { elementType: 'labels.text.stroke', stylers: [{ color: '#060c1a' }] },
-                { featureType: 'road', elementType: 'geometry', stylers: [{ color: '#0d2035' }] },
-                { featureType: 'road', elementType: 'geometry.stroke', stylers: [{ color: '#00ffcc22' }] },
-                { featureType: 'water', elementType: 'geometry', stylers: [{ color: '#020b18' }] },
-                { featureType: 'poi', stylers: [{ visibility: 'off' }] },
-            ]
+            gestureHandling: 'greedy'
         });
         const pin = new google.maps.marker.PinElement({
             background: '#00ffcc',
@@ -858,7 +888,7 @@ function initMap() {
             scale: 1.1
         });
         new google.maps.marker.AdvancedMarkerElement({
-            map: gmap, position: center, content: pin.element
+            map: gmap, position: center, content: pin
         });
         fetchWeather(userLat, userLng);
     }, (err) => {
@@ -885,21 +915,12 @@ function _ipFallbackMap() {
                         position: google.maps.ControlPosition.TOP_LEFT,
                         mapTypeIds: ['roadmap', 'satellite']
                     },
-                    gestureHandling: 'greedy',
-                    styles: [
-                        { elementType: 'geometry', stylers: [{ color: '#060c1a' }] },
-                        { elementType: 'labels.text.fill', stylers: [{ color: '#4a8fa8' }] },
-                        { elementType: 'labels.text.stroke', stylers: [{ color: '#060c1a' }] },
-                        { featureType: 'road', elementType: 'geometry', stylers: [{ color: '#0d2035' }] },
-                        { featureType: 'road', elementType: 'geometry.stroke', stylers: [{ color: '#00ffcc22' }] },
-                        { featureType: 'water', elementType: 'geometry', stylers: [{ color: '#020b18' }] },
-                        { featureType: 'poi', stylers: [{ visibility: 'off' }] },
-                    ]
+                    gestureHandling: 'greedy'
                 });
                 const pin = new google.maps.marker.PinElement({
                     background: '#00ffcc', borderColor: '#009e80', glyphColor: '#060c1a', scale: 1.1
                 });
-                new google.maps.marker.AdvancedMarkerElement({ map: gmap, position: center, content: pin.element });
+                new google.maps.marker.AdvancedMarkerElement({ map: gmap, position: center, content: pin });
                 fetchWeather(userLat, userLng);
             } else throw new Error('no coords');
         })
@@ -910,29 +931,170 @@ function _ipFallbackMap() {
         });
 }
 
+// ── Map Overlays (merchants, routes) ──────────────────────────────────────────
+let mapMarkers = [];
+let mapPolylines = [];
+let mapInfoWindows = [];
+
+function clearMapOverlays() {
+    mapMarkers.forEach(m => m.map = null);
+    mapMarkers = [];
+    mapPolylines.forEach(p => p.setMap(null));
+    mapPolylines = [];
+    mapInfoWindows.forEach(w => w.close());
+    mapInfoWindows = [];
+}
+
+function showMerchantMarkers(merchants) {
+    if (!gmap || !merchants?.length) return;
+    clearMapOverlays();
+    const bounds = new google.maps.LatLngBounds();
+    // Include user position in bounds
+    if (userLat && userLng) bounds.extend({ lat: userLat, lng: userLng });
+
+    merchants.forEach((m, i) => {
+        if (!m.lat || !m.lng) return;
+        const pos = { lat: m.lat, lng: m.lng };
+        bounds.extend(pos);
+
+        const pin = new google.maps.marker.PinElement({
+            background: '#ff6b35',
+            borderColor: '#cc4400',
+            glyphColor: '#fff',
+            glyph: `${i + 1}`,
+            scale: 1.0
+        });
+        const marker = new google.maps.marker.AdvancedMarkerElement({
+            map: gmap, position: pos, content: pin, title: m.name
+        });
+        mapMarkers.push(marker);
+
+        const status = m.is_open === true ? '🟢 Open' : m.is_open === false ? '🔴 Closed' : '';
+        const rating = m.rating ? `⭐ ${m.rating}` : '';
+        const info = new google.maps.InfoWindow({
+            content: `<div style="color:#000;font-family:sans-serif;font-size:13px;max-width:200px">
+                <b>${m.name}</b><br>
+                ${rating} ${status}<br>
+                <span style="color:#555">${m.distance || ''} ${m.eta_drive ? '· ' + m.eta_drive : ''}</span><br>
+                <span style="color:#777;font-size:11px">${m.address || ''}</span>
+            </div>`
+        });
+        mapInfoWindows.push(info);
+        marker.addEventListener('gmp-click', () => {
+            mapInfoWindows.forEach(w => w.close());
+            info.open({ anchor: marker, map: gmap });
+        });
+    });
+
+    if (merchants.length > 0) gmap.fitBounds(bounds, { top: 40, right: 40, bottom: 40, left: 40 });
+}
+
+function showRoute(route, destination) {
+    if (!gmap) return;
+    // Clear only polylines, keep merchant markers
+    mapPolylines.forEach(p => p.setMap(null));
+    mapPolylines = [];
+
+    if (route.polyline_encoded && google.maps.geometry?.encoding) {
+        // Decode real polyline
+        const path = google.maps.geometry.encoding.decodePath(route.polyline_encoded);
+        const polyline = new google.maps.Polyline({
+            path, map: gmap,
+            strokeColor: '#00ffcc', strokeOpacity: 0.9, strokeWeight: 4,
+        });
+        mapPolylines.push(polyline);
+    } else if (route.dest_lat && route.dest_lng && userLat && userLng) {
+        // Dashed straight line fallback
+        const polyline = new google.maps.Polyline({
+            path: [
+                { lat: userLat, lng: userLng },
+                { lat: route.dest_lat, lng: route.dest_lng }
+            ],
+            map: gmap,
+            strokeColor: '#00ffcc', strokeOpacity: 0.5, strokeWeight: 3,
+            icons: [{
+                icon: { path: 'M 0,-1 0,1', strokeOpacity: 1, scale: 3 },
+                offset: '0', repeat: '15px'
+            }],
+        });
+        mapPolylines.push(polyline);
+    }
+
+    // Fit bounds to show entire route
+    if (route.dest_lat && route.dest_lng) {
+        const bounds = new google.maps.LatLngBounds();
+        if (userLat && userLng) bounds.extend({ lat: userLat, lng: userLng });
+        bounds.extend({ lat: route.dest_lat, lng: route.dest_lng });
+        gmap.fitBounds(bounds, { top: 40, right: 40, bottom: 40, left: 40 });
+
+        // Add destination marker
+        const pin = new google.maps.marker.PinElement({
+            background: '#ff3366', borderColor: '#cc0033', glyphColor: '#fff', scale: 1.1
+        });
+        const marker = new google.maps.marker.AdvancedMarkerElement({
+            map: gmap, position: { lat: route.dest_lat, lng: route.dest_lng }, content: pin,
+            title: route.dest_name || destination || 'Destination'
+        });
+        mapMarkers.push(marker);
+
+        // ETA overlay info window
+        const info = new google.maps.InfoWindow({
+            content: `<div style="color:#000;font-family:sans-serif;font-size:13px">
+                <b>${route.dest_name || destination || 'Destination'}</b><br>
+                📍 ${route.distance_km} km · ${route.duration_min} min
+            </div>`
+        });
+        info.open({ anchor: marker, map: gmap });
+        mapInfoWindows.push(info);
+    }
+}
+
 // ── Weather API ───────────────────────────────────────────────────────────────
-const WEATHER_CONDITION_ICONS = {
-    CLEAR: '☀️', PARTLY_CLOUDY: '⛅', CLOUDY: '☁️', OVERCAST: '☁️',
-    FOGGY: '🌫️', DRIZZLE: '🌦️', RAIN: '🌧️', HEAVY_RAIN: '🌧️',
-    THUNDERSTORM: '⛈️', SNOW: '❄️', SLEET: '🌨️', HAIL: '🌨️',
-    WINDY: '💨', TORNADO: '🌪️', UNKNOWN: '🌡️',
+// ── Weather (Open-Meteo — free, no key, no rate limits) ─────────────────────
+// WMO weather codes → icon + description
+const WMO_CODES = {
+    0:  ['☀️','Clear'],        1:  ['🌤️','Mostly Clear'],  2:  ['⛅','Partly Cloudy'],
+    3:  ['☁️','Overcast'],      45: ['🌫️','Fog'],           48: ['🌫️','Rime Fog'],
+    51: ['🌦️','Light Drizzle'],53: ['🌦️','Drizzle'],       55: ['🌧️','Heavy Drizzle'],
+    56: ['🌧️','Freezing Drizzle'], 57: ['🌧️','Heavy Freezing Drizzle'],
+    61: ['🌧️','Light Rain'],   63: ['🌧️','Rain'],          65: ['🌧️','Heavy Rain'],
+    66: ['🌧️','Freezing Rain'],67: ['🌧️','Heavy Freezing Rain'],
+    71: ['❄️','Light Snow'],    73: ['❄️','Snow'],           75: ['❄️','Heavy Snow'],
+    77: ['❄️','Snow Grains'],   80: ['🌦️','Light Showers'], 81: ['🌧️','Showers'],
+    82: ['🌧️','Heavy Showers'],85: ['🌨️','Light Snow Showers'], 86: ['🌨️','Snow Showers'],
+    95: ['⛈️','Thunderstorm'],  96: ['⛈️','Hail Storm'],    99: ['⛈️','Heavy Hail Storm'],
 };
+
+let weatherTimezone = null;
+let cachedCurrentWeather = null;
 
 async function fetchWeather(lat, lng) {
     try {
-        const url = `https://weather.googleapis.com/v1/currentConditions:lookup` +
-                    `?key=${MAPS_API_KEY}&location.latitude=${lat}&location.longitude=${lng}&unitsSystem=METRIC`;
-        const res  = await fetch(url);
+        const url = `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lng}` +
+                    `&current=temperature_2m,relative_humidity_2m,apparent_temperature,weather_code,wind_speed_10m,wind_direction_10m,cloud_cover,uv_index` +
+                    `&timezone=auto&wind_speed_unit=kmh`;
+        const res = await fetch(url);
         const data = await res.json();
+        const c = data.current;
+        weatherTimezone = data.timezone;
 
-        const temp      = data.temperature?.degrees ?? null;
-        const feelsLike = data.feelsLikeTemperature?.degrees ?? temp;
-        const condType  = data.weatherCondition?.type ?? 'UNKNOWN';
-        const icon      = WEATHER_CONDITION_ICONS[condType] || '🌡️';
+        const temp      = c.temperature_2m ?? null;
+        const feelsLike = c.apparent_temperature ?? temp;
+        const wmo       = c.weather_code ?? 0;
+        const [icon, desc] = WMO_CODES[wmo] || ['🌡️', 'Unknown'];
+
+        cachedCurrentWeather = {
+            temp, feelsLike, icon, desc, wmo,
+            humidity:  c.relative_humidity_2m,
+            windSpd:   c.wind_speed_10m,
+            windDir:   c.wind_direction_10m,
+            cloud:     c.cloud_cover,
+            uv:        c.uv_index,
+        };
 
         if (temp !== null) {
             document.getElementById('weather-icon').textContent = icon;
-            document.getElementById('weather-temp').textContent = `${Math.round(temp)}°C`;
+            document.getElementById('weather-temp').textContent = `${Math.round(temp)}\u00B0C`;
         }
 
         // Auto climate suggestion based on feels-like
@@ -952,8 +1114,104 @@ async function fetchWeather(lat, lng) {
     }
 }
 
-// Refresh weather every 10 minutes
 setInterval(() => { if (userLat) fetchWeather(userLat, userLng); }, 10 * 60 * 1000);
+
+// ── Weather forecast popup ────────────────────────────────────────────────────
+function fmtTime(isoStr) {
+    try {
+        const d = new Date(isoStr);
+        return d.toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit', hour12: false, timeZone: weatherTimezone || undefined });
+    } catch { return '--:--'; }
+}
+
+async function fetchForecast6h() {
+    if (!userLat) return null;
+    try {
+        const url = `https://api.open-meteo.com/v1/forecast?latitude=${userLat}&longitude=${userLng}` +
+                    `&hourly=temperature_2m,weather_code,precipitation_probability,wind_speed_10m` +
+                    `&timezone=auto&forecast_hours=7&wind_speed_unit=kmh`;
+        const res = await fetch(url);
+        const data = await res.json();
+        const h = data.hourly;
+        if (!h || !h.time) return [];
+        // Skip first hour (current), take next 6
+        return h.time.slice(1, 7).map((t, i) => ({
+            time: t,
+            temp: h.temperature_2m[i + 1],
+            wmo:  h.weather_code[i + 1],
+            rain: h.precipitation_probability?.[i + 1] ?? 0,
+            wind: h.wind_speed_10m[i + 1],
+        }));
+    } catch (e) {
+        console.warn('[Weather] forecast fetch failed:', e);
+        return null;
+    }
+}
+
+function renderWeatherPopup(current, hours) {
+    const popup = document.getElementById('weather-popup');
+    if (!current) { popup.innerHTML = '<p style="font-size:10px;color:var(--text-muted)">Weather unavailable</p>'; return; }
+
+    const { temp, feelsLike, icon, desc, humidity, windSpd, windDir, uv, cloud } = current;
+    const windDirStr = windDir != null ? ['N','NE','E','SE','S','SW','W','NW'][Math.round(windDir / 45) % 8] : '';
+
+    let html = `
+        <div class="wp-now">
+            <span class="wp-now-icon">${icon}</span>
+            <div class="wp-now-temp">${temp != null ? Math.round(temp) : '--'}\u00B0C
+                <span style="font-size:10px;font-weight:400;color:var(--text-muted);margin-left:6px">
+                    Feels ${feelsLike != null ? Math.round(feelsLike) : '--'}\u00B0C
+                </span>
+            </div>
+            <div class="wp-now-desc">${(desc || 'Unknown').toUpperCase()}</div>
+        </div>
+        <div class="wp-details">
+            <div class="wp-detail"><div class="wp-detail-val">${humidity ?? '--'}%</div><div class="wp-detail-lbl">HUMIDITY</div></div>
+            <div class="wp-detail"><div class="wp-detail-val">${windSpd ?? '--'} km/h</div><div class="wp-detail-lbl">WIND ${windDirStr}</div></div>
+            <div class="wp-detail"><div class="wp-detail-val">${uv ?? '--'}</div><div class="wp-detail-lbl">UV INDEX</div></div>
+            <div class="wp-detail"><div class="wp-detail-val">${cloud ?? '--'}%</div><div class="wp-detail-lbl">CLOUD</div></div>
+        </div>`;
+
+    if (hours && hours.length) {
+        html += `<div class="wp-title">NEXT ${hours.length} HOURS</div><div class="wp-hours">`;
+        for (const h of hours) {
+            const t = fmtTime(h.time);
+            const [hIcon] = WMO_CODES[h.wmo] || ['🌡️'];
+            const hTemp = h.temp != null ? Math.round(h.temp) : '--';
+            html += `<div class="wp-hour">
+                <span class="wp-hour-time">${t}</span>
+                <span class="wp-hour-icon">${hIcon}</span>
+                <span class="wp-hour-temp">${hTemp}\u00B0C</span>
+                <span class="wp-hour-rain">\u{1F4A7}${h.rain}%</span>
+                <span class="wp-hour-wind">\u{1F4A8}${h.wind ?? '--'}</span>
+            </div>`;
+        }
+        html += '</div>';
+    }
+
+    popup.innerHTML = html;
+}
+
+document.getElementById('weather-btn').addEventListener('click', async (e) => {
+    e.stopPropagation();
+    const popup = document.getElementById('weather-popup');
+    if (!popup.classList.contains('hidden')) {
+        popup.classList.add('hidden');
+        return;
+    }
+    popup.innerHTML = '<p style="font-size:10px;color:var(--text-muted);text-align:center">Loading forecast...</p>';
+    popup.classList.remove('hidden');
+    const hours = await fetchForecast6h();
+    renderWeatherPopup(cachedCurrentWeather, hours);
+});
+
+// Close popup when clicking outside
+document.addEventListener('click', (e) => {
+    const popup = document.getElementById('weather-popup');
+    if (!popup.classList.contains('hidden') && !e.target.closest('#weather-btn') && !e.target.closest('#weather-popup')) {
+        popup.classList.add('hidden');
+    }
+});
 
 // ── WebSocket ──────────────────────────────────────────────────────────────────
 let localStream;
@@ -1030,6 +1288,8 @@ async function setupWebSocket() {
             sendUIEvent("change_voice",      document.getElementById('voice-select').value);
             sendUIEvent("change_llm",        document.getElementById('llm-select').value);
             // Don't send variant on connect — server reports active variant via stt_variants_available
+            // Send user location if available (for Google Places hybrid search)
+            if (userLat && userLng) sendUIEvent("user_location", { lat: userLat, lng: userLng });
         };
 
         ws.onmessage = (event) => {
@@ -1132,6 +1392,11 @@ function handleJsonMessage(msg) {
                 if (e.ac_temp_range) setACTemp(e.ac_temp_range);
                 if (e.fan_speed)     setACFanSpeed(e.fan_speed);
             }
+            break;
+        case 'map_update':
+            if (msg.data?.action === 'show_merchants') showMerchantMarkers(msg.data.merchants);
+            else if (msg.data?.action === 'show_route') showRoute(msg.data.route, msg.data.destination);
+            else if (msg.data?.action === 'clear') clearMapOverlays();
             break;
         case 'enrollment_done':
             if (!document.getElementById('onboarding-modal').classList.contains('hidden')) showObStep('voice');
