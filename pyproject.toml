@@ -89,7 +89,7 @@ extraPaths = [
     "nova/backend/nova-l7/L-3",
     "nova/backend/kws",
     "nova/backend/pipeline_mp",
-]
+    "./nova/backend/kws/micro-wake-word"]
 reportMissingModuleSource = "none"
 
 [tool.pytest.ini_options]

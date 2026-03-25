@@ -1,0 +1,87 @@
+# Training configuration for "Nova" micro-wake-word model
+# Used with: python -m microwakeword.model_train_eval --training_config=train_micro_nova.yaml
+# Paths are relative to the micro-wake-word/ directory (cwd during training)
+
+window_step_ms: 10
+train_dir: "../micro_training_data/trained_models/nova"
+clip_duration_ms: 1500
+batch_size: 128
+
+# Two-phase training: 20k steps with lr 0.001
+training_steps:
+  - 20000
+learning_rates:
+  - 0.001
+
+# Class weights — heavily penalise false positives
+positive_class_weight:
+  - 1
+negative_class_weight:
+  - 20
+
+# SpecAugment (disabled initially — enable for harder training)
+time_mask_max_size:
+  - 0
+time_mask_count:
+  - 0
+freq_mask_max_size:
+  - 0
+freq_mask_count:
+  - 0
+
+# Evaluation
+eval_step_interval: 500
+target_minimization: 0.9
+minimization_metric: null
+maximization_metric: "average_viable_recall"
+
+# Feature datasets (paths relative to micro-wake-word/ cwd)
+features:
+  # Positive: augmented "Nova" spectrograms
+  - features_dir: "../micro_training_data/features/positive"
+    sampling_weight: 2.0
+    penalty_weight: 1.0
+    truth: true
+    truncation_strategy: "truncate_start"
+    type: "mmap"
+
+  # Hard negatives: similar-sounding words (Noah, Nava, Over, etc.)
+  - features_dir: "../micro_training_data/features/hard_negatives"
+    sampling_weight: 5.0
+    penalty_weight: 2.0
+    truth: false
+    truncation_strategy: "random"
+    type: "mmap"
+
+  # Speech: general speech corpus (downloaded from HuggingFace)
+  - features_dir: "../micro_training_data/negative_datasets/speech"
+    sampling_weight: 10.0
+    penalty_weight: 1.0
+    truth: false
+    truncation_strategy: "random"
+    type: "mmap"
+
+  # Dinner party: overlapping speech, ambient restaurant sounds
+  - features_dir: "../micro_training_data/negative_datasets/dinner_party"
+    sampling_weight: 10.0
+    penalty_weight: 1.0
+    truth: false
+    truncation_strategy: "random"
+    type: "mmap"
+
+  # No-speech: background noise, music, etc.
+  - features_dir: "../micro_training_data/negative_datasets/no_speech"
+    sampling_weight: 5.0
+    penalty_weight: 1.0
+    truth: false
+    truncation_strategy: "random"
+    type: "mmap"
+
+  # Dinner party eval: disabled — ambient validation dataset exceeds 4GB GPU VRAM
+  # Re-enable on a larger GPU for ambient false-positive-per-hour metrics
+  # - features_dir: "../micro_training_data/negative_datasets/dinner_party_eval"
+  #   sampling_weight: 0.0
+  #   penalty_weight: 1.0
+  #   truth: false
+  #   truncation_strategy: "split"
+  #   type: "mmap"
