@@ -70,6 +70,8 @@ class MicroKWS:
         self._muted = False
         self._last_trigger_time: float = 0.0
         self._consecutive_count: int = 0
+        self._inference_count: int = 0
+        self._max_prob_seen: float = 0.0
 
         # Audio / spectrogram buffers
         self._audio_remainder = b""
@@ -179,18 +181,33 @@ class MicroKWS:
                 prob = self._run_inference()
                 self._frames_since_inference = 0
 
+                self._inference_count += 1
+                if prob > self._max_prob_seen:
+                    self._max_prob_seen = prob
+
                 if prob >= self.threshold:
                     self._consecutive_count += 1
                 else:
                     self._consecutive_count = 0
 
-                if self.debug and prob >= self.threshold * 0.6:
-                    logger.debug(
-                        "MicroKWS  prob=%.3f  consec=%d/%d",
-                        prob,
-                        self._consecutive_count,
-                        self.consecutive_triggers,
-                    )
+                if self.debug:
+                    # Log every score above 0.1 so tuning is possible
+                    if prob >= 0.1:
+                        logger.info(
+                            "MicroKWS  prob=%.3f  consec=%d/%d  (threshold=%.2f)",
+                            prob,
+                            self._consecutive_count,
+                            self.consecutive_triggers,
+                            self.threshold,
+                        )
+                    # Periodic summary every 100 inferences
+                    if self._inference_count % 100 == 0:
+                        logger.info(
+                            "MicroKWS  inferences=%d  max_prob_seen=%.3f  threshold=%.2f",
+                            self._inference_count,
+                            self._max_prob_seen,
+                            self.threshold,
+                        )
 
                 if self._consecutive_count >= self.consecutive_triggers:
                     latency = (time.perf_counter() - t0) * 1000
@@ -247,10 +264,6 @@ class MicroKWS:
             return self.load_model(str(versioned))
         logger.warning("MicroKWS version not found: %s", versioned)
         return False
-
-    # ------------------------------------------------------------------
-    # Private
-    # ------------------------------------------------------------------
 
     def _run_inference(self) -> float:
         """Feed the current spectrogram buffer through the TFLite model.

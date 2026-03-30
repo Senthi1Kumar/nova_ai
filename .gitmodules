@@ -5,3 +5,6 @@
 	path = nova/backend/nova-l7
 	url = https://github.com/dheerajbunny/nova-l7.git
 	branch = v1.1
+[submodule "nova/backend/kws/micro-wake-word"]
+	path = nova/backend/kws/micro-wake-word
+	url = https://github.com/OHF-Voice/micro-wake-word.git

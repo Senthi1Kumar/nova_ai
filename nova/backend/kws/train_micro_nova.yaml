@@ -35,6 +35,11 @@ target_minimization: 0.9
 minimization_metric: null
 maximization_metric: "average_viable_recall"
 
+# Early stopping — stop if best metric hasn't improved for N consecutive evals
+# (0 = disabled, runs all training_steps). Each eval = eval_step_interval steps.
+# patience=10 @ 500-step interval = stop if no improvement for 5000 steps.
+early_stopping_patience: 10
+
 # Feature datasets (paths relative to micro-wake-word/ cwd)
 features:
   # Positive: augmented "Nova" spectrograms

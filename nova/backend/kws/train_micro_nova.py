@@ -11,14 +11,38 @@ Prerequisites (training only — NOT needed at inference time):
     uv pip install -e piper-sample-generator/    # local repo (already installed)
     pip install -e micro-wake-word/              # local repo
 
+For Qwen3-TTS voice cloning (alternative to Piper):
+    pip install -e faster-qwen3-tts/             # local repo
+    pip install soundfile
+
 Usage:
     cd nova/backend/kws
+
+    # With Piper TTS (default):
     python train_micro_nova.py                # Step 1: prepare data
     python train_micro_nova.py --train        # Step 2: train model
     python train_micro_nova.py --export       # Step 3: copy model to kws/models/
 
+    # With Qwen3-TTS voice cloning:
+    python train_micro_nova.py --tts-engine qwen3 --voices-dir /path/to/reference_voices/
+    python train_micro_nova.py --train
+    python train_micro_nova.py --export
+
+    # Record 20-30 people saying random sentences (~10s each), put WAVs in voices-dir.
+    # Qwen3-TTS clones each voice to say the wake word variants → diverse training set.
+
+Recording reference voices with arecord (ALSA):
+    mkdir -p reference_voices
+    # Record 10s clips, 16kHz mono WAV — have each person say any random sentence:
+    arecord -f S16_LE -r 16000 -c 1 -d 10 reference_voices/voice_01.wav
+    arecord -f S16_LE -r 16000 -c 1 -d 10 reference_voices/voice_02.wav
+    # ... repeat for 20-30 different speakers
+    # Then pass the directory:
+    python train_micro_nova.py --tts-engine qwen3 --voices-dir ./reference_voices/
+
 The full pipeline (data prep → train → export) can also be run in one shot:
     python train_micro_nova.py --all
+    python train_micro_nova.py --all --tts-engine qwen3 --voices-dir ./reference_voices/
 """
 
 import argparse
@@ -45,10 +69,8 @@ PIPER_MODEL_PATH = PIPER_DIR / "models" / "en_US-libritts_r-medium.pt"
 # Wake word variants — phonetic spellings often produce better TTS samples
 POSITIVE_WORDS = [
     "nova", "Nova", "NOVA",
-    "noh vuh", "noh_vuh", "no_va",
-    "hey nova", "hey Nova", "Hey Nova",
-    "Hi Nova", "hi nova", "hi Nova",
-    "noah", "hey noah", "hey Noah"
+    "noh vuh", "Hey Nova", "hi Nova",
+    "noah", "hey Noah", "Hello Nova"
 ]
 
 # Hard negatives — confusable words the model must learn to reject
@@ -60,11 +82,41 @@ HARD_NEGATIVES = [
     "Alexa", "Hey Siri", "Hey Google", "Hey Bixby",
 ]
 
-SAMPLES_PER_POSITIVE = 250   # per word variant
-SAMPLES_PER_NEGATIVE = 100   # per hard negative word
+SAMPLES_PER_POSITIVE = 250   # per word variant (Piper) — Qwen3 uses QWEN3_SAMPLES_PER_VOICE * num_voices
+SAMPLES_PER_NEGATIVE = 100   # per hard negative word (Piper) — same logic for Qwen3
+
+QWEN3_SAMPLES_PER_VOICE = 100  # each reference voice generates this many samples per word
+
+# MicroKWS expects 1500ms windows — clips must be short.
+# Anything beyond the wake word is noise/gibberish that hurts training.
+MAX_CLIP_DURATION_S = 1.5  # hard trim all generated samples to this length
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
+
+def trim_wav_dir(directory: Path, max_duration_s: float = MAX_CLIP_DURATION_S):
+    """Trim all WAV files in a directory to max_duration_s.
+
+    Reads each file, truncates to max_duration_s * sample_rate samples,
+    overwrites in-place.  Skips files already within the limit.
+    """
+    import soundfile as sf
+
+    wavs = list(directory.glob("*.wav"))
+    trimmed = 0
+    for wav_path in wavs:
+        info = sf.info(str(wav_path))
+        if info.duration <= max_duration_s:
+            continue
+        audio, sr = sf.read(str(wav_path))
+        max_samples = int(max_duration_s * sr)
+        audio = audio[:max_samples]
+        sf.write(str(wav_path), audio, sr)
+        trimmed += 1
+
+    if trimmed:
+        print(f"    Trimmed {trimmed}/{len(wavs)} files to {max_duration_s}s in {directory.name}/")
+
 
 def ensure_piper_model():
     """Download the Piper .pt generator model if not present."""
@@ -123,11 +175,112 @@ def run_piper_prefixed(word: str, output_dir: str, max_samples: int, prefix: str
     tmp_dir = output_dir + f"_tmp_{prefix}"
     run_piper(word, tmp_dir, max_samples)
 
-    Path(output_dir).mkdir(parents=True, exist_ok=True)
+    out = Path(output_dir)
+    out.mkdir(parents=True, exist_ok=True)
     for f in sorted(Path(tmp_dir).glob("*.wav")):
-        dest = Path(output_dir) / f"{prefix}_{f.name}"
+        dest = out / f"{prefix}_{f.name}"
         shutil.move(str(f), str(dest))
     shutil.rmtree(tmp_dir, ignore_errors=True)
+    trim_wav_dir(out)
+
+
+# ── Qwen3-TTS voice cloning ────────────────────────────────────────────────
+
+# Default Qwen3-TTS model — 0.6B is fastest, fits on most GPUs
+QWEN3_DEFAULT_MODEL = "Qwen/Qwen3-TTS-12Hz-0.6B-Base"
+
+def _load_qwen3_model(model_id: str):
+    """Load FasterQwen3TTS once and cache it."""
+    import torch
+    from faster_qwen3_tts import FasterQwen3TTS
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    dtype = torch.bfloat16 if device == "cuda" else torch.float32
+    print(f"  Loading Qwen3-TTS ({model_id}) on {device}...")
+    model = FasterQwen3TTS.from_pretrained(
+        model_id,
+        device=device,
+        dtype=dtype,
+        attn_implementation="sdpa",
+        max_seq_len=2048,
+    )
+    print("  Qwen3-TTS ready.")
+    return model
+
+
+def _discover_voices(voices_dir: Path) -> list[Path]:
+    """Find all WAV/FLAC/MP3 reference voice files in a directory."""
+    exts = {".wav", ".flac", ".mp3", ".ogg"}
+    voices = sorted(
+        f for f in voices_dir.iterdir()
+        if f.is_file() and f.suffix.lower() in exts
+    )
+    if not voices:
+        print(f"ERROR: No audio files found in {voices_dir}")
+        print("  Record 20-30 people saying random sentences (~10s each)")
+        print(f"  and place the WAV files in: {voices_dir}")
+        sys.exit(1)
+    return voices
+
+
+def run_qwen3_cloned(
+    model,
+    word: str,
+    output_dir: str,
+    prefix: str,
+    voices: list[Path],
+    samples_per_voice: int = QWEN3_SAMPLES_PER_VOICE,
+):
+    """Generate samples for one word by cloning each reference voice.
+
+    Each voice produces ``samples_per_voice`` samples (default 100) with
+    temperature sampling for natural variation.  Total samples per word =
+    num_voices * samples_per_voice.
+
+    Output is 24 kHz WAV, hard-trimmed to MAX_CLIP_DURATION_S (1.5s).
+    The training pipeline's Clips loader resamples to 16 kHz as needed.
+    """
+    import numpy as np
+    import soundfile as sf
+
+    out = Path(output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+
+    # Qwen3-TTS 12Hz codec: 12 tokens ≈ 1s audio.
+    # 24 tokens ≈ 2s — enough for any wake word, avoids gibberish tail.
+    max_tokens = int(MAX_CLIP_DURATION_S * 12) + 12  # small headroom
+
+    idx = 0
+    for voice_path in voices:
+        voice_name = voice_path.stem
+        for j in range(samples_per_voice):
+            try:
+                audio_list, sr = model.generate_voice_clone(
+                    text=word,
+                    language="English",
+                    ref_audio=str(voice_path),
+                    ref_text="",  # xvec_only mode ignores ref_text
+                    xvec_only=True,
+                    do_sample=True,
+                    temperature=0.9,
+                    top_k=50,
+                    repetition_penalty=1.05,
+                    max_new_tokens=max_tokens,
+                )
+                audio = audio_list[0]
+                if isinstance(audio, np.ndarray) and len(audio) > 0:
+                    # Hard trim to MAX_CLIP_DURATION_S
+                    max_samples = int(MAX_CLIP_DURATION_S * sr)
+                    audio = audio[:max_samples]
+                    dest = out / f"{prefix}_{idx}.wav"
+                    sf.write(str(dest), audio, sr)
+                    idx += 1
+            except Exception as e:
+                print(f"    WARN: Failed {prefix} voice={voice_name} attempt={j}: {e}")
+                continue
+
+    total = len(voices) * samples_per_voice
+    print(f"    [{prefix}] Generated {idx}/{total} samples via voice cloning ({MAX_CLIP_DURATION_S}s max)")
 
 
 def download_file(url: str, dest: Path):
@@ -138,44 +291,63 @@ def download_file(url: str, dest: Path):
 
 # ── Data Generation ──────────────────────────────────────────────────────────
 
-def generate_positive_samples():
-    """Generate positive wake-word audio using Piper TTS.
+def generate_positive_samples(tts_engine: str = "piper", qwen3_model=None, voices: list | None = None):
+    """Generate positive wake-word audio using Piper TTS or Qwen3-TTS voice cloning.
 
     All variants are placed into ONE flat directory with prefixed filenames
     so that Clips(input_directory=...) can load them all at once.
     """
-    ensure_piper_model()
+    if tts_engine == "piper":
+        ensure_piper_model()
+
     pos_dir = DATA_DIR / "positive_samples"
 
     for word in POSITIVE_WORDS:
         prefix = word.replace(" ", "_").lower()
-        # Check if this variant already generated
         existing = list(pos_dir.glob(f"{prefix}_*.wav")) if pos_dir.exists() else []
-        if len(existing) >= SAMPLES_PER_POSITIVE:
-            print(f"  [{prefix}] already has {len(existing)} samples, skipping")
-            continue
 
-        print(f"  Generating {SAMPLES_PER_POSITIVE} samples for '{word}'...")
-        run_piper_prefixed(word, str(pos_dir), SAMPLES_PER_POSITIVE, prefix)
+        if tts_engine == "qwen3":
+            target = QWEN3_SAMPLES_PER_VOICE * len(voices)
+            if len(existing) >= target:
+                print(f"  [{prefix}] already has {len(existing)} samples, skipping")
+                continue
+            print(f"  Generating {target} samples for '{word}' ({len(voices)} voices x {QWEN3_SAMPLES_PER_VOICE})...")
+            run_qwen3_cloned(qwen3_model, word, str(pos_dir), prefix, voices)
+        else:
+            if len(existing) >= SAMPLES_PER_POSITIVE:
+                print(f"  [{prefix}] already has {len(existing)} samples, skipping")
+                continue
+            print(f"  Generating {SAMPLES_PER_POSITIVE} samples for '{word}' (piper)...")
+            run_piper_prefixed(word, str(pos_dir), SAMPLES_PER_POSITIVE, prefix)
 
 
-def generate_hard_negatives():
-    """Generate hard-negative audio using Piper TTS.
+def generate_hard_negatives(tts_engine: str = "piper", qwen3_model=None, voices: list | None = None):
+    """Generate hard-negative audio using Piper TTS or Qwen3-TTS voice cloning.
 
     All variants into ONE flat directory, same pattern as positives.
     """
-    ensure_piper_model()
+    if tts_engine == "piper":
+        ensure_piper_model()
+
     neg_dir = DATA_DIR / "hard_negative_samples"
 
     for word in HARD_NEGATIVES:
         prefix = word.replace(" ", "_").lower()
         existing = list(neg_dir.glob(f"{prefix}_*.wav")) if neg_dir.exists() else []
-        if len(existing) >= SAMPLES_PER_NEGATIVE:
-            print(f"  [{prefix}] already has {len(existing)} samples, skipping")
-            continue
 
-        print(f"  Generating {SAMPLES_PER_NEGATIVE} hard negatives for '{word}'...")
-        run_piper_prefixed(word, str(neg_dir), SAMPLES_PER_NEGATIVE, prefix)
+        if tts_engine == "qwen3":
+            target = QWEN3_SAMPLES_PER_VOICE * len(voices)
+            if len(existing) >= target:
+                print(f"  [{prefix}] already has {len(existing)} samples, skipping")
+                continue
+            print(f"  Generating {target} hard negatives for '{word}' ({len(voices)} voices x {QWEN3_SAMPLES_PER_VOICE})...")
+            run_qwen3_cloned(qwen3_model, word, str(neg_dir), prefix, voices)
+        else:
+            if len(existing) >= SAMPLES_PER_NEGATIVE:
+                print(f"  [{prefix}] already has {len(existing)} samples, skipping")
+                continue
+            print(f"  Generating {SAMPLES_PER_NEGATIVE} hard negatives for '{word}' (piper)...")
+            run_piper_prefixed(word, str(neg_dir), SAMPLES_PER_NEGATIVE, prefix)
 
 
 def download_negative_datasets():
@@ -316,7 +488,17 @@ def run_training():
 
 
 def export_model():
-    """Copy the trained TFLite model to kws/models/micro_nova.tflite."""
+    """Export trained TFLite model with versioned snapshot.
+
+    Creates:
+        kws/models/versions/<timestamp>/micro_nova.tflite   (immutable archive)
+        kws/models/micro_nova.tflite                        (active copy)
+        kws/models/active_version.txt                       (points to timestamp)
+
+    MicroKWS.load_version() can load any previous version by timestamp.
+    """
+    from datetime import datetime
+
     src = TRAINED_DIR / "tflite_stream_state_internal_quant" / "stream_state_internal_quant.tflite"
     if not src.exists():
         print(f"Trained model not found at {src}")
@@ -324,10 +506,31 @@ def export_model():
         sys.exit(1)
 
     MODELS_DIR.mkdir(parents=True, exist_ok=True)
-    dst = MODELS_DIR / "micro_nova.tflite"
-    shutil.copy2(src, dst)
-    size_kb = dst.stat().st_size / 1024
-    print(f"Exported: {dst}  ({size_kb:.1f} KB)")
+
+    # Versioned snapshot
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    version_dir = MODELS_DIR / "versions" / timestamp
+    version_dir.mkdir(parents=True, exist_ok=True)
+    versioned_dst = version_dir / "micro_nova.tflite"
+    shutil.copy2(src, versioned_dst)
+
+    # Also copy best_weights for reference
+    best_weights = TRAINED_DIR / "best_weights.weights.h5"
+    if best_weights.exists():
+        shutil.copy2(best_weights, version_dir / "best_weights.weights.h5")
+
+    # Active copy
+    active_dst = MODELS_DIR / "micro_nova.tflite"
+    shutil.copy2(src, active_dst)
+
+    # Update active version pointer
+    version_file = MODELS_DIR / "active_version.txt"
+    version_file.write_text(timestamp)
+
+    size_kb = active_dst.stat().st_size / 1024
+    print(f"Exported: {active_dst}  ({size_kb:.1f} KB)")
+    print(f"Version:  {timestamp} → {versioned_dst}")
+    print(f"Active:   {version_file} → {timestamp}")
 
 
 def main():
@@ -336,19 +539,48 @@ def main():
     parser.add_argument("--train", action="store_true", help="Run the training pipeline")
     parser.add_argument("--export", action="store_true", help="Copy trained model to kws/models/")
     parser.add_argument("--all", action="store_true", help="Run full pipeline (prepare + train + export)")
+    parser.add_argument(
+        "--tts-engine", choices=["piper", "qwen3"], default="piper",
+        help="TTS engine for sample generation (default: piper)",
+    )
+    parser.add_argument(
+        "--voices-dir", type=Path, default=None,
+        help="Directory of reference voice recordings for Qwen3-TTS cloning. "
+             "Record 20-30 people saying random sentences (~10s each).",
+    )
+    parser.add_argument(
+        "--qwen3-model", default=QWEN3_DEFAULT_MODEL,
+        help=f"Qwen3-TTS model ID or local path (default: {QWEN3_DEFAULT_MODEL})",
+    )
     args = parser.parse_args()
 
     if not any([args.prepare, args.train, args.export, args.all]):
         args.prepare = True
 
-    if args.prepare or args.all:
-        print("=" * 60)
-        print("Step 1: Generating positive samples via Piper TTS")
-        print("=" * 60)
-        generate_positive_samples()
+    # Validate Qwen3-TTS args
+    if args.tts_engine == "qwen3" and (args.prepare or args.all):
+        if args.voices_dir is None:
+            parser.error("--voices-dir is required when using --tts-engine qwen3")
+        if not args.voices_dir.is_dir():
+            parser.error(f"--voices-dir does not exist: {args.voices_dir}")
 
-        print("\nStep 2: Generating hard negatives via Piper TTS")
-        generate_hard_negatives()
+    # Load Qwen3 model once if needed
+    qwen3_model = None
+    voices = None
+    if args.tts_engine == "qwen3" and (args.prepare or args.all):
+        voices = _discover_voices(args.voices_dir)
+        print(f"  Found {len(voices)} reference voices in {args.voices_dir}")
+        qwen3_model = _load_qwen3_model(args.qwen3_model)
+
+    if args.prepare or args.all:
+        engine_label = "Qwen3-TTS voice cloning" if args.tts_engine == "qwen3" else "Piper TTS"
+        print("=" * 60)
+        print(f"Step 1: Generating positive samples via {engine_label}")
+        print("=" * 60)
+        generate_positive_samples(args.tts_engine, qwen3_model, voices)
+
+        print(f"\nStep 2: Generating hard negatives via {engine_label}")
+        generate_hard_negatives(args.tts_engine, qwen3_model, voices)
 
         print("\nStep 3: Downloading negative datasets from HuggingFace")
         download_negative_datasets()
