@@ -232,6 +232,7 @@ def run_stt_worker(
                 llm_in_queue.put(llm_payload)
                 ws_out_queue.put({"type": "generation_start"})
             else:
+                logger.warning("Empty transcript from STT — sending recording_stopped")
                 ws_out_queue.put({"type": "recording_stopped"})
 
             if state["is_ptt"]:
@@ -274,7 +275,7 @@ def run_stt_worker(
                 and state["session_start_time"] > 0
                 and (time.time() - state["session_start_time"]) > NO_SPEECH_TIMEOUT
             ):
-                logger.warning("No speech detected within timeout — ending session.")
+                logger.warning(f"No speech detected within {NO_SPEECH_TIMEOUT}s — ending session. tts_muted={state['tts_muted']}, should_listen={state['should_listen']}")
                 _end_session()
                 ws_out_queue.put({"type": "recording_stopped"})
             continue
@@ -284,12 +285,16 @@ def run_stt_worker(
                 mic_stream = _transcriber_state["mic_stream"]
                 if mic_stream is not None:
                     audio = np.frombuffer(msg, dtype=np.int16).astype(np.float32) / 32768.0
+                    rms_raw = np.sqrt(np.mean(audio ** 2))
                     audio = preprocess_audio(audio)
                     try:
                         mic_stream.add_audio(audio, 16000)
                     except Exception as e:
                         if "VAD is not active" not in str(e):
                             logger.debug(f"add_audio error: {e}")
+            elif state["should_listen"] and state["tts_muted"]:
+                # This is the bug: audio silently dropped because tts_muted is True
+                logger.debug("Audio dropped: tts_muted=True during active session")
             continue
 
         if not isinstance(msg, dict):
@@ -314,7 +319,8 @@ def run_stt_worker(
                 state["is_ptt"] = msg.get("ptt", False)
                 state["ptt_stopping"] = False
                 state["session_start_time"] = time.time()
-                logger.info(f"STT Session Started (PTT: {state['is_ptt']})")
+                state["tts_muted"] = False  # Clear stale mute from previous TTS cycle
+                logger.info(f"STT Session Started (PTT: {state['is_ptt']}, tts_muted cleared)")
                 _ensure_stream_started()
                 state["should_listen"] = True
 

@@ -27,15 +27,22 @@ def run_kws_worker(
             time.sleep(1)
         return
 
-    kws_engine_type = os.environ.get("NOVA_KWS_ENGINE", "v2")  # "v2" or "micro"
+    kws_engine_type = os.environ.get("NOVA_KWS_ENGINE", "micro")  # "micro" or "v2"
 
     if kws_engine_type == "micro":
         from kws.micro_kws import MicroKWS
-        kws_engine = MicroKWS()
+        kws_engine = MicroKWS(
+            threshold=float(os.environ.get("NOVA_KWS_THRESHOLD", "0.35")),
+            consecutive_triggers=int(os.environ.get("NOVA_KWS_CONSECUTIVE", "1")),
+        )
         if not kws_engine.load_model():
             logger.warning("MicroKWS model not found. Place .tflite in kws/models/")
         else:
-            logger.info("MicroKWS loaded successfully.")
+            logger.info(
+                "MicroKWS loaded  threshold=%.2f  consecutive=%d",
+                kws_engine.threshold,
+                kws_engine.consecutive_triggers,
+            )
     else:
         from kws.kws_engine_v2 import StreamingKWSv2
         from kws.kws_engine_v2 import GoogleEmbeddingModel

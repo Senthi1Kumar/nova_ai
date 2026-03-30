@@ -1,13 +1,9 @@
 """
 STT configuration — Moonshine model variant registry.
 
+Supports both moonshine_voice (model_arch_name) and HF Transformers (model_id).
 Add entries to STT_VARIANT_REGISTRY to support additional variants.
 Change STT_SETTINGS.active to switch the default.
-
-Default: small-streaming (~400 MB VRAM, good accuracy/speed balance)
-  - tiny-streaming: fastest, lowest VRAM (~200 MB), slightly lower accuracy
-  - small-streaming: recommended default (~400 MB)
-  - medium-streaming: highest accuracy (~800 MB), more VRAM
 """
 
 from __future__ import annotations
@@ -15,34 +11,46 @@ from pydantic import BaseModel
 
 
 class STTVariantConfig(BaseModel):
-    model_arch_name: str    # ModelArch enum name (e.g. "SMALL_STREAMING")
+    model_arch_name: str = ""   # ModelArch enum name for moonshine_voice (e.g. "SMALL_STREAMING")
+    model_id: str = ""          # HuggingFace model ID for Transformers-based worker
     display_name: str
-    vram_mb: int            # approximate GPU memory when loaded
-    rtf_target: float       # typical real-time factor (lower = faster)
+    vram_mb: int                # approximate GPU memory when loaded
+    rtf_target: float           # typical real-time factor (lower = faster)
     language: str = "en"
-    vad_threshold: float = 0.3  # VAD sensitivity [0..1]. Lower = more sensitive
-                                # (catches softer speech / accented pauses).
-                                # Default 0.3 works better for Indian English than 0.5.
+    vad_threshold: float = 0.2
+    is_streaming: bool = True   # True for MoonshineStreaming*, False for base Moonshine
+    processor_id: str = ""      # Override processor source (defaults to model_id if empty)
 
 
 STT_VARIANT_REGISTRY: dict[str, STTVariantConfig] = {
     "tiny": STTVariantConfig(
         model_arch_name="TINY_STREAMING",
-        display_name="Moonshine Tiny (fastest)",
+        model_id="usefulsensors/moonshine-streaming-tiny",
+        display_name="Moonshine Streaming Tiny (fastest)",
         vram_mb=200,
         rtf_target=0.05,
     ),
     "small": STTVariantConfig(
         model_arch_name="SMALL_STREAMING",
-        display_name="Moonshine Small (recommended)",
-        vram_mb=400,
+        model_id="usefulsensors/moonshine-streaming-small",
+        display_name="Moonshine Streaming Small (recommended)",
+        vram_mb=500,
         rtf_target=0.08,
     ),
     "medium": STTVariantConfig(
         model_arch_name="MEDIUM_STREAMING",
-        display_name="Moonshine Medium (highest accuracy)",
-        vram_mb=800,
+        model_id="usefulsensors/moonshine-streaming-medium",
+        display_name="Moonshine Streaming Medium (best accuracy)",
+        vram_mb=1000,
         rtf_target=0.15,
+    ),
+    "in_en": STTVariantConfig(
+        model_id="pavandheeraj05/moonshine-nova-indian-english",
+        processor_id="UsefulSensors/moonshine-base",
+        display_name="Fine-tuned moonshine base",
+        vram_mb=200,
+        rtf_target=0.1,
+        is_streaming=False,
     ),
 }
 

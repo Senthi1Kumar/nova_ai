@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import os
+import shutil
 import sys
 import psutil
 import pynvml
@@ -184,7 +185,7 @@ def get_metrics():
             "stt": get_comp_info("stt", "Moonshine (Medium)", True),
             "llm": get_comp_info("llm", current_llm, not using_openrouter),
             "tts": get_comp_info("tts", tts_display, True),
-            "kws": get_comp_info("kws", "StreamingKWS V2", True),
+            "kws": get_comp_info("kws", "MicroKWS", True),
         },
     }
 
@@ -256,6 +257,49 @@ async def _flush_turn() -> None:
     _pending_turn = {}
 
 
+_generating_since: float = 0.0
+_last_llm_activity: float = 0.0  # updated on every llm_token — resets watchdog
+_FSM_GENERATING_TIMEOUT = 60.0  # seconds of ZERO llm activity before watchdog fires
+
+async def _fsm_watchdog():
+    """Periodically checks for FSM stuck in GENERATING with no LLM activity, and force-resets.
+
+    The watchdog only fires when there has been NO llm_token for _FSM_GENERATING_TIMEOUT
+    seconds.  This means web searches (which delay token output but are legitimate) do not
+    trigger a false-positive reset — only a genuinely silent/hung generation does.
+    """
+    while True:
+        await asyncio.sleep(5)
+        if pipeline_state.get("stop_event") and pipeline_state["stop_event"].is_set():
+            break
+        global _generating_since, _last_llm_activity
+        state = pipeline_state.get("fsm_state")
+        if state == "GENERATING":
+            if _generating_since == 0.0:
+                _generating_since = time.time()
+            # Only fire if LLM has been silent for the full timeout window
+            last_activity = _last_llm_activity if _last_llm_activity > 0 else _generating_since
+            if (time.time() - last_activity) > _FSM_GENERATING_TIMEOUT:
+                logger.warning(
+                    f"FSM watchdog: no LLM activity for >{_FSM_GENERATING_TIMEOUT}s in GENERATING — forcing IDLE reset"
+                )
+                pipeline_state["fsm_state"] = "IDLE"
+                pipeline_state["_tts_pending_samples"] = 0
+                pipeline_state["_tts_start_time"] = 0.0
+                pipeline_state["_tts_total_samples"] = 0
+                # Arm echo suppression for 8s so any buffered TTS audio does not
+                # leak into KWS and cause false wake-word triggers.
+                pipeline_state["tts_suppress_until"] = time.time() + 8.0
+                pipeline_state["stt_in_queue"].put({"type": "tts_unmute"})
+                pipeline_state["stt_in_queue"].put({"type": "stop"})
+                pipeline_state["kws_in_queue"].put({"type": "set_state", "state": "IDLE"})
+                pipeline_state["ws_out_queue"].put({"type": "generation_done"})
+                _generating_since = 0.0
+                _last_llm_activity = 0.0
+        else:
+            _generating_since = 0.0
+
+
 async def ws_queue_reader():
     """Background task to read from ws_out_queue and broadcast to WebSockets."""
     loop = asyncio.get_running_loop()
@@ -280,7 +324,6 @@ async def ws_queue_reader():
                             continue
                         # Hard interrupt: stop TTS immediately, clear buffered audio
                         pipeline_state["tts_interrupt_event"].set()
-                        pipeline_state["stt_in_queue"].put({"type": "tts_unmute"})
                         for h in list(active_rtc_handlers):
                             h.audio_queue = asyncio.Queue()
                         pipeline_state["_tts_pending_samples"] = 0
@@ -288,6 +331,9 @@ async def ws_queue_reader():
                         pipeline_state["_tts_total_samples"] = 0
                         pipeline_state["_tts_last_chunk_time"] = 0.0
                         pipeline_state["tts_suppress_until"] = 0.0
+                    # Always unmute STT before starting new session — delayed
+                    # unmute from generation_done may not have fired yet
+                    pipeline_state["stt_in_queue"].put({"type": "tts_unmute"})
                     pipeline_state["fsm_state"] = "LISTENING"
                     pipeline_state["e2e_start_time"] = time.time()
                     pipeline_state["stt_in_queue"].put({"type": "start"})
@@ -335,6 +381,11 @@ async def ws_queue_reader():
                         "routing":      d.get("routing"),
                     })
 
+                elif msg.get("type") == "llm_token":
+                    # Reset watchdog: LLM is alive, not stuck
+                    global _last_llm_activity
+                    _last_llm_activity = time.time()
+
                 elif msg.get("type") == "generation_start":
                     pipeline_state["fsm_state"] = "GENERATING"
                     # NOTE: Do NOT send "stop" to STT here — STT already pauses
@@ -353,8 +404,22 @@ async def ws_queue_reader():
                         pipeline_state["e2e_start_time"] = 0.0
 
                 elif msg.get("type") == "generation_done":
+                    next_state = _pending_turn.get("fsm_state", "IDLE")
                     asyncio.ensure_future(_flush_turn())
-                    # Only honour if we're still in GENERATING — ignore stale done from an interrupted TTS
+                    # If watchdog already reset FSM to IDLE but TTS just finished its
+                    # real audio, we still need to arm echo suppression to prevent KWS
+                    # from picking up the TTS playback as a wake-word trigger.
+                    if pipeline_state["fsm_state"] == "IDLE" and pipeline_state["_tts_total_samples"] > 0:
+                        now = time.time()
+                        total_dur = pipeline_state["_tts_total_samples"] / 24000.0
+                        elapsed = now - pipeline_state["_tts_start_time"] if pipeline_state["_tts_start_time"] > 0 else 0
+                        remaining = max(0.0, total_dur - elapsed)
+                        pipeline_state["tts_suppress_until"] = now + remaining + 1.5
+                        pipeline_state["_tts_pending_samples"] = 0
+                        pipeline_state["_tts_start_time"] = 0.0
+                        pipeline_state["_tts_total_samples"] = 0
+                        pipeline_state["_tts_last_chunk_time"] = 0.0
+                    # Only honour full FSM transition if we're still in GENERATING
                     if pipeline_state["fsm_state"] == "GENERATING":
                         # Calculate remaining browser playback time before unmuting STT.
                         # Audio chunks are buffered in the browser — unmuting too early
@@ -373,18 +438,27 @@ async def ws_queue_reader():
                         pipeline_state["_tts_total_samples"] = 0
                         pipeline_state["_tts_last_chunk_time"] = 0.0
                         pipeline_state["tts_suppress_until"] = now + suppress_delay
+
+                        if os.environ.get("NOVA_NO_KWS") == "1":
+                            next_state = "LISTENING"
+
+                        pipeline_state["fsm_state"] = next_state
+                        pipeline_state["kws_in_queue"].put({"type": "set_state", "state": next_state})
+
                         # Schedule unmute + STT restart after playback finishes
-                        async def _delayed_unmute_and_restart(delay: float) -> None:
+                        async def _delayed_unmute_and_restart(delay: float, start_listen: bool) -> None:
                             await asyncio.sleep(delay)
                             pipeline_state["stt_in_queue"].put({"type": "tts_unmute"})
-                            if os.environ.get("NOVA_NO_KWS") == "1":
+                            if start_listen:
                                 pipeline_state["stt_in_queue"].put({"type": "start", "ptt": False})
-                        asyncio.ensure_future(_delayed_unmute_and_restart(suppress_delay))
-                        pipeline_state["kws_in_queue"].put({"type": "set_state", "state": "IDLE"})
-                        if os.environ.get("NOVA_NO_KWS") == "1":
-                            pipeline_state["fsm_state"] = "LISTENING"
+                                # Visually trigger listening UI on the frontend for multi-turn
+                                pipeline_state["ws_out_queue"].put({"type": "speech_started"})
+
+                        if next_state not in ("IDLE", "LOCKED"):
+                            pipeline_state["e2e_start_time"] = time.time()
+                            asyncio.ensure_future(_delayed_unmute_and_restart(suppress_delay, True))
                         else:
-                            pipeline_state["fsm_state"] = "IDLE"
+                            asyncio.ensure_future(_delayed_unmute_and_restart(suppress_delay, False))
                             pipeline_state["stt_in_queue"].put({"type": "stop"})
 
                 elif msg.get("type") == "recording_stopped":
@@ -503,17 +577,22 @@ class NovaRTCHandler(AsyncStreamHandler):
         if time.time() < pipeline_state["tts_suppress_until"]:
             return
         sr, audio_arr = frame
-        # FastRTC delivers int16 at input_sample_rate; convert to bytes for workers.
-        audio_bytes = audio_arr.flatten().astype(np.int16).tobytes()
+        # FastRTC delivers audio. If it's float [-1.0, 1.0], scale it safely to int16.
+        if audio_arr.dtype in (np.float32, np.float64):
+            audio_int16 = (audio_arr * 32767.0).astype(np.int16)
+        else:
+            audio_int16 = audio_arr.astype(np.int16)
+        audio_bytes = audio_int16.flatten().tobytes()
         if not pipeline_state["kws_in_queue"]:
             return
         state = pipeline_state["fsm_state"]
-        if state == "IDLE":
+        if state in ("IDLE", "LOCKED"):
             pipeline_state["kws_in_queue"].put(audio_bytes)
-        elif state == "LISTENING":
-            pipeline_state["stt_in_queue"].put(audio_bytes)
         elif state == "GENERATING":
             pipeline_state["kws_in_queue"].put(audio_bytes)  # wake-word interrupt
+        else:
+            # Active interactive scenarios (LISTENING, SLOT_FILL, CONFIRM_PENDING, VERIFY...)
+            pipeline_state["stt_in_queue"].put(audio_bytes)
 
     async def emit(self):
         return await wait_for_item(self.audio_queue)
@@ -583,6 +662,7 @@ async def lifespan(app: FastAPI):
     
     # Start the async reader (no reference kept — event loop holds it alive)
     asyncio.create_task(ws_queue_reader())
+    asyncio.create_task(_fsm_watchdog())
 
     if bypass_kws:
         logger.info("NOVA_NO_KWS is set. Starting STT in continuous VAD mode.")
@@ -807,8 +887,13 @@ async def websocket_endpoint(websocket: WebSocket):
                         pass # MicTranscriber handles VAD locally; ignore websocket audio bytes
                     else:
                         pipeline_state["kws_in_queue"].put(audio_bytes)
-                # If we are LISTENING, feed STT
-                elif pipeline_state["fsm_state"] == "LISTENING":
+                # If we are in any active listening state, feed STT.
+                # CONFIRM_PENDING, VERIFY, VERIFY_PIN, SLOT_FILL all auto-start
+                # an STT session after TTS finishes — they need audio bytes routed
+                # here or the Moonshine transcriber gets nothing and times out.
+                elif pipeline_state["fsm_state"] in (
+                    "LISTENING", "CONFIRM_PENDING", "VERIFY", "VERIFY_PIN", "SLOT_FILL"
+                ):
                     pipeline_state["stt_in_queue"].put(audio_bytes)
                 # If GENERATING, still feed KWS to allow Wake Word Interruption!
                 elif pipeline_state["fsm_state"] == "GENERATING":
@@ -842,6 +927,9 @@ async def websocket_endpoint(websocket: WebSocket):
                 elif msg["type"] == "change_llm":
                     pipeline_state["current_llm"] = msg["data"]
                     pipeline_state["llm_in_queue"].put({"type": "change_llm", "data": msg["data"]})
+
+                elif msg["type"] == "change_stt_variant":
+                    pipeline_state["stt_in_queue"].put({"type": "change_stt_variant", "data": msg["data"]})
 
                 # elif msg["type"] == "user_location":  # Grounding Lite — disabled for now
                 #     loc = msg.get("data") or {}
@@ -933,24 +1021,32 @@ async def _run_enrollment_task():
     from datetime import datetime
     version_tag = datetime.now().strftime("%Y%m%d_%H%M%S")
     bypass_kws = os.environ.get("NOVA_NO_KWS") == "1"
+    kws_engine_type = os.environ.get("NOVA_KWS_ENGINE", "micro")
+
     if bypass_kws:
         # KWS worker is in sleep loop when bypassed — run enrollment directly
-        try:
-            from kws.kws_engine_v2 import StreamingKWSv2, GoogleEmbeddingModel
-            kws_model_path = str(Path(__file__).parent / "kws" / "google_speech_embedding.onnx")
-            kws_engine = StreamingKWSv2(model_path=None)
-            kws_engine.model = GoogleEmbeddingModel(kws_model_path)
-            refs_dir = Path(__file__).parent / "kws" / "refs"
-            ref_paths = sorted(str(p) for p in refs_dir.glob("nova_*.wav"))
-            noise_paths = sorted(str(p) for p in refs_dir.glob("noise_*.wav"))
-            if ref_paths:
-                logger.info("Running KWS enrollment directly (KWS worker bypassed)...")
-                await asyncio.to_thread(kws_engine.enroll, ref_paths, noise_paths, version_tag)
-                logger.info("KWS enrollment completed directly.")
-        except Exception as e:
-            logger.error(f"Direct KWS enrollment failed: {e}", exc_info=True)
+        if kws_engine_type == "v2":
+            try:
+                from kws.kws_engine_v2 import StreamingKWSv2, GoogleEmbeddingModel
+                kws_model_path = str(Path(__file__).parent / "kws" / "google_speech_embedding.onnx")
+                kws_engine = StreamingKWSv2(model_path=None)
+                kws_engine.model = GoogleEmbeddingModel(kws_model_path)
+                refs_dir = Path(__file__).parent / "kws" / "refs"
+                ref_paths = sorted(str(p) for p in refs_dir.glob("nova_*.wav"))
+                noise_paths = sorted(str(p) for p in refs_dir.glob("noise_*.wav"))
+                if ref_paths:
+                    logger.info("Running KWS enrollment directly (V2 engine, worker bypassed)...")
+                    await asyncio.to_thread(kws_engine.enroll, ref_paths, noise_paths, version_tag)
+                    logger.info("KWS enrollment completed directly.")
+            except Exception as e:
+                logger.error(f"Direct KWS enrollment failed: {e}", exc_info=True)
+        else:
+            logger.info("MicroKWS model is static — skipping direct enrollment during bypass.")
     elif pipeline_state["kws_in_queue"]:
-        pipeline_state["kws_in_queue"].put({"type": "enroll", "version_tag": version_tag})
+        if kws_engine_type == "v2":
+            pipeline_state["kws_in_queue"].put({"type": "enroll", "version_tag": version_tag})
+        else:
+            logger.info("MicroKWS does not support runtime enrollment — skipping worker message.")
 
     # 2. KWS enrollment done — skip L-3 voiceprint here; use /enroll/voice-sample instead.
     # (KWS samples are short "Nova" utterances — poor for speaker verification.)
@@ -1084,8 +1180,11 @@ async def list_kws_versions():
     versions_dir = KWS_MODELS_DIR / "versions"
     if not versions_dir.exists():
         return {"versions": [], "active_version": None}
+    engine_type = os.environ.get("NOVA_KWS_ENGINE", "micro")
+    required_file = "micro_nova.tflite" if engine_type == "micro" else "mlp_weights.pth"
+    
     versions = sorted(
-        (d.name for d in versions_dir.iterdir() if d.is_dir() and (d / "mlp_weights.pth").exists()),
+        (d.name for d in versions_dir.iterdir() if d.is_dir() and (d / required_file).exists()),
         reverse=True
     )
     # Read the persisted active version tag
@@ -1099,12 +1198,13 @@ async def list_kws_versions():
 
 @app.post("/enroll/kws-activate/{version}")
 async def activate_kws_version(version: str):
-    """Switch the active KWS model to a previously saved version."""
-    import shutil
+    engine_type = os.environ.get("NOVA_KWS_ENGINE", "micro")
+    required_file = "micro_nova.tflite" if engine_type == "micro" else "mlp_weights.pth"
     v_dir = KWS_MODELS_DIR / "versions" / version
-    if not (v_dir / "mlp_weights.pth").exists():
+
+    if not (v_dir / required_file).exists():
         from fastapi import HTTPException
-        raise HTTPException(status_code=404, detail=f"Version {version} not found.")
+        raise HTTPException(status_code=404, detail=f"Version {version} not found for {engine_type} engine.")
 
     # Persist the active version tag so /enroll/kws-models can report it
     (KWS_MODELS_DIR / "active_version.txt").write_text(version)
@@ -1113,7 +1213,8 @@ async def activate_kws_version(version: str):
     if bypass_kws:
         # KWS worker is in sleep loop — it won't read the queue.
         # Copy the version files directly to the active model path.
-        for fname in ("mlp_weights.pth", "refs.pkl"):
+        fnames = ["micro_nova.tflite"] if engine_type == "micro" else ["mlp_weights.pth", "refs.pkl"]
+        for fname in fnames:
             src = v_dir / fname
             if src.exists():
                 shutil.copy2(src, KWS_MODELS_DIR / fname)

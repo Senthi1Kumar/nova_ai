@@ -20,17 +20,17 @@ def run_stt_worker(
     import setproctitle
     setproctitle.setproctitle("nova-stt-worker")
 
-    from transformers import MoonshineStreamingForConditionalGeneration, AutoProcessor
+    from transformers import MoonshineStreamingForConditionalGeneration, AutoProcessor, MoonshineForConditionalGeneration
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     dtype = torch.float16 if torch.cuda.is_available() else torch.float32
 
-    logger.info(f"Initializing HF Moonshine STT (Streaming Small) on {device}...")
-    model_id = "UsefulSensors/moonshine-streaming-small"
+    logger.info(f"Initializing HF Moonshine STT (Moonshine Nova Indian English - FTed) on {device}...")
+    model_id = "pavandheeraj05/moonshine-nova-indian-english"
 
     try:
         processor = AutoProcessor.from_pretrained(model_id)
-        model = MoonshineStreamingForConditionalGeneration.from_pretrained(model_id).to(device).to(dtype)
+        model = MoonshineForConditionalGeneration.from_pretrained(model_id).to(device).to(dtype)
 
         # Silero VAD runs on CPU — avoids nvrtc JIT compilation issues on systems
         # where CUDA runtime is present but libnvrtc-builtins is not installed.
