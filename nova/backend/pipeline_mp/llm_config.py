@@ -77,12 +77,12 @@ LOCAL_LLM_REGISTRY: dict[str, LocalLLMConfig] = {
             repetition_penalty=1.05,
             do_sample=True,
         ),
-        system_prompt=(
-            "Assistant name: Nova. You help the driver of an electric vehicle. "
-            "Reply in 1-2 plain sentences. Address the driver as 'driver' or use no name. "
-            "Do not use the name Nova when talking to the driver. "
-            "Do not invent vehicle data. Use plain text only, no formatting."
-        ),
+        # system_prompt=(
+        #     "Assistant name: Nova. You help the driver of an electric vehicle. "
+        #     "Reply in 1-2 plain sentences. Address the driver as 'driver' or use no name. "
+        #     "Do not use the name Nova when talking to the driver. "
+        #     "Do not invent vehicle data. Use plain text only, no formatting."
+        # ),
     ),
 
     # Qwen3.5-0.8B — legacy fallback, kept for compatibility

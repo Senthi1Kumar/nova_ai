@@ -83,8 +83,8 @@ TOOL_CAPABLE_MODELS = {
 }
 
 
-def _execute_web_search(query: str, max_results: int = 5) -> str:
-    """Execute a Meta search using DDGS. Uses news() for news queries, text() otherwise."""
+def _execute_web_search(query: str, max_results: int = 3) -> str:
+    """Execute a web search using DDGS. Uses news() for news queries, text() otherwise."""
     try:
         from ddgs import DDGS
         results = []
@@ -94,9 +94,9 @@ def _execute_web_search(query: str, max_results: int = 5) -> str:
             "current events", "what happened",
         ])
 
-        with DDGS() as ddgs:
+        with DDGS(timeout=5) as ddgs:
             if is_news:
-                for r in ddgs.news(query, max_results=min(max_results, 10)):
+                for r in ddgs.news(query, max_results=min(max_results, 5)):
                     results.append({
                         "title": r.get("title", ""),
                         "snippet": r.get("body", ""),
@@ -104,7 +104,7 @@ def _execute_web_search(query: str, max_results: int = 5) -> str:
                         "date": r.get("date", ""),
                     })
             else:
-                for r in ddgs.text(query, max_results=min(max_results, 10)):
+                for r in ddgs.text(query, max_results=min(max_results, 5)):
                     results.append({
                         "title": r.get("title", ""),
                         "snippet": r.get("body", ""),
@@ -400,6 +400,17 @@ def run_llm_worker(llm_in_queue: "mp.Queue[dict]", tts_in_queue: "mp.Queue[dict]
         logger.error(f"Failed to init Dialogue Manager: {e}")
         dm = None
 
+    # Pre-load SpeechBrain ECAPA-TDNN for voice verification
+    try:
+        l3_path = os.path.join(backend_dir, "nova-l7", "L-3")
+        if l3_path not in sys.path:
+            sys.path.insert(0, l3_path)
+        from verify import preload as preload_verify
+        preload_verify()
+        logger.info("Voice verification model pre-loaded.")
+    except Exception as e:
+        logger.warning(f"Could not pre-load verification model: {e}")
+
     def _stream_and_speak(stream, start_time):
         """Stream LLM response tokens to UI and TTS.
 
@@ -495,19 +506,27 @@ def run_llm_worker(llm_in_queue: "mp.Queue[dict]", tts_in_queue: "mp.Queue[dict]
             logger.warning(f"No LLM backend available for query: '{prompt[:50]}'")
 
         # System prompt — use per-model prompt for local models, shared prompt for cloud
+        # Resolve driver name from DM profile for personalization
+        _driver_name = (dm._driver_name if dm and hasattr(dm, "_driver_name") else None) or ""
+        _driver_label = _driver_name if _driver_name and _driver_name.lower() not in ("there", "guest", "") else ""
+
         if use_local and local_cfg and local_cfg.system_prompt:
             system_base = local_cfg.system_prompt
         else:
             system_base = (
-                "You are Nova, a voice assistant in an electric vehicle. "
-                "The driver is talking to you. Address the driver as 'driver' or simply reply without a name. "
-                "Only 'Nova' refers to you, the assistant. Never say your own name 'Nova' in your responses. "
-                "Keep answers to 1-2 sentences. "
-                "Vehicle controls like lights, AC, and windows are handled by a separate system — do not act on those. "
+                "You are Nova, an AI voice assistant built into an electric vehicle. "
+                "Your name is Nova. The person you are speaking WITH is the driver"
+                + (f", whose name is {_driver_label}" if _driver_label else "")
+                + ". "
+                "CRITICAL IDENTITY RULE: Never address the driver as 'Nova' — that is YOUR name, not theirs. "
+                + (f"Address the driver as '{_driver_label}' or simply reply naturally without using their name. " if _driver_label else "Address the driver naturally without inventing a name for them. ")
+                + "PERSONALITY: Helpful, concise, natural tone — like a knowledgeable co-driver, not a robot. "
+                "Never start responses with 'The system acknowledges...', 'Nova here', or similar preamble. "
+                "If the driver says 'Thank you', reply naturally: 'You're welcome!', 'No problem!', 'Glad to help!', etc. "
+                "Keep answers to 1-2 concise, conversational sentences. No lists, markdown, or formatting. "
+                "Vehicle controls are handled by dedicated hardware — do not simulate acting on them. "
                 "If asked about vehicle data you lack, say so honestly. Do not invent sensor readings. "
-                "Output is read aloud by TTS: use plain conversational sentences only, "
-                "no markdown, bullets, numbered lists, URLs, or formatting. "
-                "If a question is outside your knowledge, say you are not sure."
+                "If a question is outside your knowledge, simply say you are not sure."
             )
         if use_cloud:
             system_base += (
@@ -903,7 +922,12 @@ def run_llm_worker(llm_in_queue: "mp.Queue[dict]", tts_in_queue: "mp.Queue[dict]
                     logger.info(f"DM routed as EMERGENCY → TTS: '{dm_response['nova_says'][:60]}'")
                     if tts_interrupt_event:
                         tts_interrupt_event.set()
-                    time.sleep(0.1)
+                    # Send eof FIRST to flush any in-progress TTS and clear the
+                    # interrupt flag inside the TTS worker (it clears on eof).
+                    # Without this flush, the interrupt is still set when TTS sees
+                    # the emergency text_to_speak and skips it + generation_done,
+                    # leaving the gateway FSM stuck in GENERATING forever.
+                    tts_in_queue.put({"type": "eof"})
                     tts_in_queue.put({"type": "text_to_speak", "text": dm_response["nova_says"]})
                     tts_in_queue.put({"type": "eof"})
                     continue
