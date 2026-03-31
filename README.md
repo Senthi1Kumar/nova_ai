@@ -5,9 +5,9 @@ Nova is a high-performance, low-latency voice AI assistant designed for EV dashb
 ## Key Features
 
 - **Multiprocessing Pipeline**: STT, LLM, TTS, and KWS run as separate processes communicating via `mp.Queue`, each with its own GPU allocation. No GIL contention.
-- **Always Listening (KWS)**: Custom-trained wake-word engine using Google Speech Embeddings + PyTorch MLP classifier. Supports versioned model snapshots with rollback.
+- **Always Listening (KWS)**: MicroWakeWord TFLite engine (`micro-wake-word` submodule) trained on synthetic Nova utterances. Supports versioned model snapshots with rollback. Legacy Google Speech Embeddings + MLP engine available via `NOVA_KWS_ENGINE=v2`.
 - **Hybrid Interaction**: Hands-free wake-word activation ("Nova") and manual Push-to-Talk (PTT) via WebRTC or WebSocket.
-- **Streaming STT**: Moonshine Voice (Medium) with built-in VAD — starts transcribing while the user is still speaking.
+- **Streaming STT**: Moonshine with built-in VAD — starts transcribing while the user is still speaking. Default: fine-tuned Indian English base model (`in_en`). Switchable to Tiny/Small/Medium streaming variants from the settings menu.
 - **Tool-Calling LLM**: OpenRouter API (Nemotron 49B, Qwen3.5, Gemini Flash) with streaming tool calls. Web search via [Dux Distributed Global Search](https://github.com/deedy5/ddgs) (`ddgs`) returns actual news headlines, not website links. Falls back to local Qwen3.5-0.8B (4-bit) when offline.
 - **Neural TTS**: FasterQwen3TTS with CUDA graph acceleration (12 kHz output, resampled to 24 kHz). Falls back to Pocket-TTS with multiple voice options.
 - **Layer 7 Dialogue Manager**: Intent classification (Gemma-300M semantic embeddings), payment flow with voice verification (ECAPA-TDNN voiceprint → PIN → Face ID), OTP, and mock commerce.
@@ -21,11 +21,11 @@ Nova is a high-performance, low-latency voice AI assistant designed for EV dashb
 | Component | Technology | Details |
 | :--- | :--- | :--- |
 | **Gateway** | **FastAPI + FastRTC** | WebRTC (SDP) + WebSocket PCM streaming, FSM state machine, echo suppression |
-| **STT** | **Moonshine Voice (Medium)** | Streaming transcription with built-in VAD, ~0.5s latency. PCM fed via WebSocket ScriptProcessor |
+| **STT** | **Moonshine (fine-tuned Indian EN)** | Streaming + non-streaming variants. Default: `pavandheeraj05/moonshine-nova-indian-english`. Switchable via UI. |
 | **Storage** | **PostgreSQL + asyncpg** | Session + turn history: intent, entities, latency, FSM state per turn |
 | **LLM** | **OpenRouter (Nemotron 49B)** | Streaming tool calls, web search, local Qwen3.5-0.8B fallback |
 | **TTS** | **FasterQwen3TTS** | CUDA graphs, voice cloning, 12→24 kHz resampling. Pocket-TTS fallback |
-| **KWS** | **Google Speech Embeddings + MLP** | Custom wake-word detection with versioned model snapshots |
+| **KWS** | **MicroWakeWord (TFLite)** | Custom-trained TFLite wake-word model. Versioned snapshots. Legacy MLP engine via `NOVA_KWS_ENGINE=v2` |
 | **Intent** | **Gemma-300M Embeddings** | Semantic intent classification with regex entity extraction |
 | **Voice Auth** | **ECAPA-TDNN (SpeechBrain)** | Voiceprint verification, PIN fallback, Face ID fallback |
 | **Commerce** | **SQLite Mock Backend** | Merchant search, basket, checkout, payment with OTP |
@@ -68,9 +68,26 @@ TTS → generate audio chunks → send to browser
 
 Nova includes a built-in enrollment UI:
 
-1. **Wake Word**: Record 5 samples of "Nova" + 5 noise samples → trains MLP classifier
-2. **Voice Fingerprint**: Record 5 speech phrases → computes ECAPA-TDNN embedding → encrypted voiceprint
-3. **KWS Versioning**: Each re-enrollment saves a timestamped snapshot. Switch between versions from the settings menu.
+1. **Wake Word (MicroKWS)**: The default TFLite model is pre-trained and static — no runtime enrollment needed. To retrain with new voices:
+
+   ```bash
+   cd nova/backend/kws
+   # With Piper TTS (default):
+   python train_micro_nova.py --all
+   python train_micro_nova.py --export
+
+   # With Qwen3-TTS voice cloning (more diverse, better accuracy):
+   # Record 20-30 people saying any random sentence (~10s each):
+   arecord -f S16_LE -r 16000 -c 1 -d 10 reference_voices/voice_01.wav
+   python train_micro_nova.py --all --tts-engine qwen3 --voices-dir ./reference_voices/
+   python train_micro_nova.py --export
+   ```
+
+   Each export saves a versioned snapshot under `kws/models/versions/<timestamp>/`. Switch the active version from the settings menu.
+
+2. **Wake Word (Legacy MLP engine)**: Set `NOVA_KWS_ENGINE=v2`. Record 5 samples of "Nova" + 5 noise samples from the enrollment UI → trains MLP classifier.
+
+3. **Voice Fingerprint**: Record 5 speech phrases → computes ECAPA-TDNN embedding → encrypted voiceprint. Used for payment voice verification (L-3).
 
 ## Payment Flow
 
@@ -109,9 +126,14 @@ Nova includes a built-in enrollment UI:
    ```bash
    cp .env.example .env
    # Edit .env and add your keys:
-   #   OPENROUTER_API_KEY  — from https://openrouter.ai/keys
-   #   MAPS_DEMO_KEY       — from https://developers.google.com/maps/documentation/javascript/demo-key
-   #   NOVA_DB_URL         — PostgreSQL connection string (optional)
+   #   OPENROUTER_API_KEY   — from https://openrouter.ai/keys
+   #   MAPS_DEMO_KEY        — from https://developers.google.com/maps/documentation/javascript/demo-key
+   #   NOVA_DB_URL          — PostgreSQL connection string (optional)
+   #
+   # Optional KWS tuning (MicroKWS defaults are shown):
+   #   NOVA_KWS_ENGINE      — "micro" (default) or "v2" (legacy MLP)
+   #   NOVA_KWS_THRESHOLD   — wake-word confidence threshold (default: 0.35)
+   #   NOVA_KWS_CONSECUTIVE — consecutive triggers required (default: 1)
    ```
 
 3. **Set up PostgreSQL** (conversation storage):
@@ -169,8 +191,11 @@ Nova includes a built-in enrollment UI:
 7. **Start Nova**:
 
    ```bash
-   # With KWS wake-word detection:
+   # With KWS wake-word detection (MicroKWS, default):
    uv run nova/backend/main.py
+
+   # Explicitly set MicroKWS engine (if not set in .env):
+   NOVA_KWS_ENGINE=micro uv run nova/backend/main.py
 
    # Without KWS (always-listening mode):
    uv run nova/backend/main.py --no-kws
@@ -189,8 +214,11 @@ nova/
 │   │   ├── llm_worker.py             # OpenRouter + local fallback LLM
 │   │   ├── tts_worker.py             # FasterQwen3TTS + Pocket-TTS
 │   │   └── kws_worker.py             # Wake-word detection worker
-│   ├── kws/                     # KWS engine, enrollment, synthetic data
-│   │   └── kws_engine_v2.py          # MLP classifier with versioned save/load
+│   ├── kws/                     # KWS engine, training pipeline, models
+│   │   ├── micro_kws.py              # MicroWakeWord TFLite inference (default)
+│   │   ├── train_micro_nova.py       # Training pipeline (Piper or Qwen3-TTS)
+│   │   ├── micro-wake-word/          # (Submodule) OHF-Voice/micro-wake-word
+│   │   └── kws_engine_v2.py          # Legacy MLP classifier (NOVA_KWS_ENGINE=v2)
 │   ├── nova-l7/                 # (Submodule) Layer 7 dialogue system
 │   │   ├── L-7/                      # Intent classifier + dialogue manager
 │   │   └── L-3/                      # Voice/PIN/Face verification + commerce
