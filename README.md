@@ -8,8 +8,8 @@ Nova is a high-performance, low-latency voice AI assistant designed for EV dashb
 - **Always Listening (KWS)**: MicroWakeWord TFLite engine (`micro-wake-word` submodule) trained on synthetic Nova utterances. Supports versioned model snapshots with rollback. Legacy Google Speech Embeddings + MLP engine available via `NOVA_KWS_ENGINE=v2`.
 - **Hybrid Interaction**: Hands-free wake-word activation ("Nova") and manual Push-to-Talk (PTT) via WebRTC or WebSocket.
 - **Streaming STT**: Moonshine with built-in VAD — starts transcribing while the user is still speaking. Default: fine-tuned Indian English base model (`in_en`). Switchable to Tiny/Small/Medium streaming variants from the settings menu.
-- **Tool-Calling LLM**: OpenRouter API (Nemotron 49B, Qwen3.5, Gemini Flash) with streaming tool calls. Web search via [Dux Distributed Global Search](https://github.com/deedy5/ddgs) (`ddgs`) returns actual news headlines, not website links. Falls back to local Qwen3.5-0.8B (4-bit) when offline.
-- **Neural TTS**: FasterQwen3TTS with CUDA graph acceleration (12 kHz output, resampled to 24 kHz). Falls back to Pocket-TTS with multiple voice options.
+- **Tool-Calling LLM**: OpenRouter API (Nemotron 49B, Qwen3.5, Gemini Flash) with streaming tool calls. Web search via [Serper API](https://serper.dev/) (Google Search) returns actual news snippets and search results. Falls back to local Liquid AI's LFM-700M when offline.
+- **Neural TTS**: Pocket-TTS with multiple voice options (default, low VRAM). Optional: FasterQwen3TTS with CUDA graph acceleration (12 kHz output, resampled to 24 kHz) for higher quality and voice cloning.
 - **Layer 7 Dialogue Manager**: Intent classification (Gemma-300M semantic embeddings), payment flow with voice verification (ECAPA-TDNN voiceprint → PIN → Face ID), OTP, and mock commerce.
 - **Compound Vehicle Control**: "Switch off the AC and open the sunroof" handled as multiple actions in a single command.
 - **Echo Suppression**: Accurate TTS playback tracking (`total_samples / 24kHz - elapsed`) with delayed STT unmute prevents the assistant from hearing its own voice.
@@ -24,7 +24,7 @@ Nova is a high-performance, low-latency voice AI assistant designed for EV dashb
 | **STT** | **Moonshine (fine-tuned Indian EN)** | Streaming + non-streaming variants. Default: `pavandheeraj05/moonshine-nova-indian-english`. Switchable via UI. |
 | **Storage** | **PostgreSQL + asyncpg** | Session + turn history: intent, entities, latency, FSM state per turn |
 | **LLM** | **OpenRouter (Nemotron 49B)** | Streaming tool calls, web search, local Qwen3.5-0.8B fallback |
-| **TTS** | **FasterQwen3TTS** | CUDA graphs, voice cloning, 12→24 kHz resampling. Pocket-TTS fallback |
+| **TTS** | **Pocket-TTS** | Default engine (low VRAM). Optional: [FasterQwen3TTS](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-0.6B-Base) (CUDA graphs) |
 | **KWS** | **MicroWakeWord (TFLite)** | Custom-trained TFLite wake-word model. Versioned snapshots. Legacy MLP engine via `NOVA_KWS_ENGINE=v2` |
 | **Intent** | **Gemma-300M Embeddings** | Semantic intent classification with regex entity extraction |
 | **Voice Auth** | **ECAPA-TDNN (SpeechBrain)** | Voiceprint verification, PIN fallback, Face ID fallback |
@@ -112,14 +112,24 @@ Nova includes a built-in enrollment UI:
 
 ## Quick Start
 
-1. **Clone the repository**:
+1. **Clone and Setup Repository**:
 
-   ```bash
-   git clone --recursive https://github.com/Senthi1Kumar/nova_ai.git
-   cd nova_ai
-   git checkout v1.2
-   git submodule update --init --recursive
-   ```
+   - **Option A: Clone via Git** (Recommended)
+
+     ```bash
+     git clone https://github.com/Senthi1Kumar/nova_ai.git
+     cd nova_ai
+     git checkout v1.2
+     git submodule update --init --recursive
+     ```
+
+   - **Option B: Direct v1.2 Download**
+     If you downloaded the `v1.2` source directly, you still need to initialize submodules:
+
+     ```bash
+     cd nova_ai
+     git submodule update --init --recursive
+     ```
 
 2. **Set environment variables**:
 
@@ -127,7 +137,7 @@ Nova includes a built-in enrollment UI:
    cp .env.example .env
    # Edit .env and add your keys:
    #   OPENROUTER_API_KEY   — from https://openrouter.ai/keys
-   #   MAPS_DEMO_KEY        — from https://developers.google.com/maps/documentation/javascript/demo-key
+   #   SERPER_API_KEY       — from https://serper.dev/
    #   NOVA_DB_URL          — PostgreSQL connection string (optional)
    #
    # Optional KWS tuning (MicroKWS defaults are shown):
