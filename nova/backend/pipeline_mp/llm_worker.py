@@ -84,35 +84,63 @@ TOOL_CAPABLE_MODELS = {
 
 
 def _execute_web_search(query: str, max_results: int = 3) -> str:
-    """Execute a web search using DDGS. Uses news() for news queries, text() otherwise."""
-    try:
-        from ddgs import DDGS
-        results = []
-        query_lower = query.lower()
-        is_news = any(kw in query_lower for kw in [
-            "news", "headline", "latest", "breaking", "today",
-            "current events", "what happened",
-        ])
+    """Execute web search via Serper API (Google Search)."""
+    import urllib.request
+    import urllib.error
 
-        with DDGS(timeout=5) as ddgs:
-            if is_news:
-                for r in ddgs.news(query, max_results=min(max_results, 5)):
-                    results.append({
-                        "title": r.get("title", ""),
-                        "snippet": r.get("body", ""),
-                        "source": r.get("source", ""),
-                        "date": r.get("date", ""),
-                    })
-            else:
-                for r in ddgs.text(query, max_results=min(max_results, 5)):
-                    results.append({
-                        "title": r.get("title", ""),
-                        "snippet": r.get("body", ""),
-                        "url": r.get("href", ""),
-                    })
+    api_key = os.getenv("SERPER_API_KEY", "")
+    if not api_key:
+        return json.dumps({"error": "SERPER_API_KEY not set", "query": query})
+
+    query_lower = query.lower()
+    is_news = any(kw in query_lower for kw in [
+        "news", "headline", "latest", "breaking", "today",
+        "current events", "what happened",
+    ])
+    endpoint = "https://google.serper.dev/news" if is_news else "https://google.serper.dev/search"
+
+    try:
+        payload = json.dumps({"q": query, "num": min(max_results, 5)}).encode()
+        req = urllib.request.Request(
+            endpoint,
+            data=payload,
+            headers={"X-API-KEY": api_key, "Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read())
+
+        results = []
+        if is_news:
+            for r in data.get("news", [])[:max_results]:
+                results.append({
+                    "title": r.get("title", ""),
+                    "snippet": r.get("snippet", ""),
+                    "source": r.get("source", ""),
+                    "date": r.get("date", ""),
+                })
+        else:
+            kg = data.get("knowledgeGraph", {})
+            if kg.get("description"):
+                results.append({
+                    "title": kg.get("title", ""),
+                    "snippet": kg["description"],
+                    "source": "knowledge_graph",
+                })
+            for r in data.get("organic", [])[:max_results]:
+                results.append({
+                    "title": r.get("title", ""),
+                    "snippet": r.get("snippet", ""),
+                    "url": r.get("link", ""),
+                })
+
         if not results:
             return json.dumps({"error": "No results found", "query": query})
-        return json.dumps(results, ensure_ascii=False)
+        return json.dumps(results[:max_results], ensure_ascii=False)
+
+    except urllib.error.URLError as e:
+        logger.error(f"Web search failed: {e}")
+        return json.dumps({"error": str(e), "query": query})
     except Exception as e:
         logger.error(f"Web search failed: {e}")
         return json.dumps({"error": str(e), "query": query})
@@ -186,6 +214,8 @@ def clean_for_tts(text: str) -> str:
     text = re.sub(r'`+', '', text)
     # Remove stray markdown/special chars that produce noise
     text = re.sub(r'[/\\|<>{}[\]~^]', ' ', text)
+    # Remove quotes and apostrophes — pocket-tts produces hissing/stuttering on these
+    text = re.sub(r"[\"'\u2018\u2019\u201c\u201d]", "", text)
     # Collapse multiple spaces/newlines
     text = re.sub(r'\s+', ' ', text)
     # Abbreviation expansions
@@ -466,7 +496,7 @@ def run_llm_worker(llm_in_queue: "mp.Queue[dict]", tts_in_queue: "mp.Queue[dict]
                     is_thinking = True
                 if not is_thinking:
                     sentence_buffer += content
-                    if any(p in content for p in [".", "!", "?", "\n", ","]):
+                    if any(p in content for p in [".", "!", "?", "\n"]):
                         clean = clean_for_tts(sentence_buffer)
                         if clean:
                             tts_in_queue.put({"type": "text_to_speak", "text": clean})
@@ -510,17 +540,23 @@ def run_llm_worker(llm_in_queue: "mp.Queue[dict]", tts_in_queue: "mp.Queue[dict]
         _driver_name = (dm._driver_name if dm and hasattr(dm, "_driver_name") else None) or ""
         _driver_label = _driver_name if _driver_name and _driver_name.lower() not in ("there", "guest", "") else ""
 
+        _identity_rule = (
+            "CRITICAL IDENTITY RULE: Your name is Nova. The driver may say 'Nova' to address YOU — "
+            "that is your name, not theirs. Never call the driver 'Nova'. "
+            + (f"The driver's name is {_driver_label}. Address them as '{_driver_label}'." if _driver_label else
+               "You do not know the driver's name. Address them naturally without inventing one.")
+        )
+
         if use_local and local_cfg and local_cfg.system_prompt:
-            system_base = local_cfg.system_prompt
+            system_base = local_cfg.system_prompt + " " + _identity_rule
         else:
             system_base = (
                 "You are Nova, an AI voice assistant built into an electric vehicle. "
                 "Your name is Nova. The person you are speaking WITH is the driver"
                 + (f", whose name is {_driver_label}" if _driver_label else "")
                 + ". "
-                "CRITICAL IDENTITY RULE: Never address the driver as 'Nova' — that is YOUR name, not theirs. "
-                + (f"Address the driver as '{_driver_label}' or simply reply naturally without using their name. " if _driver_label else "Address the driver naturally without inventing a name for them. ")
-                + "PERSONALITY: Helpful, concise, natural tone — like a knowledgeable co-driver, not a robot. "
+                + _identity_rule + " "
+                "PERSONALITY: Helpful, concise, natural tone — like a knowledgeable co-driver, not a robot. "
                 "Never start responses with 'The system acknowledges...', 'Nova here', or similar preamble. "
                 "If the driver says 'Thank you', reply naturally: 'You're welcome!', 'No problem!', 'Glad to help!', etc. "
                 "Keep answers to 1-2 concise, conversational sentences. No lists, markdown, or formatting. "
@@ -709,7 +745,7 @@ def run_llm_worker(llm_in_queue: "mp.Queue[dict]", tts_in_queue: "mp.Queue[dict]
                             is_thinking = True
                         if not is_thinking:
                             sentence_buffer += clean_text
-                            if any(p in clean_text for p in [".", "!", "?", "\n", ","]):
+                            if any(p in clean_text for p in [".", "!", "?", "\n"]):
                                 clean = clean_for_tts(sentence_buffer)
                                 if clean:
                                     tts_in_queue.put({"type": "text_to_speak", "text": clean})
