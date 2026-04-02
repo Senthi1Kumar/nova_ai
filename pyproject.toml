@@ -17,7 +17,8 @@ dependencies = [
     "python-multipart",
     "pocket-tts",
     "pydub",
-    "onnxruntime-gpu",
+    "onnxruntime-gpu; platform_machine == 'x86_64'",
+    "onnxruntime; platform_machine == 'aarch64'",
     "pyaudio",
     "torch",
     "torchvision",
@@ -54,7 +55,8 @@ dependencies = [
 
 [tool.uv]
 environments = [
-    "sys_platform == 'linux'",
+    "sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "sys_platform == 'linux' and platform_machine == 'aarch64'",
 ]
 
 [[tool.uv.index]]
@@ -70,8 +72,7 @@ explicit = true
 [tool.uv.sources]
 pocket-tts = { path = "pocket-tts" }
 microwakeword = { path = "nova/backend/kws/micro-wake-word" }
-onnxruntime = { index = "ort-nightly" }
-onnxruntime-gpu = { index = "ort-nightly" }
+onnxruntime-gpu = { index = "ort-nightly", marker = "platform_machine == 'x86_64'" }
 torch = { index = "pytorch-cu130" }
 torchvision = { index = "pytorch-cu130" }
 torchaudio = { index = "pytorch-cu130" }
