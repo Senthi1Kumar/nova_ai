@@ -188,10 +188,14 @@ Nova includes a built-in enrollment UI:
 
    Set `NOVA_DB_URL=postgresql://nova:nova_dev@localhost/nova_db` in `.env`. Storage is optional — Nova runs without it if `NOVA_DB_URL` is unset.
 
-4. **Patch pocket-tts submodule** (forces CUDA PyTorch):
+4. **Patch submodules** (must run before `uv sync`):
 
    ```bash
-   ./patch_pocket-tts_submodule.sh
+   # Removes audio-metadata from microwakeword's install_requires (training dep, not needed for inference)
+   bash patch_microwakeword_submodule.sh
+
+   # Forces pocket-tts to use CUDA PyTorch
+   bash patch_pocket-tts_submodule.sh
    ```
 
 5. **Install dependencies**:
@@ -218,6 +222,9 @@ Nova includes a built-in enrollment UI:
 
    # Without KWS (always-listening mode):
    uv run nova/backend/main.py --no-kws
+
+   # Disable pVAD speaker gate (e.g. guest/debug mode, or before enrolling a voiceprint):
+   NOVA_PVAD_ENABLED=0 uv run nova/backend/main.py
    ```
 
 8. **Open Dashboard**: Navigate to `http://localhost:8000`
