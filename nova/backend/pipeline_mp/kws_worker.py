@@ -32,7 +32,7 @@ def run_kws_worker(
     if kws_engine_type == "micro":
         from kws.micro_kws import MicroKWS
         kws_engine = MicroKWS(
-            threshold=float(os.environ.get("NOVA_KWS_THRESHOLD", "0.35")),
+            threshold=float(os.environ.get("NOVA_KWS_THRESHOLD", "0.60")),
             consecutive_triggers=int(os.environ.get("NOVA_KWS_CONSECUTIVE", "1")),
         )
         if not kws_engine.load_model():

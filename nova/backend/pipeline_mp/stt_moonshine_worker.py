@@ -170,7 +170,7 @@ def run_stt_worker(
     PTT_DRAIN_TIMEOUT = 3.0
     # Safety timeout: if KWS triggers but no speech is ever detected,
     # end the session after this many seconds to avoid hanging in LISTENING.
-    NO_SPEECH_TIMEOUT = 8.0
+    NO_SPEECH_TIMEOUT = 4.0
 
     def _ensure_stream_started():
         if not state["stream_started"]:
