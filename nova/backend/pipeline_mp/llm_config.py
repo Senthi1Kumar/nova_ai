@@ -61,14 +61,31 @@ LOCAL_LLM_REGISTRY: dict[str, LocalLLMConfig] = {
         ),
     ),
 
-    # Liquid AI LFM2-700M — fastest, lowest VRAM
+    # Liquid AI LFM2.5-350M — best-in-class at 350M, tool use, <1GB RAM
+    "lfm2.5-350m": LocalLLMConfig(
+        model_id="LiquidAI/LFM2.5-350M",
+        display_name="LFM2.5-350M (Liquid AI)",
+        supports_tools=True,
+        context_length=32768,
+        vram_mb=700,               # ~700 MB in bfloat16 (no quantisation)
+        load_in_4bit=False,
+        compute_dtype="bfloat16",
+        sampling=SamplingParams(
+            max_new_tokens=256,
+            temperature=0.1,
+            top_k=50,
+            repetition_penalty=1.05,
+            do_sample=True,
+        ),
+    ),
+
+    # Liquid AI LFM2-700M — kept for reference/fallback
     "lfm2-700m": LocalLLMConfig(
         model_id="LiquidAI/LFM2-700M",
         display_name="LFM2-700M (Liquid AI)",
         supports_tools=False,
         context_length=4096,
         vram_mb=500,               # ~0.5 GB in 4-bit
-        # load_in_4bit=True,
         compute_dtype="bfloat16",
         sampling=SamplingParams(
             max_new_tokens=128,
@@ -77,12 +94,6 @@ LOCAL_LLM_REGISTRY: dict[str, LocalLLMConfig] = {
             repetition_penalty=1.05,
             do_sample=True,
         ),
-        # system_prompt=(
-        #     "Assistant name: Nova. You help the driver of an electric vehicle. "
-        #     "Reply in 1-2 plain sentences. Address the driver as 'driver' or use no name. "
-        #     "Do not use the name Nova when talking to the driver. "
-        #     "Do not invent vehicle data. Use plain text only, no formatting."
-        # ),
     ),
 
     # Qwen3.5-0.8B — legacy fallback, kept for compatibility
@@ -92,7 +103,7 @@ LOCAL_LLM_REGISTRY: dict[str, LocalLLMConfig] = {
         supports_tools=False,
         context_length=4096,
         vram_mb=600,               # ~0.6 GB in 4-bit
-        load_in_4bit=True,
+        # load_in_4bit=True,
         compute_dtype="float16",
         sampling=SamplingParams(
             max_new_tokens=128,
@@ -130,4 +141,4 @@ class LocalLLMSettings(BaseModel):
 
 
 # Single shared settings instance — import this wherever needed
-LOCAL_LLM_SETTINGS = LocalLLMSettings()
+LOCAL_LLM_SETTINGS = LocalLLMSettings(active="lfm2.5-350m")

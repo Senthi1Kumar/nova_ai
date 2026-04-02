@@ -83,6 +83,31 @@ TOOL_CAPABLE_MODELS = {
 }
 
 
+_CONVERSATIONAL_RE = re.compile(
+    r"^("
+    r"(see\s+you|bye|goodbye|good\s*(night|morning|afternoon|evening)|take\s+care|talk\s+(to\s+you\s+)?later|"
+    r"catch\s+you\s+later|have\s+a\s+good|farewell|ciao|adios|until\s+(next\s+time|then))"
+    r"|"
+    r"(ok(ay)?|sure|alright|got\s+it|thanks?(\s+you)?|thank\s+you|you('re|\s+are)\s+welcome|"
+    r"no\s+problem|great|cool|awesome|perfect|sounds?\s+good|never\s+mind|that'?s?\s+(fine|ok|good))"
+    r"|"
+    r"(my\s+name\s+is|i'?m\s+\w+|call\s+me|i\s+am\s+\w+)"
+    r")\W*$",
+    re.IGNORECASE,
+)
+
+
+def _needs_tools(prompt: str) -> bool:
+    """Return False if the prompt is clearly conversational and should never trigger a tool call."""
+    stripped = prompt.strip()
+    # Short single-word or very short phrases never need search
+    if len(stripped.split()) <= 3 and not any(c in stripped for c in "?"):
+        return False
+    if _CONVERSATIONAL_RE.match(stripped):
+        return False
+    return True
+
+
 def _execute_web_search(query: str, max_results: int = 3) -> str:
     """Execute web search via Serper API (Google Search)."""
     import urllib.request
@@ -216,6 +241,13 @@ def clean_for_tts(text: str) -> str:
     text = re.sub(r'[/\\|<>{}[\]~^]', ' ', text)
     # Remove quotes and apostrophes — pocket-tts produces hissing/stuttering on these
     text = re.sub(r"[\"'\u2018\u2019\u201c\u201d]", "", text)
+    # Strip parenthetical meta-instructions that small models sometimes leak from system prompt
+    text = re.sub(r'\([^)]{0,120}\)', '', text)
+    # Strip search-result metadata that models sometimes echo verbatim
+    text = re.sub(r'\bSource:\s*\S+.*', '', text, flags=re.IGNORECASE)
+    text = re.sub(r'\bSnippet:\s*', '', text, flags=re.IGNORECASE)
+    # Strip email addresses
+    text = re.sub(r'\S+@\S+\.\S+', '', text)
     # Collapse multiple spaces/newlines
     text = re.sub(r'\s+', ' ', text)
     # Abbreviation expansions
@@ -541,10 +573,13 @@ def run_llm_worker(llm_in_queue: "mp.Queue[dict]", tts_in_queue: "mp.Queue[dict]
         _driver_label = _driver_name if _driver_name and _driver_name.lower() not in ("there", "guest", "") else ""
 
         _identity_rule = (
-            "CRITICAL IDENTITY RULE: Your name is Nova. The driver may say 'Nova' to address YOU — "
-            "that is your name, not theirs. Never call the driver 'Nova'. "
+            "CRITICAL IDENTITY RULE: Your name is Nova. You are the AI assistant. "
+            "The driver is the human you are talking TO. Never confuse yourself with the driver. "
+            "Never call the driver 'Nova' — that is YOUR name, not theirs. "
+            "Never start a response with your own name (e.g. never say 'Nova, I...' or 'Nova here'). "
+            "Just respond directly. "
             + (f"The driver's name is {_driver_label}. Address them as '{_driver_label}'." if _driver_label else
-               "You do not know the driver's name. Address them naturally without inventing one.")
+               "You do not know the driver's name yet. If they tell you their name, acknowledge it warmly and use it — do NOT search for it.")
         )
 
         if use_local and local_cfg and local_cfg.system_prompt:
@@ -563,6 +598,16 @@ def run_llm_worker(llm_in_queue: "mp.Queue[dict]", tts_in_queue: "mp.Queue[dict]
                 "Vehicle controls are handled by dedicated hardware — do not simulate acting on them. "
                 "If asked about vehicle data you lack, say so honestly. Do not invent sensor readings. "
                 "If a question is outside your knowledge, simply say you are not sure."
+            )
+        if use_local and local_cfg and local_cfg.supports_tools:
+            system_base += (
+                " You have a web_search tool. Use it ONLY for explicit questions about current events, "
+                "breaking news, weather, or stock prices that clearly require up-to-date data. "
+                "NEVER use web_search for: single-word replies (Okay, Yes, Thanks, etc.), "
+                "acknowledgments, personal names, driver introductions, conversational replies, "
+                "vehicle control, or anything the driver tells you about themselves. "
+                "When you use web_search, synthesize the results into 1-2 plain spoken sentences — "
+                "never read out source names, URLs, snippets, emails, or article titles verbatim."
             )
         if use_cloud:
             system_base += (
@@ -677,7 +722,7 @@ def run_llm_worker(llm_in_queue: "mp.Queue[dict]", tts_in_queue: "mp.Queue[dict]
                         tokenize=False,
                         add_generation_prompt=True,
                     )
-                    if use_local_tools:
+                    if use_local_tools and _needs_tools(prompt):
                         try:
                             tmpl_kwargs["tools"] = [t["function"] for t in TOOLS]
                         except Exception:
@@ -790,6 +835,11 @@ def run_llm_worker(llm_in_queue: "mp.Queue[dict]", tts_in_queue: "mp.Queue[dict]
 
                         messages.append({"role": "assistant", "content": full_text})
                         messages.append({"role": "tool", "content": "\n".join(tool_results)})
+                        messages.append({"role": "user", "content": (
+                            "Based on those search results, give a brief spoken summary in 1-2 plain "
+                            "sentences. Do NOT read out source names, URLs, snippets, article titles, "
+                            "or any metadata. Speak naturally as a voice assistant."
+                        )})
                         continue  # re-generate with tool result in context
 
                     # Normal response — flush any remaining buffer
