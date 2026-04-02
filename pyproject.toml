@@ -8,13 +8,10 @@ dependencies = [
     "fastapi",
     "uvicorn",
     "websockets",
-    "faster-whisper",
-    # "qwen-agent",
     "bitsandbytes",
     "accelerate",
     "pynvml",
     "psutil",
-    "jiwer",
     "soundfile",
     "scipy",
     "python-multipart",
@@ -39,25 +36,20 @@ dependencies = [
     "tf-keras>=2.20.1",
     "openai>=2.24.0",
     "pydantic>=2.0",
-    "ddgs[api]>=9.11.3",
     "datasets[audio]>=4.7.0",
     "transformers",
     "moonshine-voice>=0.0.49",
+    # "optimum-onnx[onnxruntime-gpu]",
     "setproctitle>=1.3.7",
     "fastrtc[stt,tts,vad]>=0.0.34",
     "asyncpg>=0.31.0",
     "pymicro-features>=2.0.2",
     "ai-edge-litert>=2.1.3",
     "webrtcvad>=2.0.10",
-    "microwakeword",
-    "faster-qwen3-tts>=0.2.5",
-    "ipykernel>=7.2.0",
-    "ipython>=9.12.0",
-    "jupyterlab>=4.5.6",
-    "notebook>=7.5.5",
-    "ipywidgets>=8.1.8",
-    "mmap-ninja>=0.8.2",
     "webrtcvad-wheels>=2.0.14",
+    "microwakeword",
+    # "faster-qwen3-tts>=0.2.5",
+    "mmap-ninja>=0.8.2",
 ]
 
 [tool.uv]
@@ -84,12 +76,18 @@ torch = { index = "pytorch-cu130" }
 torchvision = { index = "pytorch-cu130" }
 torchaudio = { index = "pytorch-cu130" }
 torchcodec = { index = "pytorch-cu130" }
-# transformers = { git = "https://github.com/huggingface/transformers.git" }  # Incompatible with faster-qwen3-tts due to qwen-tts<=0.1.1
+transformers = { git = "https://github.com/huggingface/transformers.git" }  # Incompatible with faster-qwen3-tts due to qwen-tts<=0.1.1
 
 [dependency-groups]
 dev = [
     "ruff>=0.15.4",
     "pytest>=8.0",
+    "jiwer",
+    "ipykernel>=7.2.0",
+    "ipython>=9.12.0",
+    "jupyterlab>=4.5.6",
+    "notebook>=7.5.5",
+    "ipywidgets>=8.1.8",
 ]
 
 [tool.pyright]
