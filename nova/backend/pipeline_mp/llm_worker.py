@@ -223,6 +223,9 @@ def clean_for_tts(text: str) -> str:
     """Strip markdown, URLs, and non-speakable chars so TTS gets clean prose."""
     text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
     text = text.replace("<think>", "").replace("</think>", "")
+    # Strip "Nova, ..." self-addressing prefix — small models ignore the identity prompt rule
+    text = re.sub(r'^Nova,?\s+', '', text, flags=re.IGNORECASE)
+    text = re.sub(r'(?<=\.\s{1,2})Nova,?\s+', '', text, flags=re.IGNORECASE)
     # Remove markdown links: [text](url) → text
     text = re.sub(r'\[([^\]]*)\]\([^)]*\)', r'\1', text)
     # Remove bare URLs
@@ -295,7 +298,14 @@ def run_llm_worker(llm_in_queue: "mp.Queue[dict]", tts_in_queue: "mp.Queue[dict]
     # Default cloud model (used when routing to OpenRouter)
     cloud_llm_name = "nvidia/llama-3.3-nemotron-super-49b-v1.5"
     # Overall mode: "cloud", "local", or "auto" (query routing decides per-query)
-    llm_mode = "auto" if api_key else "local"
+    # NOVA_LLM_MODE=cloud  → skip local model entirely, all queries go to OpenRouter
+    # NOVA_LLM_MODE=local  → never use cloud
+    # NOVA_LLM_MODE=auto   → query router decides (default when API key is present)
+    _mode_env = os.getenv("NOVA_LLM_MODE", "").strip().lower()
+    if _mode_env in ("cloud", "local", "auto"):
+        llm_mode = _mode_env
+    else:
+        llm_mode = "auto" if api_key else "local"
 
     def _load_local_model(key: str):
         """Load a local model from the registry. Unloads any previous local model."""
@@ -442,12 +452,13 @@ def run_llm_worker(llm_in_queue: "mp.Queue[dict]", tts_in_queue: "mp.Queue[dict]
         return "cloud"
 
     # ── Startup: load default local model ────────────────────────────────────
-    # _load_local_model skips silently when CUDA is not available (no GPU = cloud only).
+    # Skipped when NOVA_LLM_MODE=cloud (cloud-only, no local model loaded).
     from pipeline_mp.llm_config import LOCAL_LLM_SETTINGS
-    _load_local_model(LOCAL_LLM_SETTINGS.active)
+    if llm_mode != "cloud":
+        _load_local_model(LOCAL_LLM_SETTINGS.active)
 
     # Track the current LLM name for the UI display
-    current_llm_name = cloud_llm_name if api_key else f"local:{LOCAL_LLM_SETTINGS.active}"
+    current_llm_name = cloud_llm_name if (api_key and llm_mode != "local") else f"local:{LOCAL_LLM_SETTINGS.active}"
 
     # Init Dialogue Manager
     try:
