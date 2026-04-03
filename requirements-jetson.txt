@@ -7,17 +7,18 @@
 # NVIDIA ships Jetson-specific torch wheels via the Jetson AI Lab index.
 # Run this file with the .venv pip AFTER uv sync:
 #
-#   .venv/bin/pip install -r requirements-jetson.txt --extra-index-url https://pypi.jetson-ai-lab.dev/simple/
+#   uv pip install -r requirements-jetson.txt
 #
 # This replaces only the CUDA compute stack — all other deps from uv sync remain.
 
---extra-index-url https://pypi.jetson-ai-lab.dev/simple/
+--extra-index-url https://pypi.jetson-ai-lab.io/sbsa/cu130/+simple/
 
-# Core CUDA compute stack — Jetson-native builds
+# Core CUDA compute stack — sbsa/cu130 builds (ARM64 + CUDA 13.0)
+# jp6/cu12x indexes are for JetPack 6 devices; sbsa/cu130 is for Thor (CUDA 13.0, generic aarch64)
 torch
 torchaudio
 torchvision
 
-# onnxruntime — GPU build for Jetson (replaces CPU-only onnxruntime from uv sync)
-# Provides CUDA acceleration for Moonshine STT and Gemma intent classifier
-onnxruntime-gpu
+# onnxruntime-gpu has no aarch64 wheels on this index — keep the CPU onnxruntime
+# that uv sync installs. Moonshine STT and intent classifier still run on CUDA
+# via torch directly; only the ONNX fallback paths use onnxruntime.

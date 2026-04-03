@@ -208,7 +208,7 @@ Nova includes a built-in enrollment UI:
    **Jetson / aarch64 only** — replace the PyPI torch with NVIDIA's Jetson-native build to fix cuBLAS incompatibilities:
 
    ```bash
-   .venv/bin/pip install -r requirements-jetson.txt --extra-index-url https://pypi.jetson-ai-lab.dev/simple/
+   uv pip install -r requirements-jetson.txt
    ```
 
 6. **Optional: Record a voice reference** for Faster Qwen3-TTS (see `nova/backend/voices/SETUP.md`):
