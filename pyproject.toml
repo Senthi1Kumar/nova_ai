@@ -69,31 +69,14 @@ name = "ort-nightly"
 url = "https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/ORT-Nightly/pypi/simple/"
 explicit = true
 
-[[tool.uv.index]]
-name = "jetson-sbsa-cu130"
-url = "https://pypi.jetson-ai-lab.io/sbsa/cu130"
-explicit = true
-
 [tool.uv.sources]
 pocket-tts = { path = "pocket-tts" }
 microwakeword = { path = "nova/backend/kws/micro-wake-word" }
 onnxruntime-gpu = { index = "ort-nightly", marker = "platform_machine == 'x86_64'" }
-torch = [
-  { index = "pytorch-cu130",     marker = "platform_machine == 'x86_64'" },
-  { index = "jetson-sbsa-cu130", marker = "platform_machine == 'aarch64'" },
-]
-torchvision = [
-  { index = "pytorch-cu130",     marker = "platform_machine == 'x86_64'" },
-  { index = "jetson-sbsa-cu130", marker = "platform_machine == 'aarch64'" },
-]
-torchaudio = [
-  { index = "pytorch-cu130",     marker = "platform_machine == 'x86_64'" },
-  { index = "jetson-sbsa-cu130", marker = "platform_machine == 'aarch64'" },
-]
-torchcodec = [
-  { index = "pytorch-cu130",     marker = "platform_machine == 'x86_64'" },
-  { index = "jetson-sbsa-cu130", marker = "platform_machine == 'aarch64'" },
-]
+torch = { index = "pytorch-cu130", marker = "platform_machine == 'x86_64'" }
+torchvision = { index = "pytorch-cu130", marker = "platform_machine == 'x86_64'" }
+torchaudio = { index = "pytorch-cu130", marker = "platform_machine == 'x86_64'" }
+torchcodec = { index = "pytorch-cu130", marker = "platform_machine == 'x86_64'" }
 transformers = { git = "https://github.com/huggingface/transformers.git" }  # Incompatible with faster-qwen3-tts due to qwen-tts<=0.1.1
 
 [dependency-groups]
