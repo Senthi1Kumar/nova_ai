@@ -225,7 +225,7 @@ def clean_for_tts(text: str) -> str:
     text = text.replace("<think>", "").replace("</think>", "")
     # Strip "Nova, ..." self-addressing prefix — small models ignore the identity prompt rule
     text = re.sub(r'^Nova,?\s+', '', text, flags=re.IGNORECASE)
-    text = re.sub(r'(?<=\.\s{1,2})Nova,?\s+', '', text, flags=re.IGNORECASE)
+    text = re.sub(r'(\.\s{1,2})Nova,?\s+', r'\1', text, flags=re.IGNORECASE)
     # Remove markdown links: [text](url) → text
     text = re.sub(r'\[([^\]]*)\]\([^)]*\)', r'\1', text)
     # Remove bare URLs
@@ -942,6 +942,7 @@ def run_llm_worker(llm_in_queue: "mp.Queue[dict]", tts_in_queue: "mp.Queue[dict]
                 ws_out_queue.put({"type": "recording_stopped"})
                 continue
 
+            dm_response = None
             if dm:
                 safe_transcript = transcript if transcript else "voice verification audio"
 
@@ -1049,6 +1050,19 @@ def run_llm_worker(llm_in_queue: "mp.Queue[dict]", tts_in_queue: "mp.Queue[dict]
                     tts_in_queue.put({"type": "eof"})
                     logger.info("Sent text_to_speak + eof to TTS queue")
 
+                    # Drain intent_queue (compound intents stashed by DialogueManager).
+                    # speaking_done() is only called inside generate_response() so we
+                    # must call it explicitly here on the fast (non-LLM) path.
+                    if dm:
+                        next_q = dm.speaking_done()
+                        if next_q:
+                            logger.info(f"DM speaking_done returned queued response: intent={next_q.get('intent')}")
+                            if next_q.get("intent") == "general_question" and next_q.get("original_text"):
+                                generate_response(str(next_q["original_text"]))
+                                continue  # generate_response handles its own TTS+eof
+                            tts_in_queue.put({"type": "text_to_speak", "text": next_q["nova_says"]})
+                            tts_in_queue.put({"type": "eof"})
+
                     # Multi-turn DM states (slot fill, verification, OTP) don't need
                     # special handling — generation_done will restart auto-listen.
                     # NOTE: Previously sent ptt_started here, but ws_queue_reader
@@ -1056,7 +1070,7 @@ def run_llm_worker(llm_in_queue: "mp.Queue[dict]", tts_in_queue: "mp.Queue[dict]
                     continue
 
             # General question -> LLM (query router decides local vs cloud)
-            dm_intent = dm_response.get("intent") if dm else None
+            dm_intent = dm_response.get("intent") if dm_response else None
             logger.info(f"Routing to LLM: '{transcript[:80] if transcript else ''}'")
             generate_response(transcript or "", dm_intent=dm_intent)
 
