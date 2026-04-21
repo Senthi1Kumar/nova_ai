@@ -7,8 +7,10 @@ Nova is a high-performance, low-latency voice AI assistant designed for EV dashb
 - **Multiprocessing Pipeline**: STT, LLM, TTS, and KWS run as separate processes communicating via `mp.Queue`, each with its own GPU allocation. No GIL contention.
 - **Always Listening (KWS)**: MicroWakeWord TFLite engine (`micro-wake-word` submodule) trained on synthetic Nova utterances. Supports versioned model snapshots with rollback. Legacy Google Speech Embeddings + MLP engine available via `NOVA_KWS_ENGINE=v2`.
 - **Hybrid Interaction**: Hands-free wake-word activation ("Nova") and manual Push-to-Talk (PTT) via WebRTC or WebSocket.
-- **Streaming STT**: Moonshine with built-in VAD — starts transcribing while the user is still speaking. Default: fine-tuned Indian English base model (`in_en`). Switchable to Tiny/Small/Medium streaming variants from the settings menu.
-- **Tool-Calling LLM**: OpenRouter API (Nemotron 49B, Qwen3.5, Gemini Flash) with streaming tool calls. Web search via [Serper API](https://serper.dev/) (Google Search) returns actual news snippets and search results. Falls back to local Liquid AI LFM2.5-350M when offline.
+- **Streaming STT (pluggable backend)**: Two backends selectable at runtime via `NOVA_STT_VARIANT`:
+  - **Moonshine** (default `small`) with Silero VAD — Tiny/Small/Medium streaming variants.
+  - **Kyutai STT 1B en/fr** with **built-in semantic VAD** (EMA over the model's 2s-pause head) — replaces pause-based VAD with a learned end-of-turn signal.
+- **Tool-Calling LLM**: OpenRouter API (Gemma, Qwen3.5, Gemini Flash) with streaming tool calls. Web search via [Serper API](https://serper.dev/) (Google Search) returns actual news snippets and search results. Falls back to local Liquid AI LFM2.5-350M when offline. Inline tool-call syntax leaked as plain text is filtered before TTS.
 - **Personalized VAD (pVAD)**: ECAPA-TDNN speaker gate runs in a parallel process on a 1s rolling window. FSM transitions are suppressed when a non-primary speaker is detected. Fail-open: no voiceprint = always pass. Hysteresis prevents chattering on room noise.
 - **Neural TTS**: Pocket-TTS with multiple voice options (default, low VRAM). Optional: FasterQwen3TTS with CUDA graph acceleration (12 kHz output, resampled to 24 kHz) for higher quality and voice cloning.
 - **Layer 7 Dialogue Manager**: Intent classification (Gemma-300M semantic embeddings), payment flow with voice verification (ECAPA-TDNN voiceprint → PIN → Face ID), OTP, and mock commerce.
@@ -22,9 +24,9 @@ Nova is a high-performance, low-latency voice AI assistant designed for EV dashb
 | Component | Technology | Details |
 | :--- | :--- | :--- |
 | **Gateway** | **FastAPI + FastRTC** | WebRTC (SDP) + WebSocket PCM streaming, FSM state machine, echo suppression |
-| **STT** | **Moonshine (fine-tuned Indian EN)** | Streaming + non-streaming variants. Default: `pavandheeraj05/moonshine-nova-indian-english`. Switchable via UI. |
+| **STT** | **Moonshine / Kyutai STT 1B** | Two backends behind one worker contract. Moonshine streaming (Tiny/Small/Medium) or Kyutai 1B en/fr with semantic VAD. Switchable via UI / `NOVA_STT_VARIANT`. |
 | **Storage** | **PostgreSQL + asyncpg** | Session + turn history: intent, entities, latency, FSM state per turn |
-| **LLM** | **OpenRouter (Nemotron 49B)** | Streaming tool calls, web search, local LFM2.5-350M fallback |
+| **LLM** | **OpenRouter (Gemma)** | Streaming tool calls, web search, local LFM2.5-350M fallback |
 | **pVAD** | **ECAPA-TDNN (SpeechBrain)** | Parallel speaker gate — suppresses FSM transitions for non-primary speakers. Env: `NOVA_PVAD_*` |
 | **TTS** | **Pocket-TTS** | Default engine (low VRAM). Optional: [FasterQwen3TTS](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-0.6B-Base) (CUDA graphs) |
 | **KWS** | **MicroWakeWord (TFLite)** | Custom-trained TFLite wake-word model. Versioned snapshots. Legacy MLP engine via `NOVA_KWS_ENGINE=v2` |
@@ -153,6 +155,11 @@ Nova includes a built-in enrollment UI:
    #   NOVA_PVAD_THRESHOLD  — cosine similarity cutoff (default: 0.58)
    #   NOVA_PVAD_HYSTERESIS — windows before gate state changes (default: 2)
    #   NOVA_PVAD_ENERGY     — RMS floor below which gate stays open (default: 0.035)
+   #
+   # Optional STT backend selection:
+   #   NOVA_STT_VARIANT              — "small" (default Moonshine) | "tiny" | "medium" | "kyutai_stt_1b_en_fr"
+   #   NOVA_KYUTAI_EMA_THRESH        — semantic VAD EMA threshold (default: 0.7)
+   #   NOVA_KYUTAI_NO_SPEECH_TIMEOUT — Kyutai no-speech failsafe in seconds (default: 2.5)
    ```
 
 3. **Set up PostgreSQL** (conversation storage):
@@ -239,6 +246,7 @@ nova/
 │   ├── main.py                  # FastAPI gateway, FSM, WebRTC/WS
 │   ├── pipeline_mp/             # Multiprocessing workers
 │   │   ├── stt_moonshine_worker.py   # Moonshine streaming STT
+│   │   ├── stt_kyutai_worker.py      # Kyutai STT 1B (semantic VAD)
 │   │   ├── llm_worker.py             # OpenRouter + local fallback LLM
 │   │   ├── tts_worker.py             # FasterQwen3TTS + Pocket-TTS
 │   │   └── kws_worker.py             # Wake-word detection worker
