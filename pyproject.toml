@@ -20,9 +20,9 @@ dependencies = [
     "onnxruntime-gpu; platform_machine == 'x86_64'",
     "onnxruntime; platform_machine == 'aarch64'",
     "pyaudio",
-    "torch",
-    "torchvision",
-    "torchaudio",
+    "torch<2.10",
+    "torchvision<0.25",
+    "torchaudio<2.10",
     "torchcodec",
     "coloredlogs",
     "flatbuffers",
@@ -51,6 +51,10 @@ dependencies = [
     "microwakeword",
     # "faster-qwen3-tts>=0.2.5",
     "mmap-ninja>=0.8.2",
+    "msgpack",
+    "moshi>=0.2.13",
+    "sphn",
+    "julius",
 ]
 
 [tool.uv]
@@ -77,7 +81,8 @@ torch = { index = "pytorch-cu130", marker = "platform_machine == 'x86_64'" }
 torchvision = { index = "pytorch-cu130", marker = "platform_machine == 'x86_64'" }
 torchaudio = { index = "pytorch-cu130", marker = "platform_machine == 'x86_64'" }
 torchcodec = { index = "pytorch-cu130", marker = "platform_machine == 'x86_64'" }
-transformers = { git = "https://github.com/huggingface/transformers.git" }  # Incompatible with faster-qwen3-tts due to qwen-tts<=0.1.1
+# transformers pinned to PyPI release — moshi requires huggingface-hub<1.0,
+# which is incompatible with transformers git HEAD (needs hub>=1.5).
 
 [dependency-groups]
 dev = [

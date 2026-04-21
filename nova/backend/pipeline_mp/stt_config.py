@@ -1,16 +1,25 @@
 """
-STT configuration — Moonshine model variant registry.
+STT configuration — variant registry across backends.
 
-Supports both moonshine_voice (model_arch_name) and HF Transformers (model_id).
+Supports three worker paths:
+  - moonshine_voice    (model_arch_name)  — streaming Moonshine
+  - HF Transformers    (model_id)         — Moonshine fine-tunes
+  - Kyutai moshi       (kyutai_hf_repo)   — mimi + LMGen, optional semantic VAD
+
 Add entries to STT_VARIANT_REGISTRY to support additional variants.
-Change STT_SETTINGS.active to switch the default.
+Change STT_SETTINGS.active to switch the default (or set NOVA_STT_VARIANT env).
 """
 
 from __future__ import annotations
+
+import os
+from typing import Literal
+
 from pydantic import BaseModel
 
 
 class STTVariantConfig(BaseModel):
+    backend: Literal["moonshine", "kyutai"] = "moonshine"
     model_arch_name: str = ""   # ModelArch enum name for moonshine_voice (e.g. "SMALL_STREAMING")
     model_id: str = ""          # HuggingFace model ID for Transformers-based worker
     display_name: str
@@ -20,6 +29,9 @@ class STTVariantConfig(BaseModel):
     vad_threshold: float = 0.2
     is_streaming: bool = True   # True for MoonshineStreaming*, False for base Moonshine
     processor_id: str = ""      # Override processor source (defaults to model_id if empty)
+    # Kyutai-specific:
+    kyutai_hf_repo: str = ""                 # e.g. "kyutai/stt-1b-en_fr"
+    kyutai_use_semantic_vad: bool = False    # True when the repo ships VAD heads (prs[2])
 
 
 STT_VARIANT_REGISTRY: dict[str, STTVariantConfig] = {
@@ -52,6 +64,22 @@ STT_VARIANT_REGISTRY: dict[str, STTVariantConfig] = {
         rtf_target=0.1,
         is_streaming=False,
     ),
+    "kyutai_stt_1b_en_fr": STTVariantConfig(
+        backend="kyutai",
+        kyutai_hf_repo="kyutai/stt-1b-en_fr-candle",  # candle variant ships VAD heads usable from PyTorch LMGen
+        display_name="Kyutai STT 1B en/fr (semantic VAD)",
+        vram_mb=2500,
+        rtf_target=0.12,
+        kyutai_use_semantic_vad=True,
+    ),
+    "kyutai_stt_2_6b_en": STTVariantConfig(
+        backend="kyutai",
+        kyutai_hf_repo="kyutai/stt-2.6b-en",
+        display_name="Kyutai STT 2.6B en (no built-in VAD)",
+        vram_mb=5500,
+        rtf_target=0.20,
+        kyutai_use_semantic_vad=False,
+    ),
 }
 
 
@@ -68,5 +96,7 @@ class STTSettings(BaseModel):
         return STT_VARIANT_REGISTRY[self.active]
 
 
-# Single shared settings instance — import this wherever needed
-STT_SETTINGS = STTSettings()
+_env_variant = os.getenv("NOVA_STT_VARIANT")
+STT_SETTINGS = STTSettings(
+    active=_env_variant if _env_variant in STT_VARIANT_REGISTRY else "small"
+)
