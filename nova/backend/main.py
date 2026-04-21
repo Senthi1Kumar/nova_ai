@@ -395,6 +395,36 @@ async def ws_queue_reader():
                     pipeline_state["pvad_score"] = msg.get("score", 1.0)
                     logger.debug(f"pVAD gate={'OPEN' if pipeline_state['pvad_pass'] else 'CLOSED'} score={pipeline_state['pvad_score']:.3f}")
 
+                elif msg_type == "pvad_voice_detected":
+                    # Continuous barge-in path: driver voice confirmed mid-TTS.
+                    # Mirrors Kyutai Unmute's VAD-based interruption (but using our
+                    # speaker-gated signal, so strangers can't interrupt).
+                    if os.environ.get("NOVA_PVAD_BARGEIN_ENABLED", "1") != "1":
+                        continue
+                    if pipeline_state["fsm_state"] != "GENERATING":
+                        continue
+                    if pipeline_state["_tts_start_time"] == 0.0:
+                        continue  # TTS audio not yet playing — nothing to interrupt
+                    guard_sec = float(os.environ.get("NOVA_PVAD_BARGEIN_GUARD_SEC", "1.5"))
+                    if time.time() - pipeline_state["_tts_start_time"] < guard_sec:
+                        continue  # within guard window — let AEC settle
+
+                    score = msg.get("score", 0.0)
+                    logger.info(f"pVAD barge-in: driver voice detected during TTS (score={score:.3f})")
+                    pipeline_state["tts_interrupt_event"].set()
+                    for h in list(active_rtc_handlers):
+                        h.audio_queue = asyncio.Queue()
+                    pipeline_state["_tts_pending_samples"] = 0
+                    pipeline_state["_tts_start_time"] = 0.0
+                    pipeline_state["_tts_total_samples"] = 0
+                    pipeline_state["_tts_last_chunk_time"] = 0.0
+                    pipeline_state["tts_suppress_until"] = 0.0
+                    pipeline_state["stt_in_queue"].put({"type": "tts_unmute"})
+                    pipeline_state["fsm_state"] = "LISTENING"
+                    pipeline_state["e2e_start_time"] = time.time()
+                    pipeline_state["stt_in_queue"].put({"type": "start"})
+                    pipeline_state["kws_in_queue"].put({"type": "set_state", "state": "LISTENING"})
+
                 elif msg.get("type") == "llm_token":
                     # Reset watchdog: LLM is alive, not stuck
                     global _last_llm_activity
@@ -592,10 +622,6 @@ class NovaRTCHandler(AsyncStreamHandler):
         self.audio_queue = asyncio.Queue()
 
     async def receive(self, frame: tuple[int, np.ndarray]):
-        # Echo suppression: suppress mic input until TTS audio finishes playing in browser.
-        # tts_suppress_until is set to: last_chunk_time + remaining_playback + 500ms reverb tail.
-        if time.time() < pipeline_state["tts_suppress_until"]:
-            return
         sr, audio_arr = frame
         # FastRTC delivers audio. If it's float [-1.0, 1.0], scale it safely to int16.
         if audio_arr.dtype in (np.float32, np.float64):
@@ -605,6 +631,20 @@ class NovaRTCHandler(AsyncStreamHandler):
         audio_bytes = audio_int16.flatten().tobytes()
         if not pipeline_state["kws_in_queue"]:
             return
+
+        # pVAD always receives audio — it's our barge-in detector during TTS
+        # and the speaker-gate + browser AEC reject residual TTS echo.
+        pvad_q = pipeline_state.get("pvad_in_queue")
+        if pvad_q is not None:
+            try:
+                pvad_q.put_nowait(audio_bytes)
+            except Exception:
+                pass
+
+        # Echo suppression: block mic audio from KWS/STT while TTS is playing.
+        if time.time() < pipeline_state["tts_suppress_until"]:
+            return
+
         state = pipeline_state["fsm_state"]
         if state in ("IDLE", "LOCKED"):
             pipeline_state["kws_in_queue"].put(audio_bytes)
@@ -907,23 +947,25 @@ async def websocket_endpoint(websocket: WebSocket):
             if "bytes" in data:
                 audio_bytes = data["bytes"]
 
-                # Echo suppression: block mic audio while TTS is playing in browser
+                # pVAD always receives audio — it's our barge-in detector during TTS
+                # and the speaker-gate + browser AEC reject residual TTS echo.
+                pvad_q = pipeline_state.get("pvad_in_queue")
+                if pvad_q is not None:
+                    try:
+                        pvad_q.put_nowait(audio_bytes)
+                    except Exception:
+                        pass
+
+                # Echo suppression: block mic audio from KWS/STT while TTS is playing.
                 if time.time() < pipeline_state["tts_suppress_until"]:
-                    pass  # pVAD also skipped — TTS echo would corrupt speaker scores
+                    pass
                 # If we are IDLE, feed KWS
                 elif pipeline_state["fsm_state"] == "IDLE":
                     if os.environ.get("NOVA_NO_KWS") == "1":
-                        pass # MicTranscriber handles VAD locally; ignore websocket audio bytes
+                        pass  # MicTranscriber handles VAD locally
                     else:
                         pipeline_state["kws_in_queue"].put(audio_bytes)
-                    # Feed pVAD only during real mic capture (not TTS echo)
-                    pvad_q = pipeline_state.get("pvad_in_queue")
-                    if pvad_q is not None:
-                        try:
-                            pvad_q.put_nowait(audio_bytes)
-                        except Exception:
-                            pass
-                # If we are in any active listening state, feed STT.
+                # Active listening states: feed STT.
                 # CONFIRM_PENDING, VERIFY, VERIFY_PIN, SLOT_FILL, OTP_PENDING all
                 # auto-start an STT session after TTS finishes — they need audio
                 # bytes routed here or the Moonshine transcriber times out.
@@ -932,21 +974,9 @@ async def websocket_endpoint(websocket: WebSocket):
                     "SLOT_FILL", "OTP_PENDING"
                 ):
                     pipeline_state["stt_in_queue"].put(audio_bytes)
-                    pvad_q = pipeline_state.get("pvad_in_queue")
-                    if pvad_q is not None:
-                        try:
-                            pvad_q.put_nowait(audio_bytes)
-                        except Exception:
-                            pass
                 # If GENERATING, still feed KWS to allow Wake Word Interruption!
                 elif pipeline_state["fsm_state"] == "GENERATING":
                     pipeline_state["kws_in_queue"].put(audio_bytes)
-                    pvad_q = pipeline_state.get("pvad_in_queue")
-                    if pvad_q is not None:
-                        try:
-                            pvad_q.put_nowait(audio_bytes)
-                        except Exception:
-                            pass
 
             elif "text" in data:
                 msg = json.loads(data["text"])
