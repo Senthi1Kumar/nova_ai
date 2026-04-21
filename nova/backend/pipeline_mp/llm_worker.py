@@ -77,7 +77,7 @@ TOOLS = [
 # Models that support tool/function calling via OpenRouter
 TOOL_CAPABLE_MODELS = {
     "qwen/qwen3.5-9b",
-    "nvidia/llama-3.3-nemotron-super-49b-v1.5",
+    "google/gemma-4-26b-a4b-it",
     "meta-llama/llama-3.1-8b-instruct",
     "google/gemini-2.5-flash",
 }
@@ -249,6 +249,10 @@ def clean_for_tts(text: str) -> str:
     # Strip search-result metadata that models sometimes echo verbatim
     text = re.sub(r'\bSource:\s*\S+.*', '', text, flags=re.IGNORECASE)
     text = re.sub(r'\bSnippet:\s*', '', text, flags=re.IGNORECASE)
+    # Drop leaked inline tool-call syntax emitted as plain text by some cloud models
+    # (e.g. "TOOLCALL name: web_search, arguments: {...}", "<tool_call>...</tool_call>")
+    if re.search(r'\bTOOL[_ ]?CALL\b|<\s*tool_call\b|"name"\s*:\s*"[\w_]+"\s*,\s*"arguments"', text, flags=re.IGNORECASE):
+        return ""
     # Strip email addresses
     text = re.sub(r'\S+@\S+\.\S+', '', text)
     # Collapse multiple spaces/newlines
@@ -296,7 +300,7 @@ def run_llm_worker(llm_in_queue: "mp.Queue[dict]", tts_in_queue: "mp.Queue[dict]
     local_key = None       # e.g. "lfm2.5-1.2b" — None means no local model loaded
 
     # Default cloud model (used when routing to OpenRouter)
-    cloud_llm_name = "nvidia/llama-3.3-nemotron-super-49b-v1.5"
+    cloud_llm_name = "google/gemma-4-26b-a4b-it"
     # Overall mode: "cloud", "local", or "auto" (query routing decides per-query)
     # NOVA_LLM_MODE=cloud  → skip local model entirely, all queries go to OpenRouter
     # NOVA_LLM_MODE=local  → never use cloud
@@ -496,6 +500,11 @@ def run_llm_worker(llm_in_queue: "mp.Queue[dict]", tts_in_queue: "mp.Queue[dict]
         tokens_count = 0
         # Accumulate tool calls from streaming deltas
         tool_calls_acc = {}  # index -> {id, name, arguments_parts}
+        # Some cloud models (e.g. nemotron-49b) emit tool-call syntax as plain text
+        # instead of via delta.tool_calls — mute TTS for the rest of the turn when seen.
+        inline_toolcall_re = re.compile(r'TOOL[_ ]?CALL|<\s*tool_call\b|"arguments"\s*:', re.IGNORECASE)
+        content_accum = ""
+        tts_suppressed = False
 
         for chunk in stream:
             if stop_event.is_set():
@@ -539,7 +548,12 @@ def run_llm_worker(llm_in_queue: "mp.Queue[dict]", tts_in_queue: "mp.Queue[dict]
                     is_thinking = True
                 if not is_thinking:
                     sentence_buffer += content
-                    if any(p in content for p in [".", "!", "?", "\n"]):
+                    content_accum += content
+                    if not tts_suppressed and inline_toolcall_re.search(content_accum):
+                        tts_suppressed = True
+                        sentence_buffer = ""
+                        logger.warning("Inline tool-call syntax detected in LLM text stream — suppressing TTS for this turn.")
+                    if not tts_suppressed and any(p in content for p in [".", "!", "?", "\n"]):
                         clean = clean_for_tts(sentence_buffer)
                         if clean:
                             tts_in_queue.put({"type": "text_to_speak", "text": clean})
@@ -548,7 +562,7 @@ def run_llm_worker(llm_in_queue: "mp.Queue[dict]", tts_in_queue: "mp.Queue[dict]
                     is_thinking = False
                     sentence_buffer = ""
 
-        if sentence_buffer and not stop_event.is_set():
+        if sentence_buffer and not stop_event.is_set() and not tts_suppressed:
             clean = clean_for_tts(sentence_buffer)
             if clean:
                 tts_in_queue.put({"type": "text_to_speak", "text": clean})
@@ -598,17 +612,25 @@ def run_llm_worker(llm_in_queue: "mp.Queue[dict]", tts_in_queue: "mp.Queue[dict]
         else:
             system_base = (
                 "You are Nova, an AI voice assistant built into an electric vehicle. "
-                "Your name is Nova. The person you are speaking WITH is the driver"
+                "The person you are speaking WITH is the driver"
                 + (f", whose name is {_driver_label}" if _driver_label else "")
                 + ". "
                 + _identity_rule + " "
-                "PERSONALITY: Helpful, concise, natural tone — like a knowledgeable co-driver, not a robot. "
-                "Never start responses with 'The system acknowledges...', 'Nova here', or similar preamble. "
-                "If the driver says 'Thank you', reply naturally: 'You're welcome!', 'No problem!', 'Glad to help!', etc. "
-                "Keep answers to 1-2 concise, conversational sentences. No lists, markdown, or formatting. "
+                "PERSONALITY & STYLE: You are a knowledgeable, non-servile co-driver. "
+                "Be brief and natural — write as a human would speak. "
+                "Don't be afraid to be a bit snarky or opinionated if appropriate, but always be helpful. "
+                "Use filler words like 'um', 'uh', or 'like' occasionally to feel more human. "
+                "Ask follow-up questions to keep the conversation going. "
+                "Everything is pronounced literally, so don't use markdown (e.g., *), emojis, or lists. "
+
+                "TRANSCRIPTION & ROBUSTNESS: User input comes from speech-to-text and may have errors. "
+                "If an input seems slightly nonsensical, prefer to guess the intended meaning rather than asking for clarification. "
+                "If the user's message ends abruptly, as if they have more to say, give a very short prompt to encourage them to continue. "
+
+                "SAFETY & CONSTRAINTS: "
                 "Vehicle controls are handled by dedicated hardware — do not simulate acting on them. "
                 "If asked about vehicle data you lack, say so honestly. Do not invent sensor readings. "
-                "If a question is outside your knowledge, simply say you are not sure."
+                "If asked about something you don't know, just say so."
             )
         if use_local and local_cfg and local_cfg.supports_tools:
             system_base += (
