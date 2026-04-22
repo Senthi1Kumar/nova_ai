@@ -36,6 +36,31 @@
             <p class="text-[10px] opacity-40 tracking-widest">EV VOICE ASSISTANT · v1.2</p>
         </div>
         <div class="flex items-center gap-6">
+            <div class="card rounded-lg px-3 py-1.5 flex items-center gap-4">
+                <p class="text-[9px] opacity-40 tracking-widest">MODELS</p>
+                <div class="flex gap-3 text-[9px] tracking-widest">
+                    <div>
+                        <span class="opacity-40">STT</span>
+                        <span id="model-pill-stt" class="ml-1 text-[#00ffcc]">—</span>
+                        <span id="model-pill-stt-badge" class="ml-1 text-[8px] px-1 rounded bg-yellow-400/20 text-yellow-300">on-device</span>
+                    </div>
+                    <div>
+                        <span class="opacity-40">LLM</span>
+                        <span id="model-pill-llm" class="ml-1 text-[#00ffcc]">—</span>
+                        <span id="model-pill-llm-badge" class="ml-1 text-[8px] px-1 rounded"></span>
+                    </div>
+                    <div>
+                        <span class="opacity-40">TTS</span>
+                        <span id="model-pill-tts" class="ml-1 text-[#00ffcc]">—</span>
+                        <span id="model-pill-tts-badge" class="ml-1 text-[8px] px-1 rounded bg-yellow-400/20 text-yellow-300">on-device</span>
+                    </div>
+                    <div>
+                        <span class="opacity-40">KWS</span>
+                        <span id="model-pill-kws" class="ml-1 text-[#00ffcc]">microWakeWord</span>
+                        <span id="model-pill-kws-badge" class="ml-1 text-[8px] px-1 rounded bg-yellow-400/20 text-yellow-300">on-device</span>
+                    </div>
+                </div>
+            </div>
             <div class="text-right">
                 <p class="text-[9px] opacity-40 tracking-widest">STATUS</p>
                 <p id="connection-status" class="text-red-500 font-bold text-sm tracking-widest">OFFLINE</p>
@@ -336,6 +361,7 @@
                                 <option value="small">Small (~400 MB)</option>
                                 <option value="medium">Medium (~800 MB)</option>
                                 <option value="kyutai_stt_1b_en_fr" selected>Kyutai STT 1B en/fr (semantic VAD)</option>
+                                <option value="qwen3_asr_0_6b">Qwen3-ASR 0.6B (multilingual)</option>
                             </select>
                         </div>
                     </div>
@@ -709,6 +735,25 @@
             case 'stt_variant_changed': {
                 const sel = document.getElementById('stt-variant-select');
                 if (sel && msg.data?.variant) sel.value = msg.data.variant;
+                updateModelPills();
+                break;
+            }
+
+            case 'llm_route': {
+                const pill = document.getElementById('model-pill-llm');
+                const badge = document.getElementById('model-pill-llm-badge');
+                if (pill && msg.data) {
+                    const backend = (msg.data.backend || '').toLowerCase();
+                    const model = msg.data.model || '';
+                    // Short-name the model: drop vendor prefix, drop long suffixes
+                    const shortName = model.split('/').pop().replace(/-(instruct|it|chat).*$/i, '');
+                    pill.textContent = shortName || 'LLM';
+                    if (badge) {
+                        badge.textContent = backend === 'cloud' ? 'cloud' : 'local';
+                        badge.className = 'ml-1 text-[8px] px-1 rounded ' +
+                            (backend === 'cloud' ? 'bg-[#00ffcc]/20 text-[#00ffcc]' : 'bg-yellow-400/20 text-yellow-300');
+                    }
+                }
                 break;
             }
 
@@ -742,6 +787,34 @@
     pttBtn.addEventListener('touchstart', (e) => { e.preventDefault(); sendPTT('start_ptt'); });
     pttBtn.addEventListener('touchend',   (e) => { e.preventDefault(); sendPTT('stop_ptt'); });
 
+    // ── Models Running header pills ─────────────────────────────────────────
+    function prettyLabel(sel) {
+        if (!sel) return '—';
+        const opt = sel.options[sel.selectedIndex];
+        if (!opt) return sel.value || '—';
+        // Strip trailing "(...)" annotations like size/VRAM/voice counts
+        return (opt.textContent || sel.value).replace(/\s*\([^)]*\)\s*$/, '').trim() || '—';
+    }
+    function updateModelPills() {
+        const sttPill = document.getElementById('model-pill-stt');
+        const llmPill = document.getElementById('model-pill-llm');
+        const ttsPill = document.getElementById('model-pill-tts');
+        if (sttPill) sttPill.textContent = prettyLabel(document.getElementById('stt-variant-select'));
+        if (llmPill) llmPill.textContent = prettyLabel(document.getElementById('llm-select'));
+        if (ttsPill) ttsPill.textContent = prettyLabel(document.getElementById('tts-engine-select'));
+    }
+
+    // ── STT info ────────────────────────────────────────────────────────────
+    async function loadSTTInfo() {
+        try {
+            const info = await (await fetch('/stt/info')).json();
+            const sel = document.getElementById('stt-variant-select');
+            if (sel && info.current_variant) sel.value = info.current_variant;
+        } catch (_) {}
+        updateModelPills();
+    }
+    loadSTTInfo();
+
     // ── TTS engine/voice management ─────────────────────────────────────────
     let ttsInfo = null;
 
@@ -752,6 +825,7 @@
             engineSel.value = ttsInfo.current_engine;
             populateVoices(ttsInfo.current_engine);
         } catch (_) {}
+        updateModelPills();
     }
 
     function populateVoices(engineId) {
@@ -785,6 +859,7 @@
         const voiceSel = document.getElementById('voice-select');
         if (voiceSel.value) sendUIEvent('change_voice', voiceSel.value);
         checkVramBudget();
+        updateModelPills();
     };
 
     document.getElementById('voice-select').onchange = (e) =>
@@ -793,10 +868,13 @@
     document.getElementById('llm-select').onchange = (e) => {
         sendUIEvent('change_llm', e.target.value);
         checkVramBudget();
+        updateModelPills();
     };
 
-    document.getElementById('stt-variant-select').onchange = (e) =>
+    document.getElementById('stt-variant-select').onchange = (e) => {
         sendUIEvent('change_stt_variant', e.target.value);
+        updateModelPills();
+    };
 
     loadTTSInfo();
 
@@ -835,6 +913,21 @@
 
             sel.value = llmInfo.current_llm;
         } catch (_) {}
+        updateModelPills();
+        // Seed the cloud/local badge before any query has run.
+        const badge = document.getElementById('model-pill-llm-badge');
+        if (badge && llmInfo) {
+            const cur = (llmInfo.current_llm || '').toLowerCase();
+            let backend;
+            if (cur === 'auto') backend = llmInfo.has_api_key ? 'auto' : 'local';
+            else if (cur.startsWith('local:')) backend = 'local';
+            else backend = 'cloud';
+            badge.textContent = backend;
+            badge.className = 'ml-1 text-[8px] px-1 rounded ' +
+                (backend === 'cloud' ? 'bg-[#00ffcc]/20 text-[#00ffcc]'
+                 : backend === 'local' ? 'bg-yellow-400/20 text-yellow-300'
+                 : 'bg-purple-400/20 text-purple-300');
+        }
     }
 
     function checkVramBudget() {
