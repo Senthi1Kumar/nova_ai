@@ -3,7 +3,7 @@
 	url = https://github.com/kyutai-labs/pocket-tts.git
 [submodule "nova/backend/nova-l7"]
 	path = nova/backend/nova-l7
-	url = https://github.com/dheerajbunny/nova-l7.git
+	url = https://github.com/Senthi1Kumar/nova-l7.git
 	branch = v1.1
 [submodule "nova/backend/kws/micro-wake-word"]
 	path = nova/backend/kws/micro-wake-word
