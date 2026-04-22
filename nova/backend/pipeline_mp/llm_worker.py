@@ -587,8 +587,10 @@ def run_llm_worker(llm_in_queue: "mp.Queue[dict]", tts_in_queue: "mp.Queue[dict]
 
         if use_cloud:
             logger.info(f"Query routed → CLOUD ({cloud_llm_name}): '{prompt[:50]}'")
+            ws_out_queue.put({"type": "llm_route", "data": {"backend": "cloud", "model": cloud_llm_name}})
         elif use_local:
             logger.info(f"Query routed → LOCAL ({local_key}): '{prompt[:50]}'")
+            ws_out_queue.put({"type": "llm_route", "data": {"backend": "local", "model": local_key}})
         else:
             logger.warning(f"No LLM backend available for query: '{prompt[:50]}'")
 
@@ -893,15 +895,22 @@ def run_llm_worker(llm_in_queue: "mp.Queue[dict]", tts_in_queue: "mp.Queue[dict]
         tts_in_queue.put({"type": "eof"})
 
         if dm:
-            next_response = dm.speaking_done()
-            if next_response:
+            # Drain all remaining queued intents so compound utterances don't
+            # leave items stuck until the user speaks again.
+            drained_any = False
+            while True:
+                next_response = dm.speaking_done()
+                if not next_response:
+                    break
+                drained_any = True
                 logger.info(f"DM speaking_done returned queued response: intent={next_response.get('intent')}")
                 if next_response.get("intent") == "general_question" and next_response.get("original_text"):
                     generate_response(str(next_response["original_text"]))
-                else:
-                    tts_in_queue.put({"type": "text_to_speak", "text": next_response["nova_says"]})
-                    tts_in_queue.put({"type": "eof"})
-            else:
+                    # generate_response handles its own drain loop — stop here.
+                    break
+                tts_in_queue.put({"type": "text_to_speak", "text": next_response["nova_says"]})
+                tts_in_queue.put({"type": "eof"})
+            if not drained_any:
                 logger.info("DM speaking_done: no queued response")
 
     # # User GPS location — Grounding Lite, disabled for now
@@ -1076,14 +1085,22 @@ def run_llm_worker(llm_in_queue: "mp.Queue[dict]", tts_in_queue: "mp.Queue[dict]
                     # speaking_done() is only called inside generate_response() so we
                     # must call it explicitly here on the fast (non-LLM) path.
                     if dm:
-                        next_q = dm.speaking_done()
-                        if next_q:
+                        # Drain the full intent_queue — compound utterances may
+                        # have stashed 2+ intents that all need to be spoken now.
+                        deferred_general = False
+                        while True:
+                            next_q = dm.speaking_done()
+                            if not next_q:
+                                break
                             logger.info(f"DM speaking_done returned queued response: intent={next_q.get('intent')}")
                             if next_q.get("intent") == "general_question" and next_q.get("original_text"):
                                 generate_response(str(next_q["original_text"]))
-                                continue  # generate_response handles its own TTS+eof
+                                deferred_general = True
+                                break  # generate_response handles its own drain
                             tts_in_queue.put({"type": "text_to_speak", "text": next_q["nova_says"]})
                             tts_in_queue.put({"type": "eof"})
+                        if deferred_general:
+                            continue
 
                     # Multi-turn DM states (slot fill, verification, OTP) don't need
                     # special handling — generation_done will restart auto-listen.

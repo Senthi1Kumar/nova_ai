@@ -29,10 +29,13 @@ def run_kws_worker(
 
     kws_engine_type = os.environ.get("NOVA_KWS_ENGINE", "micro")  # "micro" or "v2"
 
+    base_threshold = float(os.environ.get("NOVA_KWS_THRESHOLD", "0.55"))
+    generating_threshold = float(os.environ.get("NOVA_KWS_THRESHOLD_GENERATING", "0.70"))
+
     if kws_engine_type == "micro":
         from kws.micro_kws import MicroKWS
         kws_engine = MicroKWS(
-            threshold=float(os.environ.get("NOVA_KWS_THRESHOLD", "0.60")),
+            threshold=base_threshold,
             consecutive_triggers=int(os.environ.get("NOVA_KWS_CONSECUTIVE", "1")),
         )
         if not kws_engine.load_model():
@@ -80,7 +83,12 @@ def run_kws_worker(
                 ws_out_queue.put({"type": "kws_version_activated", "version": msg["version"], "success": success})
             elif msg.get("type") == "set_state":
                 state = msg.get("state", "IDLE")
-                # We can keep KWS unmuted even in GENERATING state to allow barge-in via Wake Word
+                # Raise threshold while Nova is speaking so its own TTS doesn't trigger KWS;
+                # keep KWS unmuted in GENERATING to allow barge-in via wake word.
+                if state == "GENERATING":
+                    kws_engine.threshold = generating_threshold
+                else:
+                    kws_engine.threshold = base_threshold
                 if state == "LISTENING":
                     kws_engine.mute()
                 else:
