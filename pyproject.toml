@@ -55,6 +55,15 @@ dependencies = [
     "moshi>=0.2.13",
     "sphn",
     "julius",
+    "kaldiio>=2.18.1",
+    "textgrid>=1.6.1",
+    "cn2an>=0.5.23",
+    "kaldi-native-fbank>=1.22.3",
+]
+
+[project.optional-dependencies]
+qwen3-asr = [
+    "qwen-asr",
 ]
 
 [tool.uv]
@@ -77,10 +86,10 @@ explicit = true
 pocket-tts = { path = "pocket-tts" }
 microwakeword = { path = "nova/backend/kws/micro-wake-word" }
 onnxruntime-gpu = { index = "ort-nightly", marker = "platform_machine == 'x86_64'" }
-torch = { index = "pytorch-cu130", marker = "platform_machine == 'x86_64'" }
-torchvision = { index = "pytorch-cu130", marker = "platform_machine == 'x86_64'" }
-torchaudio = { index = "pytorch-cu130", marker = "platform_machine == 'x86_64'" }
-torchcodec = { index = "pytorch-cu130", marker = "platform_machine == 'x86_64'" }
+torch = { index = "pytorch-cu130" }
+torchvision = { index = "pytorch-cu130" }
+torchaudio = { index = "pytorch-cu130" }
+torchcodec = { index = "pytorch-cu130" }
 # transformers pinned to PyPI release — moshi requires huggingface-hub<1.0,
 # which is incompatible with transformers git HEAD (needs hub>=1.5).
 
