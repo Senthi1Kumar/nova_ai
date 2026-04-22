@@ -19,7 +19,7 @@ from pydantic import BaseModel
 
 
 class STTVariantConfig(BaseModel):
-    backend: Literal["moonshine", "kyutai"] = "moonshine"
+    backend: Literal["moonshine", "kyutai", "qwen3"] = "moonshine"
     model_arch_name: str = ""   # ModelArch enum name for moonshine_voice (e.g. "SMALL_STREAMING")
     model_id: str = ""          # HuggingFace model ID for Transformers-based worker
     display_name: str
@@ -32,6 +32,8 @@ class STTVariantConfig(BaseModel):
     # Kyutai-specific:
     kyutai_hf_repo: str = ""                 # e.g. "kyutai/stt-1b-en_fr"
     kyutai_use_semantic_vad: bool = False    # True when the repo ships VAD heads (prs[2])
+    # Qwen3-ASR-specific:
+    qwen3_hf_repo: str = ""                  # e.g. "Qwen/Qwen3-ASR-0.6B"
 
 
 STT_VARIANT_REGISTRY: dict[str, STTVariantConfig] = {
@@ -79,6 +81,15 @@ STT_VARIANT_REGISTRY: dict[str, STTVariantConfig] = {
         vram_mb=5500,
         rtf_target=0.20,
         kyutai_use_semantic_vad=False,
+    ),
+    "qwen3_asr_0_6b": STTVariantConfig(
+        backend="qwen3",
+        qwen3_hf_repo="Qwen/Qwen3-ASR-0.6B",
+        display_name="Qwen3-ASR 0.6B (multilingual, VAD-gated streaming)",
+        vram_mb=2500,
+        rtf_target=0.20,
+        language="en",
+        is_streaming=False,
     ),
 }
 

@@ -178,6 +178,18 @@ def get_metrics():
     else:
         tts_display = f"Pocket-TTS ({current_voice})"
 
+    # Resolve current STT variant -> display name from the registry
+    try:
+        from pipeline_mp.stt_config import STT_VARIANT_REGISTRY
+        current_stt_variant = pipeline_state.get("current_stt_variant", "small")
+        stt_display = (
+            STT_VARIANT_REGISTRY[current_stt_variant].display_name
+            if current_stt_variant in STT_VARIANT_REGISTRY
+            else current_stt_variant
+        )
+    except Exception:
+        stt_display = pipeline_state.get("current_stt_variant", "STT")
+
     return {
         "cpu": cpu_usage,
         "ram": ram_usage,
@@ -186,7 +198,7 @@ def get_metrics():
         "gpu_util": round(gpu_util, 1),
         "tts_engine": current_tts_engine,
         "components": {
-            "stt": get_comp_info("stt", "Moonshine (Medium)", True),
+            "stt": get_comp_info("stt", stt_display, True),
             "llm": get_comp_info("llm", current_llm, not using_openrouter),
             "tts": get_comp_info("tts", tts_display, True),
             "kws": get_comp_info("kws", "MicroKWS", True),

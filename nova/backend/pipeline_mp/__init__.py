@@ -29,6 +29,8 @@ def run_stt_worker(
 
     if backend == "kyutai":
         from .stt_kyutai_worker import run_stt_worker as _run
+    elif backend == "qwen3":
+        from .stt_qwen3_worker import run_stt_worker as _run
     else:
         from .stt_moonshine_worker import run_stt_worker as _run
 
