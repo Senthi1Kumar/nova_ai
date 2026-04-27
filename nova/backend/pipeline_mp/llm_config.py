@@ -121,6 +121,7 @@ LOCAL_LLM_REGISTRY: dict[str, LocalLLMConfig] = {
 TTS_VRAM_ESTIMATES: dict[str, int] = {
     "faster-qwen3": 2750,     # FasterQwen3TTS 0.6B + CUDA graphs
     "pocket-tts": 150,        # small model, can also run on CPU
+    "kokoro": 330,            # Kokoro v1.0 ~82M params, 24 kHz native
 }
 
 # Baseline VRAM consumed by STT + KWS + CUDA runtime overhead

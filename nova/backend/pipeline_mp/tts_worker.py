@@ -101,11 +101,25 @@ def run_tts_worker(
     except ImportError:
         logger.info("Pocket-TTS not installed — engine unavailable.")
 
+    kokoro_available = False
+    try:
+        from kokoro import KPipeline  # noqa: F401
+        kokoro_available = True
+        logger.info("Kokoro TTS package available.")
+    except ImportError:
+        logger.info("Kokoro TTS not installed — engine unavailable.")
+
     # ── Mutable model state (only one engine loaded at a time) ────────────────
     qwen_model = None
     ref_audio  = None
     pocket_model  = None
     voice_catalog: dict = {}
+    kokoro_pipeline = None
+    # Kokoro voices: a*=US-en, b*=UK-en, e*=es, f*=fr, h*=hi, i*=it, j*=ja, p*=pt, z*=zh
+    _KOKORO_VOICE_LANG = {
+        "a": "a", "b": "b", "e": "e", "f": "f",
+        "h": "h", "i": "i", "j": "j", "p": "p", "z": "z",
+    }
 
     def _load_qwen():
         nonlocal qwen_model, ref_audio
@@ -194,9 +208,70 @@ def run_tts_worker(
         torch.cuda.empty_cache()
         logger.info("Pocket-TTS unloaded — VRAM freed.")
 
-    # ── Load ONLY the default engine (pocket-tts = low VRAM) ──────────────────
-    current_engine = "pocket-tts"
-    if pocket_available:
+    def _load_kokoro(lang_code: str = "a"):
+        """Load Kokoro KPipeline for the given language code.
+
+        Kokoro's pipeline is per-language; switching voice prefix may require
+        a fresh pipeline. We hold one at a time and reload on prefix mismatch.
+        """
+        nonlocal kokoro_pipeline
+        if not kokoro_available:
+            return
+        # Already loaded with the right lang? skip.
+        if kokoro_pipeline is not None and getattr(kokoro_pipeline, "lang_code", None) == lang_code:
+            return
+        if kokoro_pipeline is not None:
+            _unload_kokoro()
+        from kokoro import KPipeline
+        logger.info(f"Loading Kokoro TTS (lang={lang_code}) …")
+        ws_out_queue.put({"type": "engine_loading", "data": {"engine": "kokoro", "status": "loading"}})
+        try:
+            kokoro_pipeline = KPipeline(lang_code=lang_code)
+        except Exception as e:
+            logger.error(f"Kokoro load failed: {e}")
+            kokoro_pipeline = None
+            ws_out_queue.put({"type": "engine_loading", "data": {"engine": "kokoro", "status": "error", "error": str(e)}})
+            return
+        logger.info("Kokoro TTS loaded.")
+        ws_out_queue.put({"type": "engine_loading", "data": {"engine": "kokoro", "status": "ready"}})
+
+    def _unload_kokoro():
+        nonlocal kokoro_pipeline
+        if kokoro_pipeline is None:
+            return
+        try:
+            import torch
+            del kokoro_pipeline
+            kokoro_pipeline = None
+            torch.cuda.empty_cache()
+        except Exception:
+            kokoro_pipeline = None
+        logger.info("Kokoro TTS unloaded — VRAM freed.")
+
+    # ── Load default engine — kokoro preferred for low TTFT ───────────────────
+    import os as _os
+    _default_engine = _os.environ.get("NOVA_TTS_ENGINE", "kokoro").strip().lower()
+    current_engine = "pocket-tts"  # safe fallback
+    if _default_engine == "kokoro" and kokoro_available:
+        _load_kokoro(lang_code="a")  # default to American English
+        if kokoro_pipeline is not None:
+            current_engine = "kokoro"
+        elif pocket_available:
+            _load_pocket()
+            current_engine = "pocket-tts"
+    elif _default_engine == "faster-qwen3" and qwen_available:
+        _load_qwen()
+        current_engine = "faster-qwen3"
+    elif _default_engine == "pocket-tts" and pocket_available:
+        _load_pocket()
+        current_engine = "pocket-tts"
+    elif kokoro_available:
+        _load_kokoro(lang_code="a")
+        if kokoro_pipeline is not None:
+            current_engine = "kokoro"
+        elif pocket_available:
+            _load_pocket()
+    elif pocket_available:
         _load_pocket()
     elif qwen_available:
         _load_qwen()
@@ -208,12 +283,13 @@ def run_tts_worker(
 
     # Report available engines to gateway
     ws_out_queue.put({"type": "tts_engines_available", "data": {
+        "kokoro": kokoro_available,
         "faster-qwen3": qwen_available,
         "pocket-tts": pocket_available,
     }})
 
-    # main loop
-    current_voice = "alba"
+    # main loop — default voice depends on the current engine
+    current_voice = "af_heart" if current_engine == "kokoro" else "alba"
     _interrupt = tts_interrupt_event  # alias for readability
 
     while not stop_event.is_set():
@@ -235,14 +311,26 @@ def run_tts_worker(
                 continue
             if requested == "faster-qwen3" and qwen_available:
                 _unload_pocket()
+                _unload_kokoro()
                 _load_qwen()
                 current_engine = "faster-qwen3"
                 logger.info("Switched TTS engine → FasterQwen3TTS.")
             elif requested == "pocket-tts" and pocket_available:
                 _unload_qwen()
+                _unload_kokoro()
                 _load_pocket()
                 current_engine = "pocket-tts"
+                current_voice = "alba"
                 logger.info("Switched TTS engine → Pocket-TTS.")
+            elif requested == "kokoro" and kokoro_available:
+                _unload_pocket()
+                _unload_qwen()
+                _load_kokoro(lang_code=_KOKORO_VOICE_LANG.get(current_voice[:1], "a"))
+                if kokoro_pipeline is not None:
+                    current_engine = "kokoro"
+                    if not current_voice.startswith(("a", "b", "e", "f", "h", "i", "j", "p", "z")):
+                        current_voice = "af_heart"
+                    logger.info("Switched TTS engine → Kokoro.")
             else:
                 logger.warning(f"Cannot switch to '{requested}' — engine not available.")
             continue
@@ -338,6 +426,39 @@ def run_tts_worker(
                     if first_chunk:
                         ttfa      = time.time() - t0
                         chunk_dur = len(pcm_bytes) / 2 / 24000.0
+                        ws_out_queue.put({"type": "tts_metrics",
+                                          "data": {"ttfa": ttfa,
+                                                   "tts_rtf": ttfa / chunk_dur if chunk_dur else 0}})
+                        first_chunk = False
+
+                    ws_out_queue.put({"type": "audio_out", "bytes": pcm_bytes})
+
+            elif current_engine == "kokoro" and kokoro_pipeline is not None:
+                # ── Kokoro streaming (24 kHz native — no resample needed) ────
+                # KPipeline yields (graphemes, phonemes, audio_tensor) per chunk.
+                # Auto-reload pipeline if voice prefix demands a different lang.
+                want_lang = _KOKORO_VOICE_LANG.get(current_voice[:1], "a")
+                if getattr(kokoro_pipeline, "lang_code", None) != want_lang:
+                    _load_kokoro(lang_code=want_lang)
+                if kokoro_pipeline is None:
+                    logger.error("Kokoro pipeline unavailable after reload — skipping utterance.")
+                    continue
+                gen = kokoro_pipeline(text, voice=current_voice, speed=1.0)
+                for _gs, _ps, audio in gen:
+                    if stop_event.is_set() or (_interrupt and _interrupt.is_set()):
+                        break
+                    # audio is a torch.Tensor (float32, [-1, 1], 24 kHz mono)
+                    if hasattr(audio, "detach"):
+                        audio_np = audio.detach().cpu().numpy().astype(np.float32)
+                    else:
+                        audio_np = np.asarray(audio, dtype=np.float32)
+                    audio_np = np.clip(audio_np, -1.0, 1.0)
+                    audio_i16 = (audio_np * 32767).astype(np.int16)
+                    pcm_bytes = audio_i16.tobytes()
+
+                    if first_chunk:
+                        ttfa      = time.time() - t0
+                        chunk_dur = len(audio_np) / 24000.0
                         ws_out_queue.put({"type": "tts_metrics",
                                           "data": {"ttfa": ttfa,
                                                    "tts_rtf": ttfa / chunk_dur if chunk_dur else 0}})
