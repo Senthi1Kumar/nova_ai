@@ -64,11 +64,7 @@ dependencies = [
     "textgrid>=1.6.1",
     "cn2an>=0.5.23",
     "kaldi-native-fbank>=1.22.3",
-]
-
-[project.optional-dependencies]
-qwen3-asr = [
-    "qwen-asr",
+    "qwen-asr>=0.0.6",
 ]
 
 [tool.uv]
