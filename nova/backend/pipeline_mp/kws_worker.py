@@ -29,14 +29,14 @@ def run_kws_worker(
 
     kws_engine_type = os.environ.get("NOVA_KWS_ENGINE", "micro")  # "micro" or "v2"
 
-    base_threshold = float(os.environ.get("NOVA_KWS_THRESHOLD", "0.55"))
+    base_threshold = float(os.environ.get("NOVA_KWS_THRESHOLD", "0.65"))
     generating_threshold = float(os.environ.get("NOVA_KWS_THRESHOLD_GENERATING", "0.70"))
 
     if kws_engine_type == "micro":
         from kws.micro_kws import MicroKWS
         kws_engine = MicroKWS(
             threshold=base_threshold,
-            consecutive_triggers=int(os.environ.get("NOVA_KWS_CONSECUTIVE", "1")),
+            consecutive_triggers=int(os.environ.get("NOVA_KWS_CONSECUTIVE", "2")),
         )
         if not kws_engine.load_model():
             logger.warning("MicroKWS model not found. Place .tflite in kws/models/")
