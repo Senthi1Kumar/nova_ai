@@ -931,6 +931,17 @@ def run_llm_worker(llm_in_queue: "mp.Queue[dict]", tts_in_queue: "mp.Queue[dict]
                 tts_interrupt_event.set()
             if dm: dm.state.is_speaking = False
             continue
+
+        if msg.get("type") == "conversation_closed":
+            # Gateway dropped the WARM window — clear DM history/context so the
+            # next wake-word turn starts fresh instead of inheriting stale
+            # pronoun references, intent queue, or partial slot-fill state.
+            if dm and hasattr(dm, "end_conversation"):
+                try:
+                    dm.end_conversation(reason=msg.get("reason", ""))
+                except Exception as e:
+                    logger.warning(f"DM end_conversation failed: {e}")
+            continue
             
         if msg.get("type") == "change_llm":
             new_name = msg.get("data", current_llm_name)

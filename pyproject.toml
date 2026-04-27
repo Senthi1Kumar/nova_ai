@@ -48,6 +48,11 @@ dependencies = [
     "ai-edge-litert>=2.1.3",
     "webrtcvad>=2.0.10",
     "webrtcvad-wheels>=2.0.14",
+    # Barge-in during TTS: WebRTC AEC3 via livekit.rtc.apm + silero-vad on cleaned mic.
+    "livekit>=1.1.5",
+    "silero-vad>=5.1",
+    # Kokoro TTS — fast (sub-100 ms TTFT on GPU), 24 kHz native, ~330 MB VRAM.
+    "kokoro>=0.9.4",
     "microwakeword",
     # "faster-qwen3-tts>=0.2.5",
     "mmap-ninja>=0.8.2",

@@ -65,6 +65,10 @@
                 <p class="text-[9px] opacity-40 tracking-widest">STATUS</p>
                 <p id="connection-status" class="text-red-500 font-bold text-sm tracking-widest">OFFLINE</p>
             </div>
+            <div class="text-right">
+                <p class="text-[9px] opacity-40 tracking-widest">SESSION</p>
+                <p id="conversation-status" class="text-yellow-400 font-bold text-sm tracking-widest" title="Say 'Nova' to start a conversation">SAY &ldquo;NOVA&rdquo;</p>
+            </div>
             <div class="flex items-center gap-2">
                 <span class="text-[9px] opacity-40 tracking-widest">ALWAYS LISTENING</span>
                 <label class="relative inline-flex items-center cursor-pointer">
@@ -331,8 +335,11 @@
                             <select id="tts-engine-select" title="TTS Engine"
                                 class="w-full bg-black border border-[#00ffcc]/40 text-[#00ffcc]
                                        text-[10px] p-2 rounded outline-none tracking-wider">
-                                <option value="faster-qwen3" selected>FasterQwen3TTS</option>
+                                <!-- selected attribute removed: loadTTSInfo() syncs from /tts/info
+                                     so the env var (NOVA_TTS_ENGINE) wins, not the HTML default -->
+                                <option value="kokoro">Kokoro TTS</option>
                                 <option value="pocket-tts">Pocket-TTS</option>
+                                <option value="faster-qwen3">FasterQwen3TTS</option>
                             </select>
                         </div>
                         <div class="flex-1">
@@ -476,6 +483,56 @@
     }
     setUIState('idle');
 
+    // ── Conversation-session pill (WARM = auto-listen / COLD = wake word required)
+    let _sessionState = 'cold';
+    function setSessionWarm() {
+        if (_sessionState === 'warm') return;
+        _sessionState = 'warm';
+        const el = document.getElementById('conversation-status');
+        if (el) {
+            el.textContent = 'LISTENING';
+            el.className = 'text-[#00ffcc] font-bold text-sm tracking-widest';
+            el.title = 'Conversation open — just speak, no wake word needed';
+        }
+    }
+    function setSessionCold(reason) {
+        if (_sessionState === 'cold') return;
+        _sessionState = 'cold';
+        const el = document.getElementById('conversation-status');
+        if (el) {
+            el.textContent = 'SAY “NOVA”';
+            el.className = 'text-yellow-400 font-bold text-sm tracking-widest';
+            el.title = reason ? `Conversation closed (${reason}). Wake word required.`
+                              : 'Say “Nova” to start a conversation';
+        }
+        playSessionChime();
+    }
+
+    // Short descending two-tone chime (WebAudio, no asset download).
+    // Plays when the WARM window expires so the driver knows a wake word is needed.
+    function playSessionChime() {
+        try {
+            const ctx = playbackCtx || new (window.AudioContext || window.webkitAudioContext)();
+            if (ctx.state === 'suspended') ctx.resume();
+            const now = ctx.currentTime;
+            const tones = [[880, 0.08], [660, 0.12]];
+            let t = now;
+            for (const [freq, dur] of tones) {
+                const osc = ctx.createOscillator();
+                const g = ctx.createGain();
+                osc.type = 'sine';
+                osc.frequency.value = freq;
+                g.gain.setValueAtTime(0.0001, t);
+                g.gain.exponentialRampToValueAtTime(0.15, t + 0.015);
+                g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+                osc.connect(g).connect(ctx.destination);
+                osc.start(t);
+                osc.stop(t + dur + 0.02);
+                t += dur;
+            }
+        } catch (_) { /* audio context unavailable — skip silently */ }
+    }
+
     // ── visualiser ────────────────────────────────────────────────────────────
     const canvas = document.getElementById('visualizer');
     const ctx    = canvas.getContext('2d');
@@ -589,10 +646,11 @@
                 document.getElementById('connection-status').textContent = 'ONLINE';
                 document.getElementById('connection-status').className = 'text-green-400 font-bold text-sm tracking-widest';
                 setUIState('idle');
-                sendUIEvent("change_tts_engine", document.getElementById('tts-engine-select').value);
-                sendUIEvent("change_voice", document.getElementById('voice-select').value);
-                sendUIEvent("change_llm", document.getElementById('llm-select').value);
-                // Don't send variant on connect — server reports active variant via stt_variants_available
+                // DO NOT push dropdown values on connect — backend is authoritative
+                // via NOVA_TTS_ENGINE / NOVA_LLM_MODE env vars, and loadTTSInfo() /
+                // loadLLMInfo() sync the dropdowns FROM /tts/info and /llm/info.
+                // Pushing on connect raced loadTTSInfo and silently overrode the env.
+                // Only send change_* events when the user actively changes a dropdown.
             };
 
             ws.onmessage = (event) => {
@@ -643,6 +701,11 @@
                 document.getElementById('kws-latency').textContent = `${msg.data.latency.toFixed(0)} ms`;
                 isRecordingUI = true;
                 setUIState('listening');
+                setSessionWarm();
+                break;
+
+            case 'conversation_closed':
+                setSessionCold(msg.reason || '');
                 break;
             case 'speech_started':
                 isRecordingUI = true;
@@ -694,6 +757,7 @@
 
             case 'generation_done':
                 setUIState('idle');
+                setSessionWarm();
                 break;
 
             case 'dm_state':

@@ -23,6 +23,9 @@ from dotenv import load_dotenv
 # Import our worker runners
 from pipeline_mp import run_stt_worker, run_kws_worker, run_llm_worker, run_tts_worker, run_pvad_worker
 
+# AEC-based barge-in (WebRTC APM + Silero VAD on cleaned mic)
+from pipeline_mp.aec_barge_in import AECBargeInDetector, is_enabled as _aec_enabled  # noqa: E402
+
 # Monkeypatch torchaudio for speechbrain compatibility
 import torchaudio
 if not hasattr(torchaudio, "list_audio_backends"):
@@ -53,8 +56,11 @@ pipeline_state = {
     "processes": {}, # Now a dict: component -> process
     "fsm_state": "IDLE",
     "current_llm": "auto",  # "auto" = query router decides local vs cloud per-query
-    "current_voice": "alba",
-    "current_tts_engine": "pocket-tts",  # default low-VRAM; "faster-qwen3" loaded on demand
+    # NOVA_TTS_ENGINE picks the default engine. Frontend reads /tts/info on load
+    # and syncs its dropdown to current_tts_engine, so flipping the env var
+    # actually takes effect end-to-end (not silently overridden by the UI).
+    "current_tts_engine": os.environ.get("NOVA_TTS_ENGINE", "kokoro").strip().lower(),
+    "current_voice": "alba" if os.environ.get("NOVA_TTS_ENGINE", "kokoro").strip().lower() == "pocket-tts" else "af_heart",
     # pVAD: personalized speaker gate (updated by pvad_worker every ~0.5s)
     "pvad_in_queue": None,
     "pvad_pass": True,    # True = primary driver speaking (fail-open)
@@ -71,6 +77,13 @@ pipeline_state = {
     "_tts_last_chunk_time": 0.0,
     # E2E latency: start timer on KWS/PTT, inject into tts_metrics
     "e2e_start_time": 0.0,
+    # Conversation session: "cold" = wake word required before next turn;
+    # "warm" = STT auto-listens after Nova finishes speaking. Set warm on
+    # generation_done, reverts to cold after N no-speech timeouts or
+    # CONVERSATION_IDLE_TIMEOUT_S since last user speech.
+    "conversation_state": "cold",
+    "consecutive_no_speech": 0,
+    "last_user_speech_at": 0.0,
 }
 
 # Enrollment status for progress tracking
@@ -277,6 +290,94 @@ _generating_since: float = 0.0
 _last_llm_activity: float = 0.0  # updated on every llm_token — resets watchdog
 _FSM_GENERATING_TIMEOUT = 60.0  # seconds of ZERO llm activity before watchdog fires
 
+# Conversation-session (WARM window between turns)
+# Nova stays WARM — STT auto-listens without requiring the wake word — for this
+# many consecutive STT no-speech timeouts, or this many seconds of user silence,
+# whichever trips first. After that the FSM drops back to COLD (IDLE) and the
+# user must say "Nova" again to re-open the conversation.
+_CONVERSATION_MAX_NO_SPEECH = int(os.environ.get("NOVA_CONVERSATION_MAX_NO_SPEECH", "2"))
+_CONVERSATION_IDLE_TIMEOUT_S = float(os.environ.get("NOVA_CONVERSATION_IDLE_TIMEOUT_S", "45.0"))
+
+# AEC barge-in detector (None if NOVA_AEC_ENABLED=0). Singleton — shared by
+# both mic intake paths (FastRTC handler + WebSocket /ws).
+# NOTE: instantiation here is cheap (just sets state to lazy-load on first use);
+# the actual livekit + Silero loads happen inside lifespan() so worker processes
+# spawned after this module re-imports DON'T pay the cost too.
+_aec_detector: AECBargeInDetector | None = AECBargeInDetector() if _aec_enabled() else None
+_AEC_GUARD_SEC = float(os.environ.get("NOVA_AEC_GUARD_SEC", "1.5"))  # skip first N sec of TTS to let AEC settle
+
+# Periodic diagnostic counter for AEC mic processing
+_aec_mic_calls = 0
+_aec_mic_log_every = int(os.environ.get("NOVA_AEC_LOG_EVERY", "50"))  # log every N mic chunks processed
+
+
+def _maybe_detect_barge_in(audio_bytes: bytes) -> None:
+    """Run AEC + VAD on a mic chunk during TTS playback. On detection, emit a
+    `pvad_voice_detected` event — the existing gateway handler performs the
+    full interrupt + re-listen transition.
+
+    Gated on: detector enabled, FSM=GENERATING, TTS audio actually playing,
+    and past the guard window (first N seconds of TTS where AEC is still
+    converging on the room's echo path).
+    """
+    global _aec_mic_calls
+    if _aec_detector is None:
+        return
+    if pipeline_state["fsm_state"] != "GENERATING":
+        return
+    if pipeline_state["_tts_start_time"] == 0.0:
+        return
+    if time.time() - pipeline_state["_tts_start_time"] < _AEC_GUARD_SEC:
+        return
+    try:
+        mic_i16 = np.frombuffer(audio_bytes, dtype=np.int16)
+        detected, prob = _aec_detector.process_mic(mic_i16)
+        _aec_mic_calls += 1
+        # Periodic visibility — proves mic IS reaching detector during TTS,
+        # and shows the prob distribution so we can tune threshold if needed.
+        if _aec_mic_calls % _aec_mic_log_every == 0:
+            logger.info(
+                f"AEC processing mic during TTS: chunks={_aec_mic_calls}, "
+                f"latest_prob={prob:.2f}, threshold={os.environ.get('NOVA_AEC_VAD_THRESHOLD', '0.6')}"
+            )
+        if detected:
+            logger.info(f"AEC barge-in: voice on cleaned mic (prob={prob:.2f})")
+            pipeline_state["ws_out_queue"].put({
+                "type": "pvad_voice_detected",
+                "score": prob,
+                "source": "aec",
+            })
+    except Exception as e:
+        logger.warning(f"AEC barge-in check failed: {e}")
+
+
+def _close_conversation(reason: str) -> None:
+    """Transition WARM → COLD: wake word required for next turn, DM history cleared.
+
+    Idempotent — calling this when already cold is a no-op.
+    """
+    if pipeline_state.get("conversation_state") != "warm":
+        return
+    pipeline_state["conversation_state"] = "cold"
+    pipeline_state["consecutive_no_speech"] = 0
+    pipeline_state["last_user_speech_at"] = 0.0
+    if _aec_detector is not None:
+        _aec_detector.reset()
+    global _aec_mic_calls
+    _aec_mic_calls = 0
+    logger.info(f"Conversation closed (reason={reason}) — next turn needs wake word.")
+    # Notify DM so it clears history/context (otherwise stale context persists
+    # until the existing 5-min CONTEXT_DECAY_SECONDS fires).
+    try:
+        pipeline_state["llm_in_queue"].put({"type": "conversation_closed", "reason": reason})
+    except Exception:
+        pass
+    # Surface to UI so the status pill / chime can reflect the state change.
+    try:
+        pipeline_state["ws_out_queue"].put({"type": "conversation_closed", "reason": reason})
+    except Exception:
+        pass
+
 async def _fsm_watchdog():
     """Periodically checks for FSM stuck in GENERATING with no LLM activity, and force-resets.
 
@@ -315,6 +416,22 @@ async def _fsm_watchdog():
         else:
             _generating_since = 0.0
 
+        # Hard idle cap on the WARM conversation window. Independent of the
+        # GENERATING watchdog above — fires when user has been silent for
+        # CONVERSATION_IDLE_TIMEOUT_S while Nova was auto-listening.
+        if (
+            pipeline_state.get("conversation_state") == "warm"
+            and pipeline_state["fsm_state"] in ("IDLE", "LISTENING")
+        ):
+            last_speech = pipeline_state.get("last_user_speech_at", 0.0)
+            if last_speech > 0 and (time.time() - last_speech) > _CONVERSATION_IDLE_TIMEOUT_S:
+                _close_conversation(
+                    f"idle_timeout (>{_CONVERSATION_IDLE_TIMEOUT_S:.0f}s since last speech)"
+                )
+                pipeline_state["fsm_state"] = "IDLE"
+                pipeline_state["kws_in_queue"].put({"type": "set_state", "state": "IDLE"})
+                pipeline_state["stt_in_queue"].put({"type": "stop"})
+
 
 async def ws_queue_reader():
     """Background task to read from ws_out_queue and broadcast to WebSockets."""
@@ -337,13 +454,13 @@ async def ws_queue_reader():
                         continue
 
                     if pipeline_state["fsm_state"] == "GENERATING":
-                        # Only allow barge-in once TTS audio is actually playing.
-                        # Before that, there's nothing to interrupt — the LLM is still
-                        # generating tokens and the user hears silence anyway.
-                        if pipeline_state["_tts_start_time"] == 0.0:
-                            logger.debug("KWS barge-in ignored (TTS not yet playing)")
-                            continue
-                        # Hard interrupt: stop TTS immediately, clear buffered audio
+                        # Hard interrupt — kills the LLM stream + TTS pipeline.
+                        # We always interrupt during GENERATING regardless of whether
+                        # TTS audio has started yet. The earlier "wait for TTS audio"
+                        # guard caused the user's first wake-word retry (during the
+                        # 1-2s LLM-thinking window) to be silently dropped, making
+                        # Nova feel unresponsive.
+                        logger.info("KWS barge-in during GENERATING — interrupting LLM/TTS.")
                         pipeline_state["tts_interrupt_event"].set()
                         for h in list(active_rtc_handlers):
                             h.audio_queue = asyncio.Queue()
@@ -351,14 +468,43 @@ async def ws_queue_reader():
                         pipeline_state["_tts_start_time"] = 0.0
                         pipeline_state["_tts_total_samples"] = 0
                         pipeline_state["_tts_last_chunk_time"] = 0.0
-                        pipeline_state["tts_suppress_until"] = 0.0
-                    # Always unmute STT before starting new session — delayed
-                    # unmute from generation_done may not have fired yet
-                    pipeline_state["stt_in_queue"].put({"type": "tts_unmute"})
-                    pipeline_state["fsm_state"] = "LISTENING"
-                    pipeline_state["e2e_start_time"] = time.time()
-                    pipeline_state["stt_in_queue"].put({"type": "start"})
-                    pipeline_state["kws_in_queue"].put({"type": "set_state", "state": "LISTENING"})
+                        # SHORT echo-suppression window after barge-in: TTS audio
+                        # buffered in the browser is still playing for ~0.6s after
+                        # we cut server-side. Without this, STT picks up Nova's
+                        # leftover speech as a new user turn ("The...", "Like..."),
+                        # causing an infinite Nova-talks-to-itself loop.
+                        pipeline_state["tts_suppress_until"] = time.time() + 0.6
+                        # Tell LLM worker to stop streaming right now
+                        try:
+                            pipeline_state["llm_in_queue"].put({"type": "interrupted"})
+                        except Exception:
+                            pass
+                        # Tell STT to drop any in-flight session (clears stale
+                        # silence/partial state from the prior turn)
+                        try:
+                            pipeline_state["stt_in_queue"].put({"type": "interrupted"})
+                        except Exception:
+                            pass
+                    # Schedule the fresh STT session AFTER the suppress window so
+                    # it doesn't capture Nova's tail audio as user speech.
+                    async def _start_stt_after_suppress():
+                        await asyncio.sleep(0.7)
+                        pipeline_state["stt_in_queue"].put({"type": "tts_unmute"})
+                        pipeline_state["stt_in_queue"].put({"type": "start"})
+                    if pipeline_state["fsm_state"] == "GENERATING":
+                        pipeline_state["fsm_state"] = "LISTENING"
+                        pipeline_state["e2e_start_time"] = time.time()
+                        pipeline_state["kws_in_queue"].put({"type": "set_state", "state": "LISTENING"})
+                        asyncio.ensure_future(_start_stt_after_suppress())
+                    else:
+                        pipeline_state["stt_in_queue"].put({"type": "tts_unmute"})
+                        pipeline_state["fsm_state"] = "LISTENING"
+                        pipeline_state["e2e_start_time"] = time.time()
+                        pipeline_state["stt_in_queue"].put({"type": "start"})
+                        pipeline_state["kws_in_queue"].put({"type": "set_state", "state": "LISTENING"})
+                    # New conversation starting via wake word — reset WARM counters.
+                    pipeline_state["consecutive_no_speech"] = 0
+                    pipeline_state["last_user_speech_at"] = time.time()
 
                 elif msg.get("type") == "ptt_started":
                     if pipeline_state["fsm_state"] == "GENERATING":
@@ -391,6 +537,10 @@ async def ws_queue_reader():
                     stt_ms = int(latency.get("stt_ttfb", 0) * 1000) or None
                     _pending_turn["user_text"] = msg.get("data")
                     _pending_turn["stt_latency_ms"] = stt_ms
+                    # Fresh user speech — reset no-speech counter + extend WARM window
+                    if (msg.get("data") or "").strip():
+                        pipeline_state["consecutive_no_speech"] = 0
+                        pipeline_state["last_user_speech_at"] = time.time()
 
                 elif msg.get("type") == "dm_state":
                     d = msg.get("data", {})
@@ -408,10 +558,14 @@ async def ws_queue_reader():
                     logger.debug(f"pVAD gate={'OPEN' if pipeline_state['pvad_pass'] else 'CLOSED'} score={pipeline_state['pvad_score']:.3f}")
 
                 elif msg_type == "pvad_voice_detected":
-                    # Continuous barge-in path: driver voice confirmed mid-TTS.
-                    # Mirrors Kyutai Unmute's VAD-based interruption (but using our
-                    # speaker-gated signal, so strangers can't interrupt).
-                    if os.environ.get("NOVA_PVAD_BARGEIN_ENABLED", "1") != "1":
+                    # Continuous barge-in path: voice confirmed mid-TTS.
+                    # Two sources can fire this:
+                    #   - pVAD: speaker-ECAPA-gated (source="pvad" or unset — legacy)
+                    #   - AEC: echo-cancelled mic + Silero VAD (source="aec")
+                    # Only the pVAD source is gated by NOVA_PVAD_BARGEIN_ENABLED;
+                    # AEC path has its own NOVA_AEC_ENABLED gate at the detector.
+                    source = msg.get("source", "pvad")
+                    if source == "pvad" and os.environ.get("NOVA_PVAD_BARGEIN_ENABLED", "1") != "1":
                         continue
                     if pipeline_state["fsm_state"] != "GENERATING":
                         continue
@@ -422,7 +576,7 @@ async def ws_queue_reader():
                         continue  # within guard window — let AEC settle
 
                     score = msg.get("score", 0.0)
-                    logger.info(f"pVAD barge-in: driver voice detected during TTS (score={score:.3f})")
+                    logger.info(f"Barge-in ({source}): voice detected during TTS (score={score:.3f})")
                     pipeline_state["tts_interrupt_event"].set()
                     for h in list(active_rtc_handlers):
                         h.audio_queue = asyncio.Queue()
@@ -518,16 +672,48 @@ async def ws_queue_reader():
 
                         if next_state not in ("IDLE", "LOCKED"):
                             pipeline_state["e2e_start_time"] = time.time()
+                            # Nova just finished speaking — open the WARM window so
+                            # the next user turn doesn't require a wake word.
+                            pipeline_state["conversation_state"] = "warm"
+                            pipeline_state["consecutive_no_speech"] = 0
+                            pipeline_state["last_user_speech_at"] = time.time()
                             asyncio.ensure_future(_delayed_unmute_and_restart(suppress_delay, True))
                         else:
                             asyncio.ensure_future(_delayed_unmute_and_restart(suppress_delay, False))
                             pipeline_state["stt_in_queue"].put({"type": "stop"})
+                            # Terminal FSM state — no follow-up turn; make sure we're cold.
+                            _close_conversation("generation_done_terminal")
 
                 elif msg.get("type") == "recording_stopped":
-                    # STT found nothing — return to IDLE/LISTENING.
-                    # Also escape if somehow stuck in GENERATING (e.g. empty transcript
-                    # was sent to LLM which never responded with generation_done).
+                    # STT found nothing — either keep the WARM window open for
+                    # another follow-up chance, or drop back to COLD (wake word).
                     if pipeline_state["fsm_state"] != "GENERATING":
+                        if (
+                            pipeline_state.get("conversation_state") == "warm"
+                            and os.environ.get("NOVA_NO_KWS") != "1"
+                        ):
+                            pipeline_state["consecutive_no_speech"] += 1
+                            last_speech = pipeline_state.get("last_user_speech_at", 0.0)
+                            idle_s = time.time() - last_speech if last_speech > 0 else 0.0
+                            within_budget = (
+                                pipeline_state["consecutive_no_speech"] < _CONVERSATION_MAX_NO_SPEECH
+                                and idle_s < _CONVERSATION_IDLE_TIMEOUT_S
+                            )
+                            if within_budget:
+                                # Extend the WARM window: re-arm STT for another try.
+                                logger.info(
+                                    f"Conversation WARM: no_speech={pipeline_state['consecutive_no_speech']}"
+                                    f"/{_CONVERSATION_MAX_NO_SPEECH}, idle={idle_s:.1f}s "
+                                    f"— re-arming STT for follow-up."
+                                )
+                                pipeline_state["fsm_state"] = "LISTENING"
+                                pipeline_state["kws_in_queue"].put({"type": "set_state", "state": "LISTENING"})
+                                pipeline_state["stt_in_queue"].put({"type": "start", "ptt": False})
+                                continue
+                            # Budget exhausted — fall through to COLD transition.
+                            _close_conversation(
+                                f"no_speech_budget (count={pipeline_state['consecutive_no_speech']}, idle={idle_s:.1f}s)"
+                            )
                         pipeline_state["kws_in_queue"].put({"type": "set_state", "state": "IDLE"})
                         if os.environ.get("NOVA_NO_KWS") == "1":
                             pipeline_state["fsm_state"] = "LISTENING"
@@ -553,6 +739,10 @@ async def ws_queue_reader():
                     if audio_bytes is None:
                         continue
                     audio_arr = np.frombuffer(audio_bytes, dtype=np.int16)
+                    # Feed TTS output into the AEC reference buffer so the
+                    # barge-in detector can subtract it from the mic signal.
+                    if _aec_detector is not None:
+                        _aec_detector.push_reference(audio_arr)
                     # Echo suppression: track total TTS duration and when it started.
                     # remaining_play = total_duration - elapsed_since_first_chunk (accurate even
                     # when generation_done fires mid-stream while browser is still playing).
@@ -653,6 +843,11 @@ class NovaRTCHandler(AsyncStreamHandler):
             except Exception:
                 pass
 
+        # AEC barge-in detection during TTS playback. Must run BEFORE the echo
+        # suppression gate below — otherwise we'd never see mic audio during
+        # TTS and could never detect the interrupt.
+        _maybe_detect_barge_in(audio_bytes)
+
         # Echo suppression: block mic audio from KWS/STT while TTS is playing.
         if time.time() < pipeline_state["tts_suppress_until"]:
             return
@@ -740,7 +935,20 @@ async def lifespan(app: FastAPI):
         p.start()
 
     logger.info("All Multi-Processing Workers Started.")
-    
+
+    # Eager-load the AEC barge-in detector ONCE in the gateway process
+    # (livekit FFI + Silero VAD + spaCy download). Worker processes that
+    # re-import this module will skip this block because they don't enter
+    # the FastAPI lifespan — preventing the 4× duplicate load we saw before.
+    if _aec_detector is not None:
+        try:
+            _np_w = np.zeros(int(0.1 * 24000), dtype=np.int16)
+            _aec_detector.push_reference(_np_w)
+            _det, _prob = _aec_detector.process_mic(np.zeros(int(0.5 * 16000), dtype=np.int16))
+            logger.info(f"AEC barge-in eager-load complete (warmup prob={_prob:.2f}).")
+        except Exception as _e:
+            logger.warning(f"AEC barge-in eager-load failed (non-fatal): {_e}")
+
     # Start the async reader (no reference kept — event loop holds it alive)
     asyncio.create_task(ws_queue_reader())
     asyncio.create_task(_fsm_watchdog())
@@ -849,6 +1057,29 @@ async def tts_info():
         "name": "Pocket-TTS",
         "vram_mb": TTS_VRAM_ESTIMATES.get("pocket-tts", 150),
         "voices": [{"id": v, "name": v.title()} for v in pocket_voices],
+    })
+
+    # Kokoro v1.0 voices — prefix denotes (lang)(gender):
+    #   af_/am_ = American English F/M, bf_/bm_ = British English F/M
+    # Curated set of the highest-quality voices per the model card.
+    kokoro_voices = [
+        ("af_heart", "Heart (US F)"),
+        ("af_bella", "Bella (US F)"),
+        ("af_sarah", "Sarah (US F)"),
+        ("af_nicole", "Nicole (US F)"),
+        ("am_michael", "Michael (US M)"),
+        ("am_adam", "Adam (US M)"),
+        ("am_fenrir", "Fenrir (US M)"),
+        ("bf_emma", "Emma (UK F)"),
+        ("bf_isabella", "Isabella (UK F)"),
+        ("bm_george", "George (UK M)"),
+        ("bm_lewis", "Lewis (UK M)"),
+    ]
+    engines.append({
+        "id": "kokoro",
+        "name": "Kokoro TTS",
+        "vram_mb": TTS_VRAM_ESTIMATES.get("kokoro", 330),
+        "voices": [{"id": v, "name": n} for v, n in kokoro_voices],
     })
 
     # GPU total VRAM for budget calculations
@@ -967,6 +1198,9 @@ async def websocket_endpoint(websocket: WebSocket):
                         pvad_q.put_nowait(audio_bytes)
                     except Exception:
                         pass
+
+                # AEC barge-in detection during TTS playback.
+                _maybe_detect_barge_in(audio_bytes)
 
                 # Echo suppression: block mic audio from KWS/STT while TTS is playing.
                 if time.time() < pipeline_state["tts_suppress_until"]:

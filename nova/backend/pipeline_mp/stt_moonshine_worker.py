@@ -170,7 +170,40 @@ def run_stt_worker(
     PTT_DRAIN_TIMEOUT = 3.0
     # Safety timeout: if KWS triggers but no speech is ever detected,
     # end the session after this many seconds to avoid hanging in LISTENING.
-    NO_SPEECH_TIMEOUT = 4.0
+    # Env-tunable so a noisy demo room can use 2 s "fast reject" instead of 4 s.
+    # 8s default — generous think-time after wake-word. Moonshine's internal
+    # end-of-line handles "user finished speaking"; this only fires when no
+    # speech ever arrives (KWS false-fire OR user said "Nova" then went silent).
+    NO_SPEECH_TIMEOUT = float(os.getenv("NOVA_MOONSHINE_NO_SPEECH_TIMEOUT", "8.0"))
+
+    # Smart-Turn v3 — optional semantic gate on Moonshine's on_line_completed.
+    # When the stream emits a finalized line, smart-turn decides: real end-of-turn,
+    # or a mid-thought pause? If pause → buffer the line and keep listening until
+    # smart-turn agrees (or the max-wait cap trips). Held lines are concatenated
+    # into a single transcript so the DM sees the full utterance as one intent.
+    from smart_turn import (  # noqa: E402
+        SmartTurnPredictor,
+        is_enabled as _smart_turn_enabled,
+        threshold as _smart_turn_threshold,
+    )
+    smart_turn = SmartTurnPredictor() if _smart_turn_enabled() else None
+    smart_turn_threshold = _smart_turn_threshold()
+    smart_turn_max_wait_s = max(
+        0.5, int(os.getenv("NOVA_SMART_TURN_MAX_WAIT_MS", "3000")) / 1000.0
+    )
+    if smart_turn is not None:
+        logger.info(
+            f"Moonshine: Smart-Turn v3 enabled (threshold={smart_turn_threshold:.2f}, "
+            f"max_wait={smart_turn_max_wait_s:.1f}s)"
+        )
+        # Eager warmup so the first finalize doesn't pay the ONNX load cost.
+        try:
+            smart_turn.predict(np.zeros(8000, dtype=np.float32))  # 0.5 s of zeros
+            logger.info("Moonshine: Smart-Turn v3 warmup complete.")
+        except Exception as _e:
+            logger.warning(f"Moonshine: Smart-Turn warmup failed (non-fatal): {_e}")
+    # Held lines + timer for the gate (accessed only from listener callback)
+    _held: dict = {"lines": [], "audio": [], "pending_since": 0.0}
 
     def _ensure_stream_started():
         if not state["stream_started"]:
@@ -189,6 +222,11 @@ def run_stt_worker(
         state["should_listen"] = False
         state["is_ptt"] = False
         state["ptt_stopping"] = False
+        # Drop any smart-turn held state so a stale hold from a prior session
+        # can't contaminate the next utterance.
+        _held["lines"].clear()
+        _held["audio"].clear()
+        _held["pending_since"] = 0.0
 
     class STTListener(TranscriptEventListener):
         def on_line_started(self, _event):
@@ -214,6 +252,47 @@ def run_stt_worker(
 
             speaker_info = f"[Speaker #{event.line.speaker_index}] " if event.line.has_speaker_id else ""
             logger.info(f"STT Final: {speaker_info}'{transcript}' | Latency: {latency_ms/1000.0:.2f}s | RTF: {rtf:.2f}")
+
+            # Smart-Turn gate: decide whether this completed line is really the
+            # end of the user's turn, or a mid-thought pause we should absorb.
+            if smart_turn is not None and transcript and not state["is_ptt"]:
+                # Accumulate audio from this line with anything previously held
+                line_audio = np.asarray(event.line.audio_data, dtype=np.float32) \
+                    if event.line.audio_data else np.zeros(0, dtype=np.float32)
+                concat_audio = (
+                    np.concatenate(_held["audio"] + [line_audio])
+                    if _held["audio"] else line_audio
+                )
+                prob = smart_turn.predict(concat_audio)
+                now_ts = time.time()
+                pending_since = _held["pending_since"] or now_ts
+                wait_elapsed = now_ts - pending_since if _held["pending_since"] else 0.0
+
+                if prob < smart_turn_threshold and wait_elapsed < smart_turn_max_wait_s:
+                    _held["lines"].append(transcript)
+                    if line_audio.size:
+                        _held["audio"].append(line_audio)
+                    if _held["pending_since"] == 0.0:
+                        _held["pending_since"] = now_ts
+                    logger.info(
+                        f"Moonshine: holding line (smart-turn={prob:.2f} < "
+                        f"{smart_turn_threshold:.2f}): '{transcript}'"
+                    )
+                    # Keep the session live so Moonshine continues streaming
+                    return
+
+                if _held["lines"]:
+                    transcript = " ".join(_held["lines"] + [transcript]).strip()
+                    if line_audio.size:
+                        _held["audio"].append(line_audio)
+                    reason = "timeout" if wait_elapsed >= smart_turn_max_wait_s else "confirmed"
+                    logger.info(
+                        f"Moonshine: releasing held utterance ({reason}, "
+                        f"smart-turn={prob:.2f}): '{transcript}'"
+                    )
+                _held["lines"].clear()
+                _held["audio"].clear()
+                _held["pending_since"] = 0.0
 
             ws_out_queue.put({
                 "type": "transcript",

@@ -176,7 +176,38 @@ def run_stt_worker(
         "session_start_time": 0.0,
     }
     PTT_DRAIN_TIMEOUT = 3.0
-    NO_SPEECH_TIMEOUT = float(os.getenv("NOVA_KYUTAI_NO_SPEECH_TIMEOUT", "2.5"))
+    # Kyutai's semantic-VAD end-of-turn handles the "stop listening when user
+    # finished speaking" case via EMA pause-prediction heads — that's the
+    # primary close mechanism. NO_SPEECH_TIMEOUT only fires when the user
+    # never speaks at all (KWS false-fired on noise OR user paused too long
+    # after wake-word before forming a sentence). 8s gives generous think-time.
+    NO_SPEECH_TIMEOUT = float(os.getenv("NOVA_KYUTAI_NO_SPEECH_TIMEOUT", "8.0"))
+
+    # Smart-Turn v3 — optional semantic gate on Kyutai's EMA end-of-turn.
+    # The EMA heads predict acoustic pause; smart-turn adds semantic completion.
+    # Stacking them: EMA fires → smart-turn confirms → finalize.
+    from smart_turn import (  # noqa: E402 (local import)
+        SmartTurnPredictor,
+        is_enabled as _smart_turn_enabled,
+        threshold as _smart_turn_threshold,
+    )
+    smart_turn = SmartTurnPredictor() if _smart_turn_enabled() else None
+    smart_turn_threshold = _smart_turn_threshold()
+    smart_turn_max_wait_s = max(
+        0.5, int(os.getenv("NOVA_SMART_TURN_MAX_WAIT_MS", "3000")) / 1000.0
+    )
+    if smart_turn is not None:
+        logger.info(
+            f"Kyutai: Smart-Turn v3 enabled (threshold={smart_turn_threshold:.2f}, "
+            f"max_wait={smart_turn_max_wait_s:.1f}s)"
+        )
+        # Eager warmup so the first finalize doesn't pay the ONNX load cost.
+        try:
+            import numpy as _np
+            smart_turn.predict(_np.zeros(int(0.5 * NOVA_SAMPLE_RATE), dtype=_np.float32))
+            logger.info("Kyutai: Smart-Turn v3 warmup complete.")
+        except Exception as _e:
+            logger.warning(f"Kyutai: Smart-Turn warmup failed (non-fatal): {_e}")
 
     # Shared between main thread and inference thread.
     audio_q: _queue.Queue = _queue.Queue(maxsize=256)   # np.float32 16kHz chunks
@@ -367,7 +398,45 @@ def run_stt_worker(
                 and steps >= N_STEPS_TO_WAIT
                 and ema_val > ema_threshold
             ):
-                logger.info(f"Kyutai semantic VAD fired end-of-turn (ema={ema_val:.2f}).")
+                # Smart-Turn gate: confirm semantic completion before finalizing.
+                if smart_turn is not None:
+                    with inf_lock:
+                        audio_for_st = (
+                            np.concatenate(inf_state["audio_buf"])
+                            if inf_state["audio_buf"]
+                            else np.zeros(0, dtype=np.float32)
+                        )
+                    prob = smart_turn.predict(audio_for_st)
+                    if prob < smart_turn_threshold:
+                        # User's still talking — hold, but enforce a max-wait cap
+                        # so long hesitation can't stall forever.
+                        now_ts = time.time()
+                        pending = inf_state.get("smart_turn_pending_since", 0.0)
+                        if pending == 0.0:
+                            inf_state["smart_turn_pending_since"] = now_ts
+                            logger.info(
+                                f"Kyutai: holding finalize "
+                                f"(ema={ema_val:.2f}, smart-turn={prob:.2f} < "
+                                f"{smart_turn_threshold:.2f})"
+                            )
+                            # Reset EMA so it has to rebuild before re-firing;
+                            # prevents per-frame re-entry into this branch.
+                            inf_state["ema"].reset(0.0)
+                            return
+                        if (now_ts - pending) < smart_turn_max_wait_s:
+                            inf_state["ema"].reset(0.0)
+                            return
+                        logger.info(
+                            f"Kyutai: smart-turn timeout ({smart_turn_max_wait_s:.1f}s) — forcing finalize."
+                        )
+                        inf_state["smart_turn_pending_since"] = 0.0
+                    else:
+                        inf_state["smart_turn_pending_since"] = 0.0
+                        logger.info(
+                            f"Kyutai end-of-turn (ema={ema_val:.2f}) [smart-turn={prob:.2f} ≥ {smart_turn_threshold:.2f}]."
+                        )
+                else:
+                    logger.info(f"Kyutai semantic VAD fired end-of-turn (ema={ema_val:.2f}).")
                 # Drain audio_delay_seconds of silence so the last text tokens
                 # (which lag audio by this much) emerge before we finalize.
                 silence_pad = torch.zeros((1, 1, frame_size), dtype=torch.float32, device=device)

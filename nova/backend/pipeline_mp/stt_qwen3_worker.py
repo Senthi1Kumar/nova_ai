@@ -115,6 +115,26 @@ def run_stt_worker(
     stability_ticks = max(1, int(os.getenv("NOVA_QWEN3_STABILITY_TICKS", "3")))
     max_new_tokens = int(os.getenv("NOVA_QWEN3_MAX_NEW_TOKENS", "256"))
 
+    # Smart-Turn v3 semantic end-of-turn — optional gate on finalize
+    from smart_turn import SmartTurnPredictor, is_enabled as _smart_turn_enabled, threshold as _smart_turn_threshold
+    smart_turn = SmartTurnPredictor() if _smart_turn_enabled() else None
+    smart_turn_threshold = _smart_turn_threshold()
+    smart_turn_max_wait_s = max(0.5, int(os.getenv("NOVA_SMART_TURN_MAX_WAIT_MS", "3000")) / 1000.0)
+    if smart_turn is not None:
+        logger.info(
+            f"Qwen3: Smart-Turn v3 enabled (threshold={smart_turn_threshold:.2f}, "
+            f"max_wait={smart_turn_max_wait_s:.1f}s)"
+        )
+        # Eager warmup: trigger ONNX session + WhisperFeatureExtractor load NOW
+        # instead of during the first finalize (~2 s saved on first user turn).
+        try:
+            import numpy as _np
+            _warmup_audio = _np.zeros(int(0.5 * NOVA_SAMPLE_RATE), dtype=_np.float32)
+            smart_turn.predict(_warmup_audio)
+            logger.info("Qwen3: Smart-Turn v3 warmup complete.")
+        except Exception as _e:
+            logger.warning(f"Qwen3: Smart-Turn warmup failed (non-fatal): {_e}")
+
     dtype_map = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}
     torch_dtype = dtype_map.get(dtype_name, torch.bfloat16)
 
@@ -238,12 +258,19 @@ def run_stt_worker(
     # same text. When webrtcvad stays "speech" on breath noise, this is what
     # actually triggers finalize.
     stable_partial_count = 0
+    # Smart-Turn pending finalize: set when silence threshold first trips but
+    # smart-turn says the speaker isn't done (hesitation). Reset on new speech.
+    smart_turn_pending_since = 0.0
 
-    NO_SPEECH_TIMEOUT = float(os.getenv("NOVA_QWEN3_NO_SPEECH_TIMEOUT", "2.5"))
+    # 8s default — generous think-time after wake-word. webrtcvad-based
+    # end-of-utterance handles "user finished speaking"; this only fires when
+    # NO speech ever arrives (KWS false-fire OR user said "Nova" then went silent).
+    NO_SPEECH_TIMEOUT = float(os.getenv("NOVA_QWEN3_NO_SPEECH_TIMEOUT", "8.0"))
 
     def _reset_utterance():
         nonlocal last_partial_time, last_partial_text, speech_started_emitted
         nonlocal silent_frame_count, speech_frame_count, stable_partial_count
+        nonlocal smart_turn_pending_since
         utter_f32.clear()
         utter_raw_f32.clear()
         utter_i16_tail.clear()
@@ -253,6 +280,7 @@ def run_stt_worker(
         silent_frame_count = 0
         speech_frame_count = 0
         stable_partial_count = 0
+        smart_turn_pending_since = 0.0
 
     def _end_session():
         state["session_active"] = False
@@ -368,10 +396,43 @@ def run_stt_worker(
                     and silent_frame_count >= end_silence_frames
                 ):
                     silence_ms = silent_frame_count * VAD_FRAME_MS
-                    logger.info(f"Qwen3: end-of-utterance ({silence_ms}ms silence, {silent_frame_count} frames).")
-                    _emit_final()
-                    _end_session()
-                    continue
+                    should_finalize = True
+                    if smart_turn is not None:
+                        # Ask the semantic classifier: is the speaker really done?
+                        prob = smart_turn.predict(
+                            np.concatenate(utter_raw_f32, dtype=np.float32)
+                            if utter_raw_f32 else np.zeros(0, dtype=np.float32)
+                        )
+                        if prob >= smart_turn_threshold:
+                            logger.info(
+                                f"Qwen3: end-of-utterance ({silence_ms}ms silence) "
+                                f"[smart-turn={prob:.2f} ≥ {smart_turn_threshold:.2f}]."
+                            )
+                            smart_turn_pending_since = 0.0
+                        else:
+                            # Model says speaker is still thinking — hold finalize,
+                            # but enforce a hard cap so hesitation can't stall forever.
+                            if smart_turn_pending_since == 0.0:
+                                smart_turn_pending_since = now
+                                logger.info(
+                                    f"Qwen3: holding finalize (smart-turn={prob:.2f} < "
+                                    f"{smart_turn_threshold:.2f}, silence={silence_ms}ms)"
+                                )
+                            if (now - smart_turn_pending_since) >= smart_turn_max_wait_s:
+                                logger.info(
+                                    f"Qwen3: smart-turn timeout ({smart_turn_max_wait_s:.1f}s) — forcing finalize."
+                                )
+                                smart_turn_pending_since = 0.0
+                            else:
+                                should_finalize = False
+                    else:
+                        logger.info(
+                            f"Qwen3: end-of-utterance ({silence_ms}ms silence, {silent_frame_count} frames)."
+                        )
+                    if should_finalize:
+                        _emit_final()
+                        _end_session()
+                        continue
                 # Partial emission tick (speech active, no new audio this tick)
                 if (
                     speech_started_emitted
@@ -422,6 +483,9 @@ def run_stt_worker(
                 if is_speech:
                     silent_frame_count = 0
                     speech_frame_count += 1
+                    # Speaker resumed after a hesitation — clear any pending
+                    # smart-turn finalize so the full utterance is kept.
+                    smart_turn_pending_since = 0.0
                     if (
                         not speech_started_emitted
                         and speech_frame_count >= speech_start_frames
