@@ -316,12 +316,18 @@ class LLM:
         logger.info(f"LLM backend: {self.backend} ({self.model} @ {self.base_url})")
 
     def stream(self, messages: list[dict]) -> Iterator[str]:
+        yield from self._stream_request(messages, tools=None)
+
+    def _stream_request(self, messages: list[dict], tools: list[dict] | None) -> Iterator[str]:
         import requests
+        body: dict = {"model": self.model, "messages": messages, "stream": True, "max_tokens": 200}
+        if tools:
+            body["tools"] = tools
+            body["tool_choice"] = "auto"
         with requests.post(
             f"{self.base_url}/chat/completions",
             headers={"Authorization": f"Bearer {self.api_key}"},
-            json={"model": self.model, "messages": messages, "stream": True, "max_tokens": 200},
-            stream=True, timeout=60,
+            json=body, stream=True, timeout=60,
         ) as r:
             for line in r.iter_lines():
                 if not line or not line.startswith(b"data:"):
@@ -336,6 +342,115 @@ class LLM:
                         yield delta
                 except Exception:
                     continue
+
+    def chat(self, messages: list[dict], tools: list[dict] | None = None) -> dict:
+        """Non-streaming completion. Used to detect tool_calls before deciding
+        whether to stream the final answer or run a tool round-trip first.
+        Returns the raw `choices[0].message` dict."""
+        import requests
+        body: dict = {"model": self.model, "messages": messages, "max_tokens": 200}
+        if tools:
+            body["tools"] = tools
+            body["tool_choice"] = "auto"
+        r = requests.post(
+            f"{self.base_url}/chat/completions",
+            headers={"Authorization": f"Bearer {self.api_key}"},
+            json=body, timeout=60,
+        )
+        r.raise_for_status()
+        return r.json()["choices"][0]["message"]
+
+
+# ── Serper tool calling (web search + news) ───────────────────────────────────
+# Mirrors `_execute_web_search` from pipeline_mp/llm_worker.py: one tool that
+# auto-routes to Google's /news endpoint when the query has news-like keywords.
+# Tools are only attached to the LLM call when `_needs_tools()` says the user
+# prompt looks like an information request — keeps casual chat at single-call
+# latency while letting "what's the news in Paris" trigger a Serper round-trip.
+
+SERPER_TOOLS = [{
+    "type": "function",
+    "function": {
+        "name": "web_search",
+        "description": (
+            "Search the live web (Google) for current facts, news, prices, "
+            "weather snippets, sports scores, or anything time-sensitive. "
+            "Use ONLY when the user asks about something the assistant cannot "
+            "answer from its own knowledge."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Concise web-search query."},
+                "max_results": {"type": "integer", "default": 3, "minimum": 1, "maximum": 5},
+            },
+            "required": ["query"],
+        },
+    },
+}]
+
+_NEWSY = ("news", "headline", "latest", "breaking", "today",
+          "current events", "what happened")
+_TOOL_TRIGGERS = re.compile(
+    r"\b(news|weather|price|stock|score|score of|who won|when did|"
+    r"how many|how much|latest|today|tomorrow|yesterday|currently|"
+    r"right now|search|look up|google|find out|forecast)\b",
+    re.IGNORECASE,
+)
+_CONVERSATIONAL = re.compile(
+    r"^(hi|hello|hey|thanks|thank you|ok|okay|yes|no|cool|nice|great|sure)\b",
+    re.IGNORECASE,
+)
+
+
+def _needs_tools(prompt: str) -> bool:
+    s = prompt.strip()
+    if not s or _CONVERSATIONAL.match(s):
+        return False
+    if len(s.split()) <= 3 and "?" not in s:
+        return False
+    return bool(_TOOL_TRIGGERS.search(s))
+
+
+def _serper_search(query: str, max_results: int = 3) -> str:
+    api_key = os.getenv("SERPER_API_KEY", "")
+    if not api_key:
+        return json.dumps({"error": "SERPER_API_KEY not set", "query": query})
+    import urllib.request
+    import urllib.error
+    is_news = any(kw in query.lower() for kw in _NEWSY)
+    endpoint = "https://google.serper.dev/news" if is_news else "https://google.serper.dev/search"
+    try:
+        payload = json.dumps({"q": query, "num": max(1, min(max_results, 5))}).encode()
+        req = urllib.request.Request(
+            endpoint, data=payload,
+            headers={"X-API-KEY": api_key, "Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read())
+        results = []
+        if is_news:
+            for r in data.get("news", [])[:max_results]:
+                results.append({k: r.get(k, "") for k in ("title", "snippet", "source", "date")})
+        else:
+            kg = data.get("knowledgeGraph", {})
+            if kg.get("description"):
+                results.append({"title": kg.get("title", ""), "snippet": kg["description"], "source": "knowledge_graph"})
+            for r in data.get("organic", [])[:max_results]:
+                results.append({"title": r.get("title", ""), "snippet": r.get("snippet", ""), "url": r.get("link", "")})
+        if not results:
+            return json.dumps({"error": "No results", "query": query})
+        return json.dumps(results[:max_results], ensure_ascii=False)
+    except (urllib.error.URLError, Exception) as e:
+        logger.warning(f"Serper search failed: {e}")
+        return json.dumps({"error": str(e), "query": query})
+
+
+def _exec_tool(name: str, args: dict) -> str:
+    if name == "web_search":
+        return _serper_search(args.get("query", ""), int(args.get("max_results", 3)))
+    return json.dumps({"error": f"unknown tool: {name}"})
 
 
 def split_sentences(text: str) -> list[str]:
@@ -604,7 +719,48 @@ class Session:
             MEMORY_MD.write_text(result + "\n")
             logger.info("memory consolidated")
 
-    async def _stream_llm_to_tts(self, _user_text: str) -> str:
+    def _maybe_tool_roundtrip(self, msgs: list[dict], user_text: str) -> list[dict]:
+        """If the user prompt looks like an info request and Serper is set,
+        do a non-streaming pre-call with tools. If the model asks for a tool,
+        execute it and append the tool message + tool_call to msgs. Caller
+        then streams a fresh completion with the augmented message list.
+
+        Returns the (possibly augmented) message list. Single round-trip max.
+        """
+        if not os.getenv("SERPER_API_KEY") or not _needs_tools(user_text):
+            return msgs
+        try:
+            reply = self.llm.chat(msgs, tools=SERPER_TOOLS)
+        except Exception as e:
+            logger.warning(f"tool pre-call failed: {e}")
+            return msgs
+        tool_calls = reply.get("tool_calls") or []
+        if not tool_calls:
+            return msgs
+        # Append the assistant's tool_call message first (OpenAI protocol).
+        msgs = msgs + [{
+            "role": "assistant",
+            "content": reply.get("content") or "",
+            "tool_calls": tool_calls,
+        }]
+        for tc in tool_calls:
+            fn = tc.get("function", {})
+            name = fn.get("name", "")
+            try:
+                args = json.loads(fn.get("arguments") or "{}")
+            except Exception:
+                args = {}
+            logger.info(f"tool call: {name}({args})")
+            result = _exec_tool(name, args)
+            msgs.append({
+                "role": "tool",
+                "tool_call_id": tc.get("id", ""),
+                "name": name,
+                "content": result,
+            })
+        return msgs
+
+    async def _stream_llm_to_tts(self, user_text: str) -> str:
         """Three-stage pipeline running concurrently:
               llm_thread     → sent_q     (LLM → clause-split → sentences)
               synth_consumer → audio_q    (sentences → PCM samples)
@@ -615,6 +771,10 @@ class Session:
         persona = load_persona()
         sys_prompt = SYSTEM_PROMPT + ("\n\n" + persona if persona else "")
         msgs = [{"role": "system", "content": sys_prompt}, *self.history[-10:]]
+
+        # Optional Serper tool round-trip BEFORE streaming. Runs in executor
+        # so it doesn't block the WS loop. Only triggers on info-shaped prompts.
+        msgs = await loop.run_in_executor(self.executor, self._maybe_tool_roundtrip, msgs, user_text)
 
         sent_q: asyncio.Queue = asyncio.Queue(maxsize=8)
         audio_q: asyncio.Queue = asyncio.Queue(maxsize=4)  # pre-synthed sentences
