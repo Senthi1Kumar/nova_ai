@@ -540,6 +540,16 @@ def run_stt_worker(
                 _emit_final()
                 _end_session()
 
+        elif msg_type == "external_eos":
+            # Gateway VAD says end-of-speech — finalize whatever we have and close.
+            if state["session_active"] and not state["is_ptt"]:
+                logger.info(
+                    f"Qwen3 STT external_eos ({msg.get('reason', 'frontend_vad')}) — flushing final."
+                )
+                state["should_listen"] = False
+                _emit_final()
+                _end_session()
+
         elif msg_type == "interrupted":
             if state["session_active"]:
                 logger.info("Qwen3 STT Session Interrupted")

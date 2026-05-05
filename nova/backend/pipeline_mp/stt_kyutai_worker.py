@@ -80,6 +80,10 @@ def run_stt_worker(
     from stt_config import STT_SETTINGS, STT_VARIANT_REGISTRY
 
     ema_threshold = float(os.getenv("NOVA_KYUTAI_EMA_THRESH", "0.7"))
+    # Trailing-silence finalize used when the variant has no semantic VAD heads
+    # (e.g. kyutai_stt_2_6b_en). Time since last new text token after which we
+    # treat the turn as ended.
+    trailing_silence_s = float(os.getenv("NOVA_KYUTAI_TRAILING_SILENCE_S", "0.8"))
     vad_head_idx = int(os.getenv("NOVA_KYUTAI_HEAD_IDX", "2"))
     device = os.getenv("NOVA_KYUTAI_DEVICE", "cuda")
     preemph_enabled = os.getenv("NOVA_KYUTAI_PREEMPH", "1") == "1"
@@ -224,6 +228,7 @@ def run_stt_worker(
         "emitted_final": False,
         "speech_started_sent": False,
         "audio_buf": [],       # list[np.ndarray] — raw 16kHz float chunks for voice verify
+        "last_token_at": 0.0,  # wall-clock of most recent text token (trailing-silence finalize)
     }
     inf_lock = threading.Lock()
 
@@ -238,6 +243,7 @@ def run_stt_worker(
             inf_state["emitted_final"] = False
             inf_state["speech_started_sent"] = False
             inf_state["audio_buf"] = []
+            inf_state["last_token_at"] = 0.0
         # Drain any stale audio from a previous session
         try:
             while True:
@@ -357,6 +363,8 @@ def run_stt_worker(
         tok_id = int(text_tokens[0, 0, 0].cpu().item())
         if tok_id != 0 and tok_id != padding_token_id:
             piece = tokenizer.id_to_piece(tok_id)  # type: ignore[attr-defined]
+            with inf_lock:
+                inf_state["last_token_at"] = time.time()
             # sentencepiece uses ▁ as word boundary
             if piece.startswith("▁"):
                 with inf_lock:
@@ -495,6 +503,26 @@ def run_stt_worker(
                 state["session_active"]
                 and not state["is_ptt"]
                 and not state["ptt_stopping"]
+                and not cfg.kyutai_use_semantic_vad
+                and inf_state["last_token_at"] > 0.0
+                and (inf_state["words"] or inf_state["pending_piece"])
+                and (time.time() - inf_state["last_token_at"]) > trailing_silence_s
+            ):
+                logger.info(
+                    f"Kyutai trailing-silence end-of-turn "
+                    f"(silence={time.time() - inf_state['last_token_at']:.2f}s ≥ "
+                    f"{trailing_silence_s:.2f}s)"
+                )
+                try:
+                    ctrl_q.put_nowait(("flush", "trailing_silence"))
+                except _queue.Full:
+                    pass
+                state["should_listen"] = False
+                state["session_active"] = False
+            elif (
+                state["session_active"]
+                and not state["is_ptt"]
+                and not state["ptt_stopping"]
                 and state["session_start_time"] > 0
                 and (time.time() - state["session_start_time"]) > NO_SPEECH_TIMEOUT
                 and not inf_state["words"]
@@ -594,6 +622,17 @@ def run_stt_worker(
                     logger.info("Kyutai STT Session Stopped (auto).")
                     _end_session()
                     ws_out_queue.put({"type": "recording_stopped"})
+
+        elif mtype == "external_eos":
+            # Gateway VAD says end-of-speech — pad+flush so trailing words
+            # emerge, then close the session. Same shape as PTT release.
+            if state["session_active"] and not state["is_ptt"]:
+                state["should_listen"] = False
+                ctrl_q.put(("flush", msg.get("reason", "external_eos")))
+                deadline = time.time() + PTT_DRAIN_TIMEOUT
+                while time.time() < deadline and not inf_state["emitted_final"]:
+                    time.sleep(0.02)
+                _end_session()
 
         elif mtype == "interrupted":
             if state["session_active"]:

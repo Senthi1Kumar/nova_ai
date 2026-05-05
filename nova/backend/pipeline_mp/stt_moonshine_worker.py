@@ -419,6 +419,35 @@ def run_stt_worker(
                     _end_session()
                     ws_out_queue.put({"type": "recording_stopped"})
 
+        elif msg_type == "external_eos":
+            # Gateway VAD says end-of-speech — release any held smart-turn
+            # lines as a single transcript, then close session.
+            if state["session_active"] and not state["is_ptt"]:
+                if _held["lines"]:
+                    flushed = " ".join(_held["lines"]).strip()
+                    logger.info(f"Moonshine: flushing held lines on external_eos: '{flushed}'")
+                    ws_out_queue.put({
+                        "type": "transcript",
+                        "data": flushed,
+                        "latency": {"stt_ttfb": 0.0, "stt_rtf": 0.0},
+                    })
+                    payload = {"type": "text", "text": flushed}
+                    audio_concat = (
+                        np.concatenate(_held["audio"]).tolist() if _held["audio"] else None
+                    )
+                    if audio_concat is not None:
+                        payload["audio_data"] = audio_concat
+                    llm_in_queue.put(payload)
+                    ws_out_queue.put({"type": "generation_start"})
+                    _held["lines"].clear()
+                    _held["audio"].clear()
+                    _held["pending_since"] = 0.0
+                    _end_session()
+                else:
+                    logger.info("Moonshine: external_eos with no held lines — closing session.")
+                    _end_session()
+                    ws_out_queue.put({"type": "recording_stopped"})
+
         elif msg_type == "interrupted":
             if state["session_active"]:
                 logger.info("STT Session Interrupted")

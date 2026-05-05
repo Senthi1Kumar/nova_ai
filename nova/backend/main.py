@@ -23,8 +23,9 @@ from dotenv import load_dotenv
 # Import our worker runners
 from pipeline_mp import run_stt_worker, run_kws_worker, run_llm_worker, run_tts_worker, run_pvad_worker
 
-# AEC-based barge-in (WebRTC APM + Silero VAD on cleaned mic)
-from pipeline_mp.aec_barge_in import AECBargeInDetector, is_enabled as _aec_enabled  # noqa: E402
+# Mic front-end: WebRTC APM (AEC3 + NS + AGC + HPF) + Silero VAD speech events.
+# Always-on when enabled — no longer gated to GENERATING-only barge-in detection.
+from pipeline_mp.audio_frontend import AudioFrontend, is_enabled as _frontend_enabled  # noqa: E402
 
 # Monkeypatch torchaudio for speechbrain compatibility
 import torchaudio
@@ -298,57 +299,143 @@ _FSM_GENERATING_TIMEOUT = 60.0  # seconds of ZERO llm activity before watchdog f
 _CONVERSATION_MAX_NO_SPEECH = int(os.environ.get("NOVA_CONVERSATION_MAX_NO_SPEECH", "2"))
 _CONVERSATION_IDLE_TIMEOUT_S = float(os.environ.get("NOVA_CONVERSATION_IDLE_TIMEOUT_S", "45.0"))
 
-# AEC barge-in detector (None if NOVA_AEC_ENABLED=0). Singleton — shared by
-# both mic intake paths (FastRTC handler + WebSocket /ws).
-# NOTE: instantiation here is cheap (just sets state to lazy-load on first use);
-# the actual livekit + Silero loads happen inside lifespan() so worker processes
-# spawned after this module re-imports DON'T pay the cost too.
-_aec_detector: AECBargeInDetector | None = AECBargeInDetector() if _aec_enabled() else None
-_AEC_GUARD_SEC = float(os.environ.get("NOVA_AEC_GUARD_SEC", "1.5"))  # skip first N sec of TTS to let AEC settle
+# Mic front-end: APM-cleaned mic + Silero-driven speech-event state machine.
+# Always-on (no longer gated to GENERATING-only); a single instance is shared
+# by both mic intake paths (FastRTC handler + WebSocket /ws). Lazy-loads on
+# first call so worker subprocesses don't pay the cost on import.
+_aec_detector: AudioFrontend | None = AudioFrontend() if _frontend_enabled() else None
+_AEC_GUARD_SEC = float(os.environ.get("NOVA_AEC_GUARD_SEC", "1.5"))  # barge-in eligibility delay after TTS start
 
-# Periodic diagnostic counter for AEC mic processing
+# Periodic diagnostic counter for front-end processing
 _aec_mic_calls = 0
-_aec_mic_log_every = int(os.environ.get("NOVA_AEC_LOG_EVERY", "50"))  # log every N mic chunks processed
+_aec_mic_log_every = int(os.environ.get("NOVA_AEC_LOG_EVERY", "50"))
+
+# FSM states in which the front-end's speech_event=="end" should finalize STT.
+_LISTENING_FSM_STATES = {
+    "LISTENING", "CONFIRM_PENDING", "VERIFY", "VERIFY_PIN",
+    "SLOT_FILL", "OTP_PENDING",
+}
 
 
-def _maybe_detect_barge_in(audio_bytes: bytes) -> None:
-    """Run AEC + VAD on a mic chunk during TTS playback. On detection, emit a
-    `pvad_voice_detected` event — the existing gateway handler performs the
-    full interrupt + re-listen transition.
+# Pre-speech lookback ring: when speech_start fires, we flush this much past
+# audio to STT so the leading phoneme isn't lost. Small (~300 ms).
+_PRE_SPEECH_LOOKBACK_MS = int(os.environ.get("NOVA_FRONTEND_LOOKBACK_MS", "300"))
+from collections import deque  # noqa: E402
+_pre_speech_ring: deque[bytes] = deque()
+_pre_speech_ring_bytes = 0
+_PRE_SPEECH_RING_MAX_BYTES = int(_PRE_SPEECH_LOOKBACK_MS * 16000 * 2 / 1000)  # 16k mono int16
 
-    Gated on: detector enabled, FSM=GENERATING, TTS audio actually playing,
-    and past the guard window (first N seconds of TTS where AEC is still
-    converging on the room's echo path).
-    """
-    global _aec_mic_calls
+
+def _gate_should_forward_to_stt() -> bool:
+    """STT should receive bytes only while the front-end VAD says we're in
+    speech (NO_KWS mode). KWS path / disabled front-end → always forward."""
     if _aec_detector is None:
-        return
-    if pipeline_state["fsm_state"] != "GENERATING":
-        return
-    if pipeline_state["_tts_start_time"] == 0.0:
-        return
-    if time.time() - pipeline_state["_tts_start_time"] < _AEC_GUARD_SEC:
-        return
+        return True
+    if os.environ.get("NOVA_NO_KWS") != "1":
+        return True
+    return _aec_detector.in_speech
+
+
+def _process_mic_frontend(audio_bytes: bytes) -> bytes | None:
+    """Run mic chunk through APM + VAD.
+
+    Returns the bytes the caller should forward to STT, or None if the gate
+    is currently closed (background noise / silence). Disabled front-end is
+    a passthrough.
+
+    Side effects:
+      - On rising edge of speech (`barge_in=True`) during GENERATING and past
+        the guard window: emits `pvad_voice_detected` for the existing barge-in
+        handler.
+      - On end-of-speech in LISTENING-class FSM states (NO_KWS demo path):
+        sends `external_eos` to the STT worker, replacing the per-worker
+        `NO_SPEECH_TIMEOUT` heuristic with a deterministic VAD boundary.
+      - Stamps `last_user_speech_at` on speech_start (drives WARM→COLD timeout).
+    """
+    global _aec_mic_calls, _pre_speech_ring_bytes
+    if _aec_detector is None:
+        return audio_bytes
+
+    # Maintain the rolling pre-speech ring so on speech_start we can flush
+    # ~300 ms of preceding audio (leading phoneme).
+    _pre_speech_ring.append(audio_bytes)
+    _pre_speech_ring_bytes += len(audio_bytes)
+    while _pre_speech_ring_bytes > _PRE_SPEECH_RING_MAX_BYTES and _pre_speech_ring:
+        _pre_speech_ring_bytes -= len(_pre_speech_ring.popleft())
     try:
         mic_i16 = np.frombuffer(audio_bytes, dtype=np.int16)
-        detected, prob = _aec_detector.process_mic(mic_i16)
+        barge_in, prob, event, cleaned_i16 = _aec_detector.process_mic(mic_i16)
         _aec_mic_calls += 1
-        # Periodic visibility — proves mic IS reaching detector during TTS,
-        # and shows the prob distribution so we can tune threshold if needed.
         if _aec_mic_calls % _aec_mic_log_every == 0:
             logger.info(
-                f"AEC processing mic during TTS: chunks={_aec_mic_calls}, "
-                f"latest_prob={prob:.2f}, threshold={os.environ.get('NOVA_AEC_VAD_THRESHOLD', '0.6')}"
+                f"Frontend mic: chunks={_aec_mic_calls} "
+                f"in_speech={_aec_detector.in_speech} latest_prob={prob:.2f}"
             )
-        if detected:
-            logger.info(f"AEC barge-in: voice on cleaned mic (prob={prob:.2f})")
+
+        fsm_state = pipeline_state["fsm_state"]
+
+        if event == "start":
+            pipeline_state["last_user_speech_at"] = time.time()
+            # NO_KWS: flush the pre-speech lookback ring to STT so the leading
+            # phoneme isn't lost. Done here as a side-effect; the current
+            # chunk is forwarded by the caller in the normal gated path.
+            if (
+                fsm_state in _LISTENING_FSM_STATES
+                and os.environ.get("NOVA_NO_KWS") == "1"
+                and pipeline_state.get("stt_in_queue") is not None
+            ):
+                stt_q = pipeline_state["stt_in_queue"]
+                logger.info(
+                    f"Frontend speech_start → flushing {len(_pre_speech_ring)} "
+                    f"lookback chunks to STT."
+                )
+                for past_chunk in list(_pre_speech_ring):
+                    try:
+                        stt_q.put(past_chunk)
+                    except Exception:
+                        pass
+
+        # Barge-in: only meaningful during TTS playback, after guard window.
+        if (
+            barge_in
+            and fsm_state == "GENERATING"
+            and pipeline_state["_tts_start_time"] > 0.0
+            and (time.time() - pipeline_state["_tts_start_time"]) >= _AEC_GUARD_SEC
+        ):
+            logger.info(f"Frontend barge-in: voice on cleaned mic (prob={prob:.2f})")
             pipeline_state["ws_out_queue"].put({
                 "type": "pvad_voice_detected",
                 "score": prob,
-                "source": "aec",
+                "source": "aec",  # keep contract for existing UI handler
             })
+
+        # End-of-speech → finalize STT (NO_KWS path drives turn boundaries
+        # entirely from gateway VAD; KWS path keeps its own timeouts for now).
+        if (
+            event == "end"
+            and fsm_state in _LISTENING_FSM_STATES
+            and os.environ.get("NOVA_NO_KWS") == "1"
+            and pipeline_state.get("stt_in_queue") is not None
+        ):
+            logger.info("Frontend EOS → external_eos to STT.")
+            try:
+                pipeline_state["stt_in_queue"].put({
+                    "type": "external_eos",
+                    "reason": "frontend_vad",
+                })
+            except Exception:
+                pass
+
+        return audio_bytes
     except Exception as e:
-        logger.warning(f"AEC barge-in check failed: {e}")
+        logger.warning(f"Frontend mic processing failed: {e}")
+        return audio_bytes
+
+
+# Backwards-compat thin wrapper — used by the FastRTC + WS bytes paths today.
+# New code should call `_process_mic_frontend` directly to also get cleaned bytes.
+def _maybe_detect_barge_in(audio_bytes: bytes) -> None:
+    _process_mic_frontend(audio_bytes)
 
 
 def _close_conversation(reason: str) -> None:
@@ -750,6 +837,11 @@ async def ws_queue_reader():
                     new_samples = len(audio_arr)
                     if pipeline_state["_tts_start_time"] == 0.0:
                         pipeline_state["_tts_start_time"] = now
+                        # Fresh rising edge for barge-in: clear any echo-induced
+                        # in_speech state from the AEC convergence window so the
+                        # first real user voice past the guard fires a clean start.
+                        if _aec_detector is not None:
+                            _aec_detector.clear_speech_state()
                     pipeline_state["_tts_total_samples"] += new_samples
                     total_dur = pipeline_state["_tts_total_samples"] / 24000.0
                     elapsed = now - pipeline_state["_tts_start_time"]
@@ -843,10 +935,11 @@ class NovaRTCHandler(AsyncStreamHandler):
             except Exception:
                 pass
 
-        # AEC barge-in detection during TTS playback. Must run BEFORE the echo
-        # suppression gate below — otherwise we'd never see mic audio during
-        # TTS and could never detect the interrupt.
-        _maybe_detect_barge_in(audio_bytes)
+        # Front-end (APM + VAD): always-on, side-effects only — drives barge-in
+        # and external_eos via Silero VAD on the APM-cleaned signal. STT and
+        # KWS still receive RAW mic bytes (cleaned audio is for VAD only;
+        # AEC convergence + AGC mangle the signal enough to hurt ASR).
+        _process_mic_frontend(audio_bytes)
 
         # Echo suppression: block mic audio from KWS/STT while TTS is playing.
         if time.time() < pipeline_state["tts_suppress_until"]:
@@ -859,7 +952,11 @@ class NovaRTCHandler(AsyncStreamHandler):
             pipeline_state["kws_in_queue"].put(audio_bytes)  # wake-word interrupt
         else:
             # Active interactive scenarios (LISTENING, SLOT_FILL, CONFIRM_PENDING, VERIFY...)
-            pipeline_state["stt_in_queue"].put(audio_bytes)
+            # In NO_KWS mode the front-end VAD gates STT so background noise
+            # doesn't get transcribed; on speech_start the ring-buffer prefix
+            # is already flushed by `_process_mic_frontend` above.
+            if _gate_should_forward_to_stt():
+                pipeline_state["stt_in_queue"].put(audio_bytes)
 
     async def emit(self):
         return await wait_for_item(self.audio_queue)
@@ -944,8 +1041,10 @@ async def lifespan(app: FastAPI):
         try:
             _np_w = np.zeros(int(0.1 * 24000), dtype=np.int16)
             _aec_detector.push_reference(_np_w)
-            _det, _prob = _aec_detector.process_mic(np.zeros(int(0.5 * 16000), dtype=np.int16))
-            logger.info(f"AEC barge-in eager-load complete (warmup prob={_prob:.2f}).")
+            _det, _prob, _evt, _cleaned = _aec_detector.process_mic(
+                np.zeros(int(0.5 * 16000), dtype=np.int16)
+            )
+            logger.info(f"AudioFrontend eager-load complete (warmup prob={_prob:.2f}).")
         except Exception as _e:
             logger.warning(f"AEC barge-in eager-load failed (non-fatal): {_e}")
 
@@ -1199,8 +1298,9 @@ async def websocket_endpoint(websocket: WebSocket):
                     except Exception:
                         pass
 
-                # AEC barge-in detection during TTS playback.
-                _maybe_detect_barge_in(audio_bytes)
+                # Front-end: always-on APM + VAD; side-effects only (barge-in
+                # + external_eos events). STT/KWS still get raw mic bytes.
+                _process_mic_frontend(audio_bytes)
 
                 # Echo suppression: block mic audio from KWS/STT while TTS is playing.
                 if time.time() < pipeline_state["tts_suppress_until"]:
@@ -1211,15 +1311,13 @@ async def websocket_endpoint(websocket: WebSocket):
                         pass  # MicTranscriber handles VAD locally
                     else:
                         pipeline_state["kws_in_queue"].put(audio_bytes)
-                # Active listening states: feed STT.
-                # CONFIRM_PENDING, VERIFY, VERIFY_PIN, SLOT_FILL, OTP_PENDING all
-                # auto-start an STT session after TTS finishes — they need audio
-                # bytes routed here or the Moonshine transcriber times out.
+                # Active listening states: feed STT (gated by front-end VAD in NO_KWS).
                 elif pipeline_state["fsm_state"] in (
                     "LISTENING", "CONFIRM_PENDING", "VERIFY", "VERIFY_PIN",
                     "SLOT_FILL", "OTP_PENDING"
                 ):
-                    pipeline_state["stt_in_queue"].put(audio_bytes)
+                    if _gate_should_forward_to_stt():
+                        pipeline_state["stt_in_queue"].put(audio_bytes)
                 # If GENERATING, still feed KWS to allow Wake Word Interruption!
                 elif pipeline_state["fsm_state"] == "GENERATING":
                     pipeline_state["kws_in_queue"].put(audio_bytes)
