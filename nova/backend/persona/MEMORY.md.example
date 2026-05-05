@@ -1,0 +1,11 @@
+# Memory
+
+<!--
+Auto-grown by Nova during conversations. Each line is a durable fact the
+assistant extracted from your turns. Lines look like:
+  - User dislikes spicy food
+  - User commutes to La Défense on weekday mornings
+Nova consolidates this file every NOVA_MEMORY_CONSOLIDATE_EVERY (default 5)
+assistant turns, merging duplicates and stripping session-specific noise.
+Edit by hand whenever you like — Nova will respect manual edits.
+-->
