@@ -65,6 +65,7 @@ dependencies = [
     "cn2an>=0.5.23",
     "kaldi-native-fbank>=1.22.3",
     "qwen-asr>=0.0.6",
+    "nemo-toolkit[asr]>=2.7.3",
 ]
 
 [tool.uv]
