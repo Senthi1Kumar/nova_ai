@@ -271,18 +271,25 @@ class TTS:
             base = "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0"
             urllib.request.urlretrieve(f"{base}/kokoro-v1.0.onnx", m)
             urllib.request.urlretrieve(f"{base}/voices-v1.0.bin", v)
-        # Try GPU when available — cuts per-sentence synth time ~3-5x on
-        # mid-range GPUs vs CPU. Falls back gracefully if CUDA EP unavailable.
-        sess = None
+        # Kokoro reads ORT providers from the env. To use CUDA: install
+        # onnxruntime-gpu (instead of plain onnxruntime). Verify with:
+        #   python -c "import onnxruntime as ort; print(ort.get_available_providers())"
+        # — must contain 'CUDAExecutionProvider'. Otherwise Kokoro falls back
+        # to CPU and synth is the dominant TTFB on Jetson/laptops.
         if os.getenv("NOVA_KOKORO_GPU", "1") == "1":
             try:
                 import onnxruntime as ort  # type: ignore
-                providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
-                sess = ort.InferenceSession(str(m), providers=providers)
-                logger.info(f"Kokoro ONNX providers: {sess.get_providers()}")
+                provs = ort.get_available_providers()
+                if "CUDAExecutionProvider" in provs:
+                    logger.info(f"Kokoro: ORT CUDA EP available → GPU synth ({provs})")
+                else:
+                    logger.warning(
+                        "Kokoro: ORT CUDA EP NOT available — falling back to CPU. "
+                        "Install onnxruntime-gpu to enable GPU synth."
+                    )
             except Exception as e:
-                logger.warning(f"Kokoro CUDA provider unavailable: {e}")
-        self.k = Kokoro(str(m), str(v), session=sess) if sess is not None else Kokoro(str(m), str(v))
+                logger.warning(f"Kokoro: ORT introspection failed: {e}")
+        self.k = Kokoro(str(m), str(v))
         self.voice = os.getenv("NOVA_KOKORO_VOICE", "af_heart")
         # Warmup so the first sentence doesn't pay graph-build cost.
         try:
