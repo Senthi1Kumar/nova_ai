@@ -47,6 +47,17 @@ import torch
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 
+# Auto-load .env from the repo root so users don't have to remember
+# `uv run --env-file .env` or `source .env`. Best-effort: silently skip
+# if python-dotenv isn't installed.
+try:
+    from dotenv import load_dotenv  # type: ignore
+    _env_path = Path(__file__).resolve().parents[2] / ".env"
+    if _env_path.exists():
+        load_dotenv(_env_path, override=False)
+except ImportError:
+    pass
+
 logger = logging.getLogger("nova-simple")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 
@@ -318,8 +329,14 @@ class LLM:
             self.model = os.getenv("NOVA_LLM_MODEL", "google/gemma-2-2b-it")
         else:
             self.base_url = "https://openrouter.ai/api/v1"
-            self.api_key = os.environ["OPENROUTER_API_KEY"]
+            self.api_key = os.getenv("OPENROUTER_API_KEY", "")
             self.model = os.getenv("NOVA_LLM_MODEL", "openai/gpt-4o-mini")
+            if not self.api_key:
+                logger.warning(
+                    "OPENROUTER_API_KEY is not set — LLM calls will fail. "
+                    "Either set it, or run `NOVA_LLM_BACKEND=local` against a "
+                    "local OpenAI-compatible server."
+                )
         logger.info(f"LLM backend: {self.backend} ({self.model} @ {self.base_url})")
 
     def stream(self, messages: list[dict]) -> Iterator[str]:
