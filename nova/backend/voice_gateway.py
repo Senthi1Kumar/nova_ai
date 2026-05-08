@@ -1,31 +1,35 @@
-"""Nova — simple single-process voice gateway (demo skeleton).
+"""Nova — single-process voice gateway.
 
-Mirrors the architecture of `voice-loop/voice_loop_mac.py` but served over
-WebSocket so the existing browser frontend talks to it. One process, one
-asyncio loop, blocking model calls dispatched to a thread executor.
+One asyncio loop per WebSocket connection; blocking model calls dispatched
+to a thread executor. The browser frontend lives in `nova/backend/static/`
+(index.html, app.css, app.js) and is served as static assets — no embedded
+HTML strings.
 
 Pipeline per turn:
     browser mic (16k mono int16 bytes via /ws)
         ─▶ asyncio audio_q
             ─▶ Silero VAD (turn detection)
-            ─▶ on speech_end: Smart-Turn confirm
-            ─▶ STT.transcribe(np.float32)
-            ─▶ LLM.stream(messages)  ─┐ tokens → split into sentences
-            ─▶ for each sentence: TTS.synth → push pcm to /ws + APM ref buffer
-                   during playback: APM-cleaned mic + Silero → barge-in cancels
+            ─▶ during speech: Qwen3StreamingSTT rolling-buffer partials
+            ─▶ on silence: Smart-Turn confirm + stt.finalize()
+            ─▶ LLM.stream(messages)  ─┐ tokens → clause-split sentences
+            ─▶ for each sentence: TTS.synth_stream → binary PCM frames
+                   during playback: APM-cleaned mic + Silero → barge-in
 
-Models default to Moonshine (CPU) + Kokoro (CPU) + OpenRouter (cloud) so the
-whole stack loads in <30s with no GPU. Swap the loaders below to use the
-production Kyutai / Pocket-TTS / local LLM engines once GPU is available.
+Default stack: Qwen3-ASR-0.6B (streaming) + Kokoro-ONNX + a local
+OpenAI-compatible LLM server (llama.cpp / vLLM / Ollama) selectable via
+NOVA_LLM_BACKEND. Persona files at `nova/backend/persona/` (USER.md +
+MEMORY.md) are gitignored — copy USER.md.example / MEMORY.md.example on
+first run.
 
 Run:
-    uv run python -m nova.backend.gateway_simple
+    uv run python -m nova.backend.voice_gateway
 
 WS protocol (browser side):
     inbound  : raw int16 PCM mono @ 16 kHz (binary frames) + JSON ctrl
     outbound : JSON events {speech_started, transcript_partial, transcript,
                             llm_token, assistant_start, generation_start,
-                            generation_done, audio_out{b64 pcm @ 24k}, error}
+                            generation_done, audio_header, audio_out, error,
+                            turn_metrics} + raw int16 PCM @ 24k binary frames
 """
 
 from __future__ import annotations
@@ -45,7 +49,8 @@ from typing import Any, Iterable, Iterator
 import numpy as np
 import torch
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 
 # Auto-load .env from the repo root so users don't have to remember
 # `uv run --env-file .env` or `source .env`. Best-effort: silently skip
@@ -1420,10 +1425,14 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
+# Frontend assets live next to this module: nova/backend/static/{index.html, app.css, app.js}
+_STATIC_DIR = Path(__file__).parent / "static"
+app.mount("/static", StaticFiles(directory=str(_STATIC_DIR)), name="static")
 
-@app.get("/", response_class=HTMLResponse)
-def index() -> str:
-    return _DEMO_HTML
+
+@app.get("/")
+def index() -> FileResponse:
+    return FileResponse(_STATIC_DIR / "index.html")
 
 
 @app.get("/persona/{name}")
@@ -1463,312 +1472,6 @@ async def ws(ws: WebSocket) -> None:
         pass
     finally:
         loop_task.cancel()
-
-
-# ── Minimal browser demo (mic capture + audio playback) ───────────────────────
-
-_DEMO_HTML = r"""<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>Nova</title>
-  <style>
-    *,*::before,*::after { box-sizing: border-box }
-    :root {
-      --bg-0: #07090d; --bg-1: #0d1218; --line: #1c2230;
-      --fg: #e6ecf3; --muted: #7e8a9c; --accent: #4cd2c8; --accent-2: #4f7cff;
-      --user: #ffd166; --error: #ff6b6b;
-    }
-    html,body { height: 100% }
-    body {
-      margin: 0; background: radial-gradient(1200px 600px at 70% -10%, #14223a 0%, var(--bg-0) 60%);
-      color: var(--fg); font: 15px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
-      display: grid; grid-template-rows: auto 1fr auto; min-height: 100vh;
-    }
-    header {
-      padding: 18px 28px; display: flex; align-items: center; gap: 14px;
-      border-bottom: 1px solid var(--line);
-    }
-    .brand { font-weight: 600; letter-spacing: .12em; text-transform: uppercase; font-size: 13px; color: var(--muted) }
-    .brand b { color: var(--fg); letter-spacing: .04em }
-    .pill {
-      margin-left: auto; padding: 4px 10px; border: 1px solid var(--line); border-radius: 999px;
-      font-size: 12px; color: var(--muted); display: inline-flex; align-items: center; gap: 8px;
-    }
-    .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); transition: background .2s }
-    .dot.idle { background: #4a5568 }
-    .dot.listen { background: var(--accent); box-shadow: 0 0 12px var(--accent) }
-    .dot.think { background: #a78bfa; animation: pulse 1.2s ease-in-out infinite }
-    .dot.speak { background: var(--accent-2); box-shadow: 0 0 12px var(--accent-2) }
-    @keyframes pulse { 0%,100% { opacity: .35 } 50% { opacity: 1 } }
-
-    main {
-      display: grid; grid-template-columns: minmax(0, 1fr) 360px; gap: 24px;
-      padding: 28px; max-width: 1200px; margin: 0 auto; width: 100%;
-    }
-    @media (max-width: 900px) { main { grid-template-columns: 1fr } }
-
-    .turns { display: flex; flex-direction: column; gap: 12px; min-height: 60vh }
-    .turn {
-      padding: 14px 16px; border-radius: 14px; border: 1px solid var(--line);
-      background: linear-gradient(180deg, rgba(255,255,255,0.02), rgba(255,255,255,0));
-      max-width: 720px;
-    }
-    .turn.user { align-self: flex-end; border-color: rgba(255, 209, 102, 0.25) }
-    .turn .who { font-size: 11px; letter-spacing: .12em; text-transform: uppercase; color: var(--muted); margin-bottom: 4px }
-    .turn.user .who { color: var(--user) }
-    .turn.assistant .who { color: var(--accent) }
-
-    aside {
-      display: flex; flex-direction: column; gap: 14px;
-      border: 1px solid var(--line); border-radius: 16px; padding: 18px; background: var(--bg-1);
-      align-self: start; position: sticky; top: 20px;
-    }
-    aside h3 { margin: 0 0 4px; font-size: 12px; letter-spacing: .12em; color: var(--muted); text-transform: uppercase; font-weight: 600 }
-    .row { display: flex; gap: 8px; align-items: center; justify-content: space-between }
-    .row .v { color: var(--fg); font-variant-numeric: tabular-nums }
-    .row .k { color: var(--muted); font-size: 13px }
-    .meter { height: 8px; background: #131a25; border-radius: 999px; overflow: hidden }
-    .meter > span { display: block; height: 100%; width: 0%; background: linear-gradient(90deg, var(--accent), var(--accent-2)); transition: width 60ms linear }
-
-    footer {
-      padding: 18px 28px; border-top: 1px solid var(--line);
-      display: flex; align-items: center; gap: 16px; justify-content: center;
-    }
-    .mic-wrap { position: relative; display: inline-flex; align-items: center; justify-content: center }
-    .mic-wrap::before, .mic-wrap::after {
-      content: ""; position: absolute; inset: 0; border-radius: 50%;
-      border: 2px solid var(--accent-2); opacity: 0; pointer-events: none;
-    }
-    body[data-state="listening"] .mic-wrap::before { animation: ring 1.6s ease-out infinite; border-color: var(--accent) }
-    body[data-state="listening"] .mic-wrap::after  { animation: ring 1.6s ease-out infinite .8s; border-color: var(--accent) }
-    body[data-state="speaking"]  .mic-wrap::before { animation: ring 1.0s ease-out infinite; border-color: var(--accent-2) }
-    body[data-state="speaking"]  .mic-wrap::after  { animation: ring 1.0s ease-out infinite .5s; border-color: var(--accent-2) }
-    body[data-state="thinking"]  .mic-wrap::before { animation: ring 0.6s ease-out infinite; border-color: #a78bfa }
-    @keyframes ring {
-      0% { transform: scale(1); opacity: .8 }
-      100% { transform: scale(1.9); opacity: 0 }
-    }
-    button.mic {
-      appearance: none; border: 0; cursor: pointer; position: relative; z-index: 1;
-      width: 76px; height: 76px; border-radius: 50%;
-      background: radial-gradient(circle at 30% 30%, #4f7cff 0%, #2a3a8a 60%, #0a1130 100%);
-      color: white; font-size: 26px;
-      box-shadow: 0 8px 26px rgba(79, 124, 255, 0.35), inset 0 1px 0 rgba(255,255,255,0.2);
-      transition: transform .1s ease;
-    }
-    button.mic:hover { transform: translateY(-1px) }
-    button.mic.on { background: radial-gradient(circle at 30% 30%, #ff6b6b 0%, #8a2a2a 60%, #300a0a 100%); box-shadow: 0 8px 26px rgba(255, 107, 107, 0.35) }
-    .tabs { display: flex; gap: 4px; margin-top: 8px }
-    .tab { flex: 1; cursor: pointer; padding: 6px 8px; text-align: center; border-radius: 8px; border: 1px solid var(--line); font-size: 11px; color: var(--muted); letter-spacing: .08em; text-transform: uppercase; user-select: none }
-    .tab.active { background: var(--bg-1); color: var(--fg); border-color: var(--accent-2) }
-    .doc { white-space: pre-wrap; font: 12px/1.55 ui-monospace, SFMono-Regular, monospace; background: #0a0e15; border: 1px solid var(--line); border-radius: 10px; padding: 10px; max-height: 280px; overflow: auto; color: #cfd8e3 }
-    .hint { color: var(--muted); font-size: 13px }
-    .err { color: var(--error); font-size: 12px; text-align: center }
-  </style>
-</head>
-<body>
-  <header>
-    <div class="brand"><b>NOVA</b> &nbsp;·&nbsp; in-car voice agent</div>
-    <div class="pill"><span id="dot" class="dot idle"></span><span id="status">idle</span></div>
-  </header>
-
-  <main>
-    <div id="turns" class="turns" aria-live="polite"></div>
-    <aside>
-      <h3>Session</h3>
-      <div class="row"><div class="k">Mic level</div><div class="v" id="lvl">—</div></div>
-      <div class="meter"><span id="lvlBar"></span></div>
-      <div class="row"><div class="k">Last latency</div><div class="v" id="lat">—</div></div>
-      <div class="row"><div class="k">Turns</div><div class="v" id="nTurns">0</div></div>
-      <div class="err" id="err"></div>
-
-      <h3 style="margin-top:8px">Persona</h3>
-      <div class="tabs">
-        <div class="tab active" data-doc="user">USER</div>
-        <div class="tab" data-doc="memory">MEMORY</div>
-        <div class="tab" data-doc="conversation">CHAT</div>
-      </div>
-      <pre class="doc" id="doc">(loading…)</pre>
-    </aside>
-  </main>
-
-  <footer>
-    <span class="hint">Click the mic and speak. Nova will reply in voice.</span>
-    <span class="mic-wrap"><button id="micBtn" class="mic" title="Start / stop mic">🎙</button></span>
-    <span class="hint">Press space to interrupt.</span>
-  </footer>
-
-<script>
-(() => {
-  const $ = id => document.getElementById(id);
-  const setStatus = (k, t) => {
-    document.body.dataset.state = k === 'listen' ? 'listening' : k === 'think' ? 'thinking' : k === 'speak' ? 'speaking' : 'idle';
-    $('dot').className = 'dot ' + k; $('status').textContent = t;
-  };
-  setStatus('idle', 'idle');
-  const turns = $('turns');
-  const newTurn = (who, text) => {
-    const el = document.createElement('div');
-    el.className = 'turn ' + who;
-    el.innerHTML = `<div class="who">${who}</div><div class="t"></div>`;
-    el.querySelector('.t').textContent = text;
-    turns.appendChild(el); el.scrollIntoView({ behavior: 'smooth', block: 'end' });
-    $('nTurns').textContent = turns.children.length;
-    return el.querySelector('.t');
-  };
-  const showErr = m => { $('err').textContent = m; setTimeout(() => $('err').textContent = '', 4000); };
-
-  let ws, micCtx, playCtx, playT = 0, on = false, srcNode, workletNode, t0 = 0;
-  let assistantSpan = null;
-  let pendingAudioSr = 0;
-  function playPCM(i16, sr) {
-    if (!playCtx) return;
-    const f32 = new Float32Array(i16.length);
-    for (let i = 0; i < i16.length; i++) f32[i] = i16[i] / 32768;
-    const buf = playCtx.createBuffer(1, f32.length, sr);
-    buf.copyToChannel(f32, 0);
-    const s = playCtx.createBufferSource(); s.buffer = buf; s.connect(playCtx.destination);
-    const t = Math.max(playT, playCtx.currentTime); s.start(t); playT = t + buf.duration;
-  }
-
-  async function start() {
-    let stream;
-    try {
-      stream = await navigator.mediaDevices.getUserMedia({
-        audio: { sampleRate: 16000, channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true }
-      });
-    } catch (e) { showErr('mic permission denied'); return; }
-
-    ws = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws`);
-    ws.binaryType = 'arraybuffer';
-    ws.onopen = () => setStatus('listen', 'listening');
-    ws.onclose = () => setStatus('idle', 'disconnected');
-    ws.onerror = () => showErr('connection error');
-    ws.onmessage = onMessage;
-    // Track expected binary audio frame from preceding header
-    pendingAudioSr = 0;
-
-    micCtx = new AudioContext({ sampleRate: 16000 });
-    await micCtx.audioWorklet.addModule(URL.createObjectURL(new Blob([`
-      class P extends AudioWorkletProcessor {
-        process(inputs) {
-          const ch = inputs[0][0]; if (!ch) return true;
-          let peak = 0;
-          const i16 = new Int16Array(ch.length);
-          for (let i = 0; i < ch.length; i++) {
-            const v = Math.max(-1, Math.min(1, ch[i]));
-            i16[i] = v < 0 ? v * 0x8000 : v * 0x7fff;
-            const a = v < 0 ? -v : v; if (a > peak) peak = a;
-          }
-          this.port.postMessage({ buf: i16.buffer, peak }, [i16.buffer]);
-          return true;
-        }
-      }
-      registerProcessor('p', P);`], { type: 'application/javascript' })));
-    srcNode = micCtx.createMediaStreamSource(stream);
-    workletNode = new AudioWorkletNode(micCtx, 'p');
-    workletNode.port.onmessage = e => {
-      if (ws && ws.readyState === 1) ws.send(e.data.buf);
-      const pct = Math.min(100, Math.round(e.data.peak * 200));
-      $('lvlBar').style.width = pct + '%';
-      $('lvl').textContent = `${pct}%`;
-    };
-    srcNode.connect(workletNode);
-
-    playCtx = new AudioContext({ sampleRate: 24000 });
-    playT = playCtx.currentTime;
-    on = true; $('micBtn').classList.add('on');
-  }
-
-  function stop() {
-    on = false; $('micBtn').classList.remove('on');
-    if (workletNode) workletNode.disconnect();
-    if (srcNode) srcNode.disconnect();
-    if (micCtx) micCtx.close().catch(()=>{});
-    if (playCtx) playCtx.close().catch(()=>{});
-    if (ws && ws.readyState === 1) ws.close();
-    setStatus('idle', 'idle');
-  }
-
-  function onMessage(e) {
-    // Binary frame arrives right after an audio_header text frame.
-    if (e.data instanceof ArrayBuffer) {
-      const i16 = new Int16Array(e.data);
-      playPCM(i16, pendingAudioSr || 24000);
-      pendingAudioSr = 0;
-      return;
-    }
-    let msg; try { msg = JSON.parse(e.data) } catch { return; }
-    switch (msg.type) {
-      case 'speech_started':
-        setStatus('listen', 'listening'); break;
-      case 'transcript':
-        newTurn('user', msg.data || '');
-        t0 = performance.now();
-        setStatus('think', 'thinking…');
-        break;
-      case 'assistant_start':
-        assistantSpan = newTurn('assistant', '');
-        break;
-      case 'llm_token':
-        if (assistantSpan) assistantSpan.textContent += (assistantSpan.textContent ? ' ' : '') + (msg.data || '');
-        if (t0) { $('lat').textContent = `${Math.round(performance.now() - t0)} ms`; t0 = 0; }
-        setStatus('speak', 'speaking…');
-        break;
-      case 'generation_done':
-        setStatus('listen', 'listening');
-        assistantSpan = null;
-        // Refresh sidebar after the turn — memory may have grown.
-        loadDoc(currentDoc);
-        break;
-      case 'audio_header': pendingAudioSr = msg.sr || 24000; break;
-      case 'audio_out': {
-        // Legacy base64 path (NOVA_TTS_BINARY=0).
-        const bin = atob(msg.pcm_b64);
-        const arr = new Uint8Array(bin.length);
-        for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
-        playPCM(new Int16Array(arr.buffer), msg.sr);
-        break;
-      }
-      case 'error': showErr(msg.data || 'error'); break;
-    }
-  }
-
-  // Sidebar tabs
-  let currentDoc = 'user';
-  async function loadDoc(name) {
-    try {
-      const r = await fetch('/persona/' + name); const j = await r.json();
-      $('doc').textContent = j.content || '(empty)';
-    } catch { $('doc').textContent = '(failed to load)' }
-  }
-  document.querySelectorAll('.tab').forEach(t => {
-    t.onclick = () => {
-      document.querySelectorAll('.tab').forEach(x => x.classList.remove('active'));
-      t.classList.add('active');
-      currentDoc = t.dataset.doc; loadDoc(currentDoc);
-    };
-  });
-  loadDoc('user');
-
-  $('micBtn').onclick = () => on ? stop() : start();
-  document.addEventListener('keydown', e => {
-    if (e.code === 'Space' && on && playCtx) {
-      // local interrupt: drop scheduled playback so user feels barge-in immediately
-      try { playCtx.close(); } catch {}
-      playCtx = new AudioContext({ sampleRate: 24000 });
-      playT = playCtx.currentTime;
-      setStatus('listen', 'listening');
-      e.preventDefault();
-    }
-  });
-})();
-</script>
-</body>
-</html>
-"""
 
 
 if __name__ == "__main__":

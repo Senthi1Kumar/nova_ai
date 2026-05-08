@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Nova</title>
+  <link rel="stylesheet" href="/static/app.css" />
+</head>
+<body>
+  <header>
+    <div class="brand"><b>NOVA</b> &nbsp;·&nbsp; in-car voice agent</div>
+    <div class="pill"><span id="dot" class="dot idle"></span><span id="status">idle</span></div>
+  </header>
+
+  <main>
+    <div id="turns" class="turns" aria-live="polite"></div>
+    <aside>
+      <h3>Session</h3>
+      <div class="row"><div class="k">Mic level</div><div class="v" id="lvl">—</div></div>
+      <div class="meter"><span id="lvlBar"></span></div>
+      <div class="row"><div class="k">Last latency</div><div class="v" id="lat">—</div></div>
+      <div class="row"><div class="k">Turns</div><div class="v" id="nTurns">0</div></div>
+      <div class="err" id="err"></div>
+
+      <h3 style="margin-top:8px">Persona</h3>
+      <div class="tabs">
+        <div class="tab active" data-doc="user">USER</div>
+        <div class="tab" data-doc="memory">MEMORY</div>
+        <div class="tab" data-doc="conversation">CHAT</div>
+      </div>
+      <pre class="doc" id="doc">(loading…)</pre>
+    </aside>
+  </main>
+
+  <footer>
+    <span class="hint">Click the mic and speak. Nova will reply in voice.</span>
+    <span class="mic-wrap"><button id="micBtn" class="mic" title="Start / stop mic">🎙</button></span>
+    <span class="hint">Press space to interrupt.</span>
+  </footer>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

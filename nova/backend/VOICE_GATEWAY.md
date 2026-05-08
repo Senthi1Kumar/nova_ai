@@ -1,0 +1,220 @@
+# Nova — single-process voice gateway
+
+`voice_gateway.py` is a one-process alternative to the multiprocess `main.py`
+pipeline. One asyncio loop per WebSocket connection, blocking model calls
+dispatched to a thread executor, browser frontend served from `static/` —
+no FastRTC, no multiprocessing, no FSM.
+
+```
+browser mic ──/ws bytes──▶ Silero VAD turn detection
+                                  │
+                                  │  (during speech: Qwen3StreamingSTT
+                                  │   rolling-buffer partials)
+                                  ▼  (silence_end: Smart-Turn confirm)
+                                stt.finalize() ─▶ LLM stream ─▶ clause split
+                                                                    │
+                                                                    ▼
+                                                    Kokoro TTS streaming
+                                                                    │
+                                                                    ▼
+                                  binary PCM frames + APM ref ▶ /ws audio_out
+```
+
+Per-turn pipeline is fully concurrent: STT runs *during* user speech (rolling
+buffer), synth for sentence N+1 starts the moment N enters the audio queue,
+playback never blocks on synth.
+
+## Layout
+
+```
+nova/backend/
+  voice_gateway.py          # the gateway server
+  static/
+    index.html              # browser UI
+    app.css                 # styles + mic animation
+    app.js                  # mic capture, WS protocol, audio playback
+  persona/
+    USER.md.example         # template (committed)
+    MEMORY.md.example       # template (committed)
+    USER.md                 # your persona (gitignored)
+    MEMORY.md               # auto-grown durable facts (gitignored)
+  VOICE_GATEWAY.md          # this doc
+```
+
+## Quick start
+
+### 1. Install deps
+
+```bash
+uv sync
+```
+
+Optional: `apt-get install libssl-dev` / `pacman -S openssl` if you want
+HTTPS on the gateway port.
+
+### 2. Set up persona files (first run only)
+
+```bash
+cd nova/backend/persona
+cp USER.md.example USER.md
+cp MEMORY.md.example MEMORY.md
+$EDITOR USER.md          # set name, role, language, vehicle, prefs
+```
+
+`USER.md` is your manual persona. `MEMORY.md` is auto-grown by Nova: after
+every assistant turn it extracts durable facts and appends `- ...` lines;
+every 5 turns it consolidates the file to dedupe. You can edit it by hand
+at any time.
+
+Disable the whole thing with `NOVA_MEMORY=0` if you want a stateless demo.
+
+### 3. Start a local LLM (optional but recommended)
+
+The gateway speaks OpenAI-compatible chat completions. Either point it at
+OpenRouter (default, requires `OPENROUTER_API_KEY`) or run any local server
+that exposes `/v1/chat/completions` — vLLM, Ollama, llama.cpp.
+
+`llama.cpp` example with Gemma-4-E4B (fits 6 GB VRAM at Q4):
+
+```bash
+./build/bin/llama-server \
+  -hf unsloth/gemma-4-E4B-it-GGUF:Q4_K_M \
+  --alias "unsloth/gemma-4-E4B-it" \
+  --host 0.0.0.0 --port 8080 \
+  --n-gpu-layers 999 --ctx-size 4096 --threads -1 \
+  --temp 1.0 --top-p 0.95 --top-k 64 \
+  --jinja \
+  --chat-template-kwargs '{"enable_thinking":false}'
+```
+
+`--jinja` is required for tool-calling support. `enable_thinking:false`
+keeps TTFB low.
+
+### 4. Run the gateway
+
+`.env` (see `.env.example` for the full list):
+
+```bash
+NOVA_LLM_BACKEND=local
+NOVA_LLM_BASE_URL=http://localhost:8080/v1
+NOVA_LLM_MODEL=unsloth/gemma-4-E4B-it
+SERPER_API_KEY=...                      # optional, enables web_search tool
+```
+
+```bash
+uv run python -m nova.backend.voice_gateway
+```
+
+Open `http://localhost:8001`, click the mic, talk. The browser handles mic
+capture + 16 kHz PCM upload via `AudioWorkletNode` and plays back received
+24 kHz PCM frames through `AudioBufferSource`.
+
+## Streaming STT (Qwen3-ASR rolling buffer)
+
+The default `Qwen3StreamingSTT` runs partial transcribes on a 3 s rolling
+window every 400 ms while the user is speaking. Identical consecutive
+partials trigger an early settle; otherwise on silence-end one final cold
+transcribe runs against the full utterance buffer.
+
+Net: STT compute happens *during* user speech, so the silence-end → first
+audio path is dominated by LLM TTFT + Kokoro first chunk, not STT.
+
+Switch back to single-call STT for A/B with `NOVA_STT_BACKEND=qwen3_0_6b`.
+
+## Tool calling (Serper)
+
+When `SERPER_API_KEY` is set, the gateway exposes a single `web_search` tool
+to the LLM. Before each user-message → assistant streaming pass, the gateway
+runs a cheap regex (`_needs_tools`) over the transcript:
+
+- Casual chat ("hi", "thanks", "what's 2+2?") → tools skipped, single
+  streaming call.
+- Info-shaped ("what's the news in Paris", "weather tomorrow", "who won
+  the match") → one non-streaming pre-call with `tools=[web_search]`. If
+  the model returns a `tool_call`, the gateway hits Google via Serper,
+  appends the tool result to the message list, then streams the final
+  answer.
+
+The Serper endpoint auto-routes to `/news` when the query contains news-y
+keywords (`news`, `headline`, `latest`, `breaking`, `today`, ...) and
+`/search` otherwise. Top 3 results returned as JSON.
+
+## Latency instrumentation
+
+Every turn emits a `turn_metrics` WS event + single-line stderr log:
+
+```text
+turn_metrics: speech_dur_ms=1527 smart_turn_ms=189 stt_ms=18
+              llm_ttft_ms=160 tts_ttfb_ms=240 total_ttfb_ms=607
+```
+
+`stt_ms` should be small (~10–50 ms) when the streaming partial settled
+during speech; large means it ran a final cold call. `total_ttfb_ms` is
+end-of-speech → first audio frame on the wire.
+
+## Environment knobs (gateway-specific)
+
+| Var | Default | Notes |
+|---|---|---|
+| `NOVA_STT_BACKEND` | `qwen3_streaming` | `qwen3_streaming` / `qwen3_0_6b` / `kyutai_1b` / `moonshine` |
+| `NOVA_QWEN3_LANGUAGE` | `English` | Pinned so noise stays in-language |
+| `NOVA_QWEN3_PARTIAL_INTERVAL_MS` | `400` | Streaming partial cadence |
+| `NOVA_QWEN3_PARTIAL_WINDOW_S` | `3.0` | Rolling-window length |
+| `NOVA_QWEN3_STABILITY_TICKS` | `2` | Consecutive identical partials → settled |
+| `NOVA_QWEN3_MAX_UTTERANCE_S` | `12.0` | Hard cap |
+| `NOVA_LLM_BACKEND` | `openrouter` | `local` for vLLM/llama.cpp/Ollama |
+| `NOVA_LLM_BASE_URL` | OpenRouter | e.g. `http://localhost:8080/v1` |
+| `NOVA_LLM_MODEL` | `openai/gpt-4o-mini` | Match local server's model |
+| `NOVA_SYSTEM_PROMPT` | concise English | Override per deployment |
+| `NOVA_KOKORO_GPU` | `1` | Try CUDA EP for Kokoro ONNX |
+| `NOVA_KOKORO_VOICE` | `af_heart` | Any Kokoro voice name |
+| `NOVA_VAD_THRESHOLD` | `0.5` | Silero per-frame voice prob |
+| `NOVA_SILENCE_END_MS` | `400` | End-of-utterance silence |
+| `NOVA_MIN_SPEECH_MS` | `500` | Drop turns shorter than this |
+| `NOVA_SMART_TURN_THRESHOLD` | `0.5` | Drops if model unsure speaker is done |
+| `NOVA_AEC_GUARD_MS` | `500` | Skip first N ms of TTS for barge-in |
+| `NOVA_BARGE_IN_THRESHOLD` | `0.5` | Cleaned-VAD prob for interrupt |
+| `NOVA_BARGE_IN_FRAMES` | `2` | Consecutive frames to confirm barge-in |
+| `NOVA_TTS_BINARY` | `1` | 0 to fall back to base64 JSON |
+| `NOVA_TTS_PLAY_CHUNK` | `2048` | Samples per WS network frame @ 24 kHz |
+| `NOVA_SENT_MIN_CHARS` | `8` | First clause ships once it hits this |
+| `NOVA_LATIN_ONLY` | `1` | Drop transcripts >20% non-Latin |
+| `NOVA_MEMORY` | `1` | Persona + auto-memory loop |
+| `NOVA_MEM_DIR` | `./persona` | Where USER/MEMORY live |
+| `NOVA_MEMORY_CONSOLIDATE_EVERY` | `5` | Turns between memory dedupe passes |
+| `SERPER_API_KEY` | *(unset)* | Enables `web_search` tool when set |
+
+## What this is NOT
+
+- Not a replacement for `main.py`. The multiprocess gateway has KWS, the FSM,
+  multi-client broadcast, voice enrollment, Postgres, per-variant routing.
+  This file is the *demo + iteration* surface.
+- Not multi-tenant. One WS connection at a time is the design (each opens
+  its own APM/VAD; concurrent sessions would oversubscribe the GPU). For
+  multi-driver demos, run multiple gateway instances on different ports.
+
+## Troubleshooting
+
+**Browser shows "mic permission denied"**: Chrome blocks `getUserMedia` on
+non-HTTPS / non-localhost. Use `localhost` (with SSH `-L 8001:localhost:8001`
+if remote), HTTPS, or `--unsafely-treat-insecure-origin-as-secure=...`.
+
+**Audio plays glitchy**: usually a browser-side underrun. Confirm
+`NOVA_TTS_BINARY=1` and that the gateway's GPU isn't oversubscribed
+(`nvidia-smi` while talking should show steady activity).
+
+**Kyutai/Qwen3 OOM**: smaller STT or move to CPU with
+`NOVA_KYUTAI_DEVICE=cpu`. Qwen3-ASR-0.6B at fp16 fits on ~1.2 GB VRAM.
+
+**Echo loop (Nova talks to itself)**: the echo guard catches near-identical
+transcripts. If real follow-ups also get dropped, lower the Jaccard
+threshold in `Session._looks_like_echo` (currently 0.6) or raise
+`NOVA_AEC_GUARD_MS` to `800`.
+
+**`turn_metrics: stt_ms` consistently large**: streaming partials aren't
+settling. Try `NOVA_QWEN3_STABILITY_TICKS=1` (accept first match) or widen
+`NOVA_QWEN3_PARTIAL_WINDOW_S=5.0` so each partial sees more context.
+
+**`turn_metrics: tts_ttfb_ms` large on first turn only**: cold-start cost.
+The lifespan now warms both `create()` and `create_stream()` — if first turn
+is still slow, check the boot log for `Kokoro stream warmup failed`.
