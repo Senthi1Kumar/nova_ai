@@ -84,10 +84,10 @@ that exposes `/v1/chat/completions` — vLLM, Ollama, llama.cpp.
   --n-gpu-layers 999 --ctx-size 4096 --threads -1 \
   --temp 1.0 --top-p 0.95 --top-k 64 \
   --jinja \
-  --chat-template-kwargs '{"enable_thinking":false}'
+  --reasoning off'
 ```
 
-`--jinja` is required for tool-calling support. `enable_thinking:false`
+`--jinja` is required for tool-calling support. `reasoning off`
 keeps TTFB low.
 
 ### 4. Run the gateway
