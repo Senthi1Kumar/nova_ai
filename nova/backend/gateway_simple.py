@@ -558,6 +558,7 @@ class Kyutai1BSTT:
 
     def __init__(self) -> None:
         import math
+        import moshi.models  # type: ignore
         from moshi.models.loaders import CheckpointInfo  # type: ignore
         repo = os.getenv("NOVA_KYUTAI_HF_REPO", "kyutai/stt-1b-en_fr")
         self.device = os.getenv("NOVA_KYUTAI_DEVICE", "cuda" if torch.cuda.is_available() else "cpu")
@@ -565,7 +566,11 @@ class Kyutai1BSTT:
         self.silence_prefix_s = info.stt_config.get("audio_silence_prefix_seconds", 1.0)
         self.delay_s = info.stt_config.get("audio_delay_seconds", 0.5)
         self.mimi = info.get_mimi(device=self.device)
-        self.lm_gen = info.get_moshi_lm(device=self.device, lm_gen=True)
+        # Match the production worker (stt_kyutai_worker.py:107-108): load the
+        # LM, then wrap it in LMGen. The older `info.get_moshi_lm(lm_gen=True)`
+        # path was removed in moshi >= ~0.3.
+        _lm = info.get_moshi(device=self.device, dtype=torch.bfloat16)
+        self.lm_gen = moshi.models.LMGen(_lm, temp=0, temp_text=0.0)
         self.tokenizer = info.get_text_tokenizer()
         self.padding_token_id = info.raw_config.get("text_padding_token_id", 3)
         self.kyutai_sr = int(self.mimi.sample_rate)
