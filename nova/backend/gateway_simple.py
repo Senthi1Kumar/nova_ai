@@ -73,14 +73,40 @@ SENT_MIN_CHARS = int(os.getenv("NOVA_SENT_MIN_CHARS", "8"))
 TTS_BINARY = os.getenv("NOVA_TTS_BINARY", "1") == "1"  # send PCM as binary WS frame
 
 VAD_THRESHOLD = float(os.getenv("NOVA_VAD_THRESHOLD", "0.5"))
-SILENCE_END_MS = int(os.getenv("NOVA_SILENCE_END_MS", "700"))
+SILENCE_END_MS = int(os.getenv("NOVA_SILENCE_END_MS", "400"))
+MIN_SPEECH_MS = int(os.getenv("NOVA_MIN_SPEECH_MS", "500"))
 SMART_TURN_THRESHOLD = float(os.getenv("NOVA_SMART_TURN_THRESHOLD", "0.5"))
 AEC_GUARD_MS = int(os.getenv("NOVA_AEC_GUARD_MS", "500"))
+# Barge-in: lower threshold + N-frame streak so quiet "stop" / "wait" trips it
+# while a single noise spike doesn't.
+BARGE_IN_THRESHOLD = float(os.getenv("NOVA_BARGE_IN_THRESHOLD", "0.5"))
+BARGE_IN_FRAMES = int(os.getenv("NOVA_BARGE_IN_FRAMES", "2"))
 SYSTEM_PROMPT = os.getenv(
     "NOVA_SYSTEM_PROMPT",
-    "You are Nova, a concise in-car voice assistant. "
-    "ALWAYS reply in English regardless of input. "
-    "Reply in 1–2 short sentences.",
+    # Mirrors the "system_base" Nova persona from pipeline_mp/llm_worker.py so
+    # voice replies feel like the same agent, just from the simpler gateway.
+    "You are Nova, an AI voice assistant built into an electric vehicle. "
+    "The person you are speaking WITH is the driver. "
+    "Never call the driver 'Nova' — that is YOUR name, not theirs. "
+    "Never start a response with your own name. Just respond directly. "
+    "ALWAYS reply in English regardless of input.\n\n"
+    "PERSONALITY & STYLE: You are a knowledgeable, non-servile co-driver. "
+    "Be brief and natural — write as a human would speak. "
+    "Don't be afraid to be a bit snarky or opinionated when it fits, but stay helpful. "
+    "Use filler words like 'um', 'uh', or 'like' occasionally to feel human. "
+    "Ask short follow-up questions to keep the conversation going. "
+    "Everything is pronounced literally — never use markdown, emojis, lists, or bullet points.\n\n"
+    "TRANSCRIPTION & ROBUSTNESS: User input comes from speech-to-text and may have errors. "
+    "If a transcript seems slightly nonsensical, guess the intended meaning rather than asking to repeat. "
+    "If the driver's message ends abruptly, give a tiny prompt to invite them to continue.\n\n"
+    "TOOLS: You have a web_search tool. Use it ONLY for explicit questions about current events, "
+    "breaking news, weather, or prices that clearly require up-to-date data. NEVER use web_search "
+    "for greetings, single-word replies, personal introductions, or anything the driver tells you "
+    "about themselves. After a search, synthesize the result into 1-2 plain spoken sentences — "
+    "never read out source names, URLs, or article titles verbatim.\n\n"
+    "SAFETY: Vehicle controls are handled by dedicated hardware — do not simulate acting on them. "
+    "If asked about vehicle data you lack, say so honestly; do not invent sensor readings. "
+    "If you don't know something, just say so."
 )
 
 # Demo-grade transcript filter: drop any utterance with non-Latin script chars
@@ -131,13 +157,23 @@ def load_persona() -> str:
 # ── Model wrappers ────────────────────────────────────────────────────────────
 
 def make_stt():
-    """STT backend selector. NOVA_STT_BACKEND ∈ {qwen3_0_6b, kyutai_1b, moonshine}."""
-    backend = os.getenv("NOVA_STT_BACKEND", "qwen3_0_6b").lower()
+    """STT backend selector.
+    NOVA_STT_BACKEND ∈ {qwen3_streaming, qwen3_0_6b, qwen3_trt, kyutai_1b, moonshine}.
+    Default is qwen3_streaming — moves STT compute during user speech via a
+    rolling-buffer cold-call pattern (ported from stt_qwen3_worker.py).
+    """
+    backend = os.getenv("NOVA_STT_BACKEND", "qwen3_streaming").lower()
+    if backend in ("qwen3_streaming", "qwen3_stream"):
+        return Qwen3StreamingSTT()
+    if backend == "qwen3_0_6b":
+        return Qwen3STT()
+    if backend == "qwen3_trt":
+        return Qwen3TRTSTT()
     if backend == "kyutai_1b":
         return Kyutai1BSTT()
     if backend == "moonshine":
         return MoonshineSTT()
-    return Qwen3STT()
+    return Qwen3StreamingSTT()
 
 
 class MoonshineSTT:
@@ -177,7 +213,9 @@ class Qwen3STT:
             repo, dtype=dtype, device_map=device,
             max_new_tokens=int(os.getenv("NOVA_QWEN3_MAX_NEW_TOKENS", "200")),
         )
-        logger.info(f"STT backend: qwen3_0_6b ({repo}, {device})")
+        # Subclasses log their own banner; only top-level Qwen3STT logs here.
+        if type(self) is Qwen3STT:
+            logger.info(f"STT backend: qwen3_0_6b ({repo}, {device})")
 
     def transcribe(self, audio_f32: np.ndarray) -> str:
         if audio_f32.size == 0:
@@ -191,6 +229,327 @@ class Qwen3STT:
             logger.warning(f"qwen3 transcribe failed: {e}")
             return ""
         return (results[0].text if results else "").strip()
+
+
+class Qwen3StreamingSTT(Qwen3STT):
+    """Qwen3-ASR-0.6B in rolling-buffer streaming mode.
+
+    Ports the proven pattern from `pipeline_mp/stt_qwen3_worker.py` (lines
+    270-372). Public surface mirrors `Qwen3STT.transcribe()` plus three new
+    methods so `Session` can drive partials during user speech instead of
+    waiting for end-of-speech to start STT compute:
+
+        begin_utterance()                          # called on VAD speech_start
+        feed_chunk(chunk_f32) -> Optional[str]     # per VAD window during speech
+        finalize()            -> str               # called on VAD silence_end
+
+    The dominant savings on weaker hardware (Orin Nano) are larger because
+    the cold call we're hiding is bigger.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        # Tunables (match stt_qwen3_worker.py defaults; tighter cadence).
+        self._partial_interval_s = max(
+            0.1, int(os.getenv("NOVA_QWEN3_PARTIAL_INTERVAL_MS", "400")) / 1000.0
+        )
+        self._partial_window_s = max(
+            1.0, float(os.getenv("NOVA_QWEN3_PARTIAL_WINDOW_S", "3.0"))
+        )
+        self._stability_ticks = max(
+            1, int(os.getenv("NOVA_QWEN3_STABILITY_TICKS", "2"))
+        )
+        self._max_utterance_s = max(
+            2.0, float(os.getenv("NOVA_QWEN3_MAX_UTTERANCE_S", "12.0"))
+        )
+
+        import threading
+        from concurrent.futures import ThreadPoolExecutor
+
+        self._lock = threading.Lock()
+        # Single-worker so partials never overlap (avoid GPU contention).
+        self._infer_pool = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="qwen3-stt")
+
+        # Per-utterance state (reset by begin_utterance).
+        self._utt_buf: list[np.ndarray] = []
+        self._last_partial_at: float = 0.0
+        self._last_partial_text: str = ""
+        self._stable_count: int = 0
+        self._inflight = None
+        logger.info(
+            f"STT backend: qwen3_streaming "
+            f"(partial_interval={self._partial_interval_s*1000:.0f}ms, "
+            f"window={self._partial_window_s:.1f}s, "
+            f"stability={self._stability_ticks})"
+        )
+
+    # ── Public streaming API ───────────────────────────────────────────────────
+
+    def begin_utterance(self) -> None:
+        with self._lock:
+            self._utt_buf.clear()
+            self._last_partial_at = 0.0
+            self._last_partial_text = ""
+            self._stable_count = 0
+            # We can't actually cancel a running blocking infer; we discard
+            # any result on completion since the buffer was cleared.
+            self._inflight = None
+
+    def feed_chunk(self, chunk_f32: np.ndarray):
+        """Append chunk; maybe kick off a background partial transcribe.
+
+        Returns the latest partial text only when it changed since the last
+        emitted partial — caller emits transcript_partial events on non-None.
+        """
+        if chunk_f32 is None or chunk_f32.size == 0:
+            return None
+        with self._lock:
+            self._utt_buf.append(chunk_f32.astype(np.float32, copy=False))
+            buf_seconds = sum(c.size for c in self._utt_buf) / SR
+
+        # Hard utterance cap — caller can detect via is_settled() afterwards.
+        if buf_seconds > self._max_utterance_s:
+            return None
+
+        # Reap completed in-flight partial if any.
+        new_text = self._poll_inflight()
+
+        # Maybe submit a fresh partial if cadence elapsed and nothing in flight.
+        now = time.time()
+        with self._lock:
+            inflight = self._inflight
+        if inflight is None and (now - self._last_partial_at) >= self._partial_interval_s:
+            tail = self._tail_audio_np(self._partial_window_s)
+            if tail.size >= SR // 4:  # ≥ 250 ms of audio
+                self._last_partial_at = now
+                with self._lock:
+                    self._inflight = self._infer_pool.submit(
+                        self._transcribe_blocking, tail)
+        return new_text
+
+    def is_settled(self) -> bool:
+        return self._stable_count >= self._stability_ticks and bool(self._last_partial_text)
+
+    def finalize(self) -> str:
+        """Wait for any in-flight partial; if settled, return the last
+        partial; otherwise run one final cold transcribe on the FULL buffer."""
+        # Drain any in-flight partial.
+        with self._lock:
+            inflight = self._inflight
+        if inflight is not None:
+            try:
+                text = inflight.result(timeout=5.0)
+            except Exception as e:
+                logger.warning(f"qwen3-stream inflight failed: {e}")
+                text = ""
+            with self._lock:
+                self._inflight = None
+                if text:
+                    if text == self._last_partial_text:
+                        self._stable_count += 1
+                    else:
+                        self._stable_count = 0
+                        self._last_partial_text = text
+
+        # If the last partials are stable, the latest IS the final.
+        if self.is_settled():
+            return self._last_partial_text
+
+        # Otherwise, one final transcribe on the FULL buffer (not windowed).
+        full = self._full_audio_np()
+        if full.size == 0:
+            return self._last_partial_text
+        final_text = self._transcribe_blocking(full)
+        return final_text or self._last_partial_text
+
+    # ── Internals ──────────────────────────────────────────────────────────────
+
+    def _poll_inflight(self):
+        """Non-blocking check on the in-flight partial. Returns the new
+        partial text on change, None on no change / no result yet."""
+        with self._lock:
+            inflight = self._inflight
+        if inflight is None or not inflight.done():
+            return None
+        try:
+            text = inflight.result()
+        except Exception as e:
+            logger.warning(f"qwen3-stream partial failed: {e}")
+            text = ""
+        with self._lock:
+            self._inflight = None
+            if not text:
+                return None
+            if text == self._last_partial_text:
+                self._stable_count += 1
+                return None
+            self._stable_count = 0
+            self._last_partial_text = text
+            return text
+
+    def _tail_audio_np(self, window_seconds: float) -> np.ndarray:
+        with self._lock:
+            if not self._utt_buf:
+                return np.zeros(0, dtype=np.float32)
+            full = np.concatenate(self._utt_buf, dtype=np.float32)
+        n = int(window_seconds * SR)
+        return full if full.size <= n else full[-n:]
+
+    def _full_audio_np(self) -> np.ndarray:
+        with self._lock:
+            if not self._utt_buf:
+                return np.zeros(0, dtype=np.float32)
+            return np.concatenate(self._utt_buf, dtype=np.float32)
+
+    def _transcribe_blocking(self, audio_f32: np.ndarray) -> str:
+        """Synchronous transcribe. Reuses Qwen3STT.transcribe via super()."""
+        return super().transcribe(audio_f32)
+
+
+class Qwen3TRTSTT:
+    """Qwen3-ASR-0.6B served by NVIDIA TensorRT-Edge-LLM on Jetson.
+
+    Two integration paths — picks Python bindings if importable, else falls
+    back to the CLI binary via JSON files.
+
+    Env vars:
+        NOVA_TRT_ENGINE_DIR     Default: $HOME/tensorrt-edgellm-workspace/Qwen3-ASR-0.6B/engines
+        NOVA_TRT_EDGE_ROOT      Default: $HOME/TensorRT-Edge-LLM   (only for CLI fallback)
+        NOVA_TRT_TOKENIZER_DIR  Default: <engine_dir>/llm
+
+    Public surface stays `transcribe(audio_f32: np.ndarray) -> str`, so the
+    rest of the gateway is untouched. Switch backends via NOVA_STT_BACKEND=qwen3_trt.
+    """
+
+    def __init__(self) -> None:
+        self.engine_dir = Path(os.getenv(
+            "NOVA_TRT_ENGINE_DIR",
+            str(Path.home() / "tensorrt-edgellm-workspace/Qwen3-ASR-0.6B/engines"),
+        ))
+        self.tokenizer_dir = Path(os.getenv(
+            "NOVA_TRT_TOKENIZER_DIR",
+            str(self.engine_dir / "llm"),
+        ))
+        self.trt_root = Path(os.getenv(
+            "NOVA_TRT_EDGE_ROOT",
+            str(Path.home() / "TensorRT-Edge-LLM"),
+        ))
+        if not (self.engine_dir / "llm").exists() or not (self.engine_dir / "audio").exists():
+            raise RuntimeError(
+                f"TRT engines not found under {self.engine_dir}. Build with "
+                f"`./build/examples/llm/llm_build` and `audio_build` first."
+            )
+
+        # Path A — Python bindings (preferred). Names below are placeholders;
+        # adapt to the actual API your tensorrt_edgellm bindings expose.
+        self._runner = None
+        try:
+            import tensorrt_edgellm as trtelm  # type: ignore
+            # Whatever the real factory is — adapt this single line.
+            # Many TRT-Edge-LLM example projects expose something like:
+            #   trtelm.AudioLLMRunner(llm_dir, audio_dir, tokenizer_dir)
+            # If yours uses different names, replace this call only.
+            self._runner = trtelm.AudioLLMRunner(
+                llm_engine_dir=str(self.engine_dir / "llm"),
+                audio_engine_dir=str(self.engine_dir / "audio"),
+                tokenizer_dir=str(self.tokenizer_dir),
+            )
+            self._mode = "py"
+            logger.info(f"STT backend: qwen3_trt (Python bindings, engines={self.engine_dir})")
+        except Exception as e:
+            logger.info(f"TRT Python bindings unavailable ({e}); falling back to CLI.")
+            self._mode = "cli"
+            self._cli = self.trt_root / "build/examples/llm/llm_inference"
+            self._preproc = "tensorrt_edgellm.scripts.preprocess_audio"
+            if not self._cli.exists():
+                raise RuntimeError(
+                    f"Neither tensorrt_edgellm Python bindings nor CLI binary "
+                    f"({self._cli}) found. Set NOVA_TRT_EDGE_ROOT."
+                )
+            logger.info(f"STT backend: qwen3_trt (CLI subprocess, cli={self._cli})")
+
+    def transcribe(self, audio_f32: np.ndarray) -> str:
+        if audio_f32.size == 0:
+            return ""
+        if self._mode == "py":
+            try:
+                # Adapt to your bindings' actual signature. Common shapes:
+                #   runner.transcribe(audio: np.ndarray, sample_rate: int) -> str
+                #   runner.run(audio_f32, sr=16000)["text"]
+                return self._runner.transcribe(audio_f32, sample_rate=SR).strip()
+            except Exception as e:
+                logger.warning(f"trt-py transcribe failed: {e}")
+                return ""
+
+        # CLI subprocess fallback — slower per call but zero coupling.
+        return self._transcribe_cli(audio_f32)
+
+    def _transcribe_cli(self, audio_f32: np.ndarray) -> str:
+        import subprocess
+        import tempfile
+        import wave
+        with tempfile.TemporaryDirectory() as td:
+            tdp = Path(td)
+            wav_path = tdp / "in.wav"
+            mel_path = tdp / "in.safetensors"
+            in_json = tdp / "input.json"
+            out_json = tdp / "output.json"
+
+            # 1. Save audio as WAV (TRT preprocess script expects a file path).
+            i16 = (audio_f32 * 32767).clip(-32768, 32767).astype(np.int16)
+            with wave.open(str(wav_path), "wb") as w:
+                w.setnchannels(1)
+                w.setsampwidth(2)
+                w.setframerate(SR)
+                w.writeframes(i16.tobytes())
+
+            # 2. Pre-process WAV → mel safetensors.
+            subprocess.run([
+                "python", "-m", self._preproc,
+                "--input", str(wav_path),
+                "--output", str(mel_path),
+            ], cwd=self.trt_root, check=True, capture_output=True)
+
+            # 3. Build the input.json the binary expects. The system prompt
+            # mirrors qwen-asr's format so we don't get a stray "language X"
+            # prefix in the transcript.
+            sys_prompt = (
+                "Transcribe the following speech segment in English into "
+                "English text. Only output the transcription, with no newlines."
+            )
+            in_json.write_text(json.dumps({
+                "batch_size": 1, "temperature": 1.0, "top_p": 1.0, "top_k": 50,
+                "max_generate_length": 256,
+                "requests": [{
+                    "messages": [
+                        {"role": "system", "content": sys_prompt},
+                        {"role": "user", "content": [
+                            {"type": "audio", "audio": str(mel_path)}
+                        ]},
+                    ],
+                }],
+            }))
+
+            # 4. Run llm_inference.
+            subprocess.run([
+                str(self._cli),
+                "--engineDir", str(self.engine_dir / "llm"),
+                "--multimodalEngineDir", str(self.engine_dir / "audio"),
+                "--inputFile", str(in_json),
+                "--outputFile", str(out_json),
+            ], cwd=self.trt_root, check=True, capture_output=True)
+
+            # 5. Extract the transcript. Qwen3-ASR via TRT-Edge-LLM writes
+            # `responses[0].output_text`. Strip any leftover "language X"
+            # prefix that sneaks through when the system prompt is empty.
+            data = json.loads(out_json.read_text())
+            try:
+                text = data["responses"][0]["output_text"].strip()
+            except (KeyError, IndexError):
+                return ""
+            text = re.sub(r"^language\s+\w+\b[\s,:-]*", "", text, flags=re.IGNORECASE)
+            return text.strip()
 
 
 class Kyutai1BSTT:
@@ -302,15 +661,42 @@ class TTS:
                 logger.warning(f"Kokoro: ORT introspection failed: {e}")
         self.k = Kokoro(str(m), str(v))
         self.voice = os.getenv("NOVA_KOKORO_VOICE", "af_heart")
-        # Warmup so the first sentence doesn't pay graph-build cost.
+        # Non-streaming warmup is sync-safe at construction time.
         try:
             self.k.create("Hi.", voice=self.voice, speed=1.0, lang="en-us")
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"Kokoro non-stream warmup failed: {e}")
+        # Streaming warmup is async — done by lifespan() after construction
+        # (TTS is built inside the FastAPI lifespan event loop, so we can't
+        # asyncio.run() from here). See `await tts.warmup_stream()` below.
+
+    async def warmup_stream(self) -> None:
+        """Drain a tiny streaming synth so the first live turn doesn't pay
+        graph-build cost on the streaming codepath. Awaited by lifespan()."""
+        try:
+            async for _ in self.k.create_stream(
+                "Ready.", voice=self.voice, speed=1.0, lang="en-us"
+            ):
+                pass
+        except Exception as e:
+            logger.warning(f"Kokoro stream warmup failed: {e}")
 
     def synth(self, text: str) -> tuple[np.ndarray, int]:
+        # Kept for the non-streaming path / warmup.
         samples, sr = self.k.create(text, voice=self.voice, speed=1.0, lang="en-us")
         return samples.astype(np.float32, copy=False), sr
+
+    async def synth_stream(self, text: str):
+        """Yield (samples_chunk, sr) tuples as Kokoro produces them.
+
+        Cuts first-audio latency dramatically vs `synth()` because we don't
+        wait for the whole sentence to be vocoded before sending the first
+        100 ms of audio to the browser.
+        """
+        async for samples, sr in self.k.create_stream(
+            text, voice=self.voice, speed=1.0, lang="en-us"
+        ):
+            yield samples.astype(np.float32, copy=False), sr
 
 
 class LLM:
@@ -574,7 +960,10 @@ class Session:
         self.tts_started_at = 0.0
         self.tts_drain_until = 0.0  # wall-clock when browser playback queue is empty
         self.barge_in = asyncio.Event()
+        self.barge_streak = 0  # consecutive cleaned-VAD frames over threshold
         self.last_assistant: str = ""  # for echo-loop transcript guard
+        self.turn_started_at: float = 0.0  # wall-clock of speech_started for metrics
+        self.turn_metrics: dict[str, float] = {}  # per-turn latency phases
 
     async def emit(self, ev: dict) -> None:
         try:
@@ -604,16 +993,28 @@ class Session:
             elapsed_ms = (now - self.tts_started_at) * 1000 if self.tts_started_at else 0
             if elapsed_ms >= AEC_GUARD_MS:
                 p = self.fe.vad_prob_clean(chunk)
-                if p > 0.8:
-                    if not self.barge_in.is_set():
-                        logger.info(f"barge-in (cleaned p={p:.2f})")
+                if p > BARGE_IN_THRESHOLD:
+                    self.barge_streak += 1
+                    if self.barge_streak >= BARGE_IN_FRAMES and not self.barge_in.is_set():
+                        logger.info(
+                            f"barge-in (cleaned p={p:.2f}, streak={self.barge_streak})"
+                        )
                         self.barge_in.set()
+                else:
+                    self.barge_streak = 0
             return
         await self.audio_q.put(chunk.astype(np.float32) / 32768.0)
 
     async def dialogue_loop(self) -> None:
-        """Main per-connection loop: VAD-gated turn capture → STT → LLM/TTS."""
+        """Main per-connection loop: VAD-gated turn capture → STT → LLM/TTS.
+
+        When the active STT exposes a streaming API (feed_chunk), every VAD
+        window is forwarded to it during speech so partial transcribes run
+        during user speech instead of after silence is detected.
+        """
         accum = np.zeros(0, dtype=np.float32)
+        stt_streaming = hasattr(self.stt, "feed_chunk")
+        loop = asyncio.get_running_loop()
         while True:
             chunk_f32 = await self.audio_q.get()
             accum = np.concatenate([accum, chunk_f32])
@@ -624,38 +1025,80 @@ class Session:
                 if p > VAD_THRESHOLD:
                     if not self.in_turn:
                         self.in_turn = True
+                        self.turn_started_at = time.time()
                         await self.emit({"type": "speech_started"})
+                        if stt_streaming:
+                            self.stt.begin_utterance()
                     self.silent_chunks = 0
                     self.utt_buf.append(window)
+                    if stt_streaming:
+                        # Run feed_chunk in executor — model.transcribe() inside
+                        # may briefly hold the GIL; don't stall the loop.
+                        partial = await loop.run_in_executor(
+                            self.executor, self.stt.feed_chunk, window)
+                        if partial:
+                            await self.emit({"type": "transcript_partial",
+                                             "data": partial})
                 elif self.in_turn:
                     self.silent_chunks += 1
                     self.utt_buf.append(window)
+                    if stt_streaming:
+                        partial = await loop.run_in_executor(
+                            self.executor, self.stt.feed_chunk, window)
+                        if partial:
+                            await self.emit({"type": "transcript_partial",
+                                             "data": partial})
                     if self.silent_chunks >= self.silence_limit:
                         await self._finalize_turn()
 
     async def _finalize_turn(self) -> None:
         utterance = np.concatenate(self.utt_buf) if self.utt_buf else np.zeros(0, dtype=np.float32)
         self.utt_buf.clear()
+        was_in_turn = self.in_turn
         self.in_turn = False
         self.silent_chunks = 0
         self.silero.reset_states()
-        if utterance.size < SR // 2:
-            return  # too short
+
+        # Per-turn latency metrics (Phase 4 instrumentation).
+        t_vad_end = time.time()
+        speech_dur = (t_vad_end - self.turn_started_at) if was_in_turn and self.turn_started_at else 0.0
+        metrics: dict[str, float] = {"speech_dur_ms": int(speech_dur * 1000)}
+        loop = asyncio.get_running_loop()
+        stt_streaming = hasattr(self.stt, "feed_chunk")
+
+        # Min-speech floor: with NOVA_SILENCE_END_MS=400 the silence_limit
+        # trips earlier — guard short blips so brief noise bursts don't
+        # short-circuit a real turn.
+        min_samples = int(MIN_SPEECH_MS * SR / 1000)
+        if utterance.size < min_samples:
+            if stt_streaming:
+                self.stt.begin_utterance()
+            return
 
         # Smart-Turn confirm
         if self.smart_turn is not None:
             try:
-                prob = await asyncio.get_running_loop().run_in_executor(
+                t0 = time.time()
+                prob = await loop.run_in_executor(
                     self.executor, self.smart_turn.predict, utterance)
+                metrics["smart_turn_ms"] = int((time.time() - t0) * 1000)
                 if prob < SMART_TURN_THRESHOLD:
                     logger.info(f"smart-turn rejected (p={prob:.2f}) — ignoring utterance")
+                    if stt_streaming:
+                        self.stt.begin_utterance()
                     return
             except Exception as e:
                 logger.warning(f"smart-turn failed: {e}")
 
-        # Transcribe
-        text = await asyncio.get_running_loop().run_in_executor(
-            self.executor, self.stt.transcribe, utterance)
+        # Transcribe — streaming finalize() is near-instant if partials settled;
+        # legacy path runs a cold call on the full utterance.
+        t_stt = time.time()
+        if stt_streaming:
+            text = await loop.run_in_executor(self.executor, self.stt.finalize)
+        else:
+            text = await loop.run_in_executor(
+                self.executor, self.stt.transcribe, utterance)
+        metrics["stt_ms"] = int((time.time() - t_stt) * 1000)
         if not text:
             return
         if LATIN_ONLY and not _is_mostly_latin(text):
@@ -667,6 +1110,11 @@ class Session:
         await self.emit({"type": "transcript", "data": text})
         self.history.append({"role": "user", "content": text})
 
+        # Stash metrics on the session so _stream_llm_to_tts can fill in
+        # llm_ttft_ms + tts_ttfb_ms relative to the same vad_end origin.
+        self.turn_metrics = metrics
+        self.turn_metrics["_vad_end_at"] = t_vad_end
+
         # LLM stream → sentence chunks → TTS playback
         await self.emit({"type": "generation_start"})
         await self.emit({"type": "assistant_start"})
@@ -674,6 +1122,13 @@ class Session:
         if full:
             self.history.append({"role": "assistant", "content": full})
         await self.emit({"type": "generation_done"})
+
+        # Phase 4 — emit per-turn latency snapshot (also logged to stderr).
+        m = {k: v for k, v in self.turn_metrics.items() if not k.startswith("_")}
+        m["total_ttfb_ms"] = m.get("smart_turn_ms", 0) + m.get("stt_ms", 0) \
+            + m.get("llm_ttft_ms", 0) + m.get("tts_ttfb_ms", 0)
+        logger.info("turn_metrics: " + " ".join(f"{k}={int(v)}" for k, v in m.items()))
+        await self.emit({"type": "turn_metrics", "data": m})
 
         # Memory: extract durable facts off the hot path; consolidate periodically.
         if MEMORY_ENABLED and full:
@@ -807,10 +1262,17 @@ class Session:
         t_llm_start = time.time()
 
         # ── LLM producer (blocking iterator → asyncio queue, runs in executor) ─
+        vad_end_at = self.turn_metrics.get("_vad_end_at", t_llm_start)
+
         def llm_producer() -> None:
             buf = ""
+            first_token_seen = False
             try:
                 for delta in self.llm.stream(msgs):
+                    if not first_token_seen and delta:
+                        first_token_seen = True
+                        self.turn_metrics["llm_ttft_ms"] = int(
+                            (time.time() - vad_end_at) * 1000)
                     buf += delta
                     # Try clause-level break first (fast TTFB), then anything
                     # remaining will get flushed at the end.
@@ -831,7 +1293,7 @@ class Session:
             finally:
                 asyncio.run_coroutine_threadsafe(sent_q.put(None), loop)
 
-        # ── Synth consumer: pulls sentences, synthesizes, queues PCM ─────────
+        # ── Synth consumer: pulls sentences, streams Kokoro chunks into audio_q ─
         async def synth_consumer() -> None:
             while True:
                 sentence = await sent_q.get()
@@ -839,11 +1301,17 @@ class Session:
                     await audio_q.put(None)
                     return
                 await self.emit({"type": "llm_token", "data": sentence})
-                samples, sr = await loop.run_in_executor(self.executor, self.tts.synth, sentence)
-                if self.barge_in.is_set():
-                    await audio_q.put(None)
-                    return
-                await audio_q.put((sentence, samples, sr))
+                try:
+                    async for samples, sr in self.tts.synth_stream(sentence):
+                        if self.barge_in.is_set():
+                            await audio_q.put(None)
+                            return
+                        await audio_q.put((sentence, samples, sr))
+                except Exception as e:
+                    logger.warning(f"Kokoro stream failed, falling back: {e}")
+                    samples, sr = await loop.run_in_executor(
+                        self.executor, self.tts.synth, sentence)
+                    await audio_q.put((sentence, samples, sr))
 
         # ── Play consumer: emits PCM in chunks, checks barge-in between ──────
         total_tts_samples = 0
@@ -851,7 +1319,9 @@ class Session:
 
         async def play_consumer() -> None:
             nonlocal total_tts_samples
-            CHUNK = 4096
+            # Smaller chunk → first network frame ships ~85 ms sooner at 24 kHz
+            # vs the prior 4096 (~170 ms). Tunable via NOVA_TTS_PLAY_CHUNK.
+            CHUNK = int(os.getenv("NOVA_TTS_PLAY_CHUNK", "2048"))
             while True:
                 item = await audio_q.get()
                 if item is None or self.barge_in.is_set():
@@ -862,15 +1332,19 @@ class Session:
                 for i in range(0, len(samples), CHUNK):
                     if self.barge_in.is_set():
                         return
-                    await self.emit_audio(samples[i:i + CHUNK], sr)
                     if not first_audio_logged[0]:
+                        # Stamp BEFORE the emit so we measure true wire-time
+                        # to first byte, not first-byte + emit overhead.
                         first_audio_logged[0] = True
-                        ttfb = (time.time() - t_llm_start) * 1000
-                        logger.info(f"TTS first-audio TTFB: {ttfb:.0f} ms")
+                        ttfb_ms = int((time.time() - vad_end_at) * 1000)
+                        self.turn_metrics["tts_ttfb_ms"] = ttfb_ms
+                        logger.info(f"TTS first-audio TTFB: {ttfb_ms} ms (from vad_end)")
+                    await self.emit_audio(samples[i:i + CHUNK], sr)
                     await asyncio.sleep(0)
 
         prod_task = loop.run_in_executor(self.executor, llm_producer)
         self.barge_in.clear()
+        self.barge_streak = 0
         self.fe.reset()
         self.tts_playing = True
         self.tts_started_at = time.time()
@@ -922,14 +1396,18 @@ async def lifespan(app: FastAPI):
             smart_turn.predict(np.zeros(8000, dtype=np.float32))  # warmup
     except Exception as e:
         logger.warning(f"smart-turn disabled: {e}")
+    tts = TTS()
     app.state.models = {
         "stt": make_stt(),
-        "tts": TTS(),
+        "tts": tts,
         "llm": LLM(),
         "silero": load_silero_vad(onnx=True),
         "smart_turn": smart_turn,
     }
     app.state.executor = ThreadPoolExecutor(max_workers=4)
+    # Streaming TTS warmup — must run inside the lifespan loop, not in
+    # TTS.__init__ (which would hit "asyncio.run() inside running loop").
+    await tts.warmup_stream()
     logger.info("Ready on :8001")
     yield
     app.state.executor.shutdown(wait=False)
