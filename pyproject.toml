@@ -16,8 +16,11 @@ dependencies = [
     "scipy",
     "python-multipart",
     "pydub",
+    # onnxruntime-gpu – uncomment exactly ONE line below for your platform.
+    # Jetson / ARM64 (Thor):
+    # "onnxruntime-gpu @ https://pypi.jetson-ai-lab.io/sbsa/cu130/onnxruntime-gpu/onnxruntime_gpu-1.24.0-cp312-cp312-linux_aarch64.whl ; platform_machine == 'aarch64'",
+    # x86_64 (Arch, etc.) – uses ort-nightly index:
     "onnxruntime-gpu; platform_machine == 'x86_64'",
-    "onnxruntime; platform_machine == 'aarch64'",
     "pyaudio",
     "torch<2.10",
     "torchvision<0.25",
@@ -84,7 +87,7 @@ explicit = true
 
 [tool.uv.sources]
 microwakeword = { path = "nova/backend/kws/micro-wake-word" }
-onnxruntime-gpu = { index = "ort-nightly", marker = "platform_machine == 'x86_64'" }
+onnxruntime-gpu = { index = "ort-nightly" }
 torch = { index = "pytorch-cu130" }
 torchvision = { index = "pytorch-cu130" }
 torchaudio = { index = "pytorch-cu130" }
@@ -123,3 +126,4 @@ addopts = "-v -m 'not e2e'"
 markers = [
     "e2e: end-to-end tests that load real models (deselected by default)",
 ]
+

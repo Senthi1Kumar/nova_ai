@@ -45,6 +45,16 @@ nova/backend/
 
 ### 1. Install deps
 
+### Platform‑specific ONNX Runtime GPU
+
+This project uses `onnxruntime-gpu` for TTS and other ONNX models.  
+Before running `uv sync`, uncomment the correct line in `pyproject.toml`:
+
+- **NVIDIA Jetson (Thor / ARM64):**  
+  Uncomment the line with `@ https://pypi.jetson-ai-lab.io/...` and comment the plain `"onnxruntime-gpu"` line.
+- **AMD64/Intel (Arch Linux, etc.):**  
+  Uncomment the plain `"onnxruntime-gpu"` line and comment the Jetson URL line.
+
 ```bash
 uv sync
 ```
