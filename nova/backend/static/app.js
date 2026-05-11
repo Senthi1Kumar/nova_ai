@@ -44,7 +44,6 @@
     ws.onclose = () => setStatus('idle', 'disconnected');
     ws.onerror = () => showErr('connection error');
     ws.onmessage = onMessage;
-    // Track expected binary audio frame from preceding header
     pendingAudioSr = 0;
 
     micCtx = new AudioContext({ sampleRate: 16000 });
@@ -90,7 +89,6 @@
   }
 
   function onMessage(e) {
-    // Binary frame arrives right after an audio_header text frame.
     if (e.data instanceof ArrayBuffer) {
       const i16 = new Int16Array(e.data);
       playPCM(i16, pendingAudioSr || 24000);
@@ -117,12 +115,10 @@
       case 'generation_done':
         setStatus('listen', 'listening');
         assistantSpan = null;
-        // Refresh sidebar after the turn — memory may have grown.
         loadDoc(currentDoc);
         break;
       case 'audio_header': pendingAudioSr = msg.sr || 24000; break;
       case 'audio_out': {
-        // Legacy base64 path (NOVA_TTS_BINARY=0).
         const bin = atob(msg.pcm_b64);
         const arr = new Uint8Array(bin.length);
         for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
@@ -133,7 +129,7 @@
     }
   }
 
-  // Sidebar tabs
+  // ── Sidebar tabs ────────────────────────────────────────────────────────────
   let currentDoc = 'user';
   async function loadDoc(name) {
     try {
@@ -150,10 +146,130 @@
   });
   loadDoc('user');
 
+  // ── Voice fingerprint enrollment ───────────────────────────────────────────
+  const VP_PROMPTS = [
+    "The quick brown fox jumps over the lazy dog.",
+    "Nova, navigate me home and play some music.",
+    "What is the weather forecast for tomorrow?",
+    "Turn on the AC and set temperature to twenty-two degrees.",
+    "Order me a coffee from the nearest café.",
+  ];
+  let vpCount = 0;
+
+  function buildVoicePrompts() {
+    const container = $('voice-prompts');
+    if (!container) return;
+    container.innerHTML = '';
+    vpCount = 0;
+    VP_PROMPTS.forEach((phrase, i) => {
+      const btn = document.createElement('button');
+      btn.className = 'vp-btn';
+      btn.id = `vp-btn-${i}`;
+      btn.innerHTML = `<span class="vp-check" id="vp-check-${i}"></span><span class="vp-text">"${phrase}"</span>`;
+      btn.addEventListener('click', async () => {
+        btn.classList.add('recording');
+        btn.querySelector('.vp-text').textContent = 'recording…';
+        $('vp-status').textContent = `Recording phrase ${i+1}…`;
+
+        let rec, stream;
+        try {
+          stream = await navigator.mediaDevices.getUserMedia({
+            audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }
+          });
+          rec = new MediaRecorder(stream);
+          const chunks = [];
+          rec.ondataavailable = e => chunks.push(e.data);
+          rec.onstop = async () => {
+            stream.getTracks().forEach(t => t.stop());
+            const blob = new Blob(chunks, { type: 'audio/webm' });
+            const fd = new FormData();
+            fd.append('file', blob, `voice_${i+1}.webm`);
+            fd.append('index', i + 1);
+            fd.append('total', VP_PROMPTS.length);
+            fd.append('driver_id', 'driver1');
+
+            try {
+              const r = await fetch('/enroll/voice-sample', { method: 'POST', body: fd });
+              const data = await r.json();
+              if (data.status === 'enrolled') {
+                btn.classList.remove('recording');
+                btn.classList.add('done');
+                btn.querySelector('.vp-check').textContent = '✓';
+                btn.querySelector('.vp-text').textContent = `"${phrase}"`;
+                $('vp-status').textContent = 'Voiceprint enrolled! Restart Nova to activate pVAD.';
+                $('vp-status').classList.add('enrolled');
+                $('vp-hint').textContent = 'Voice enrolled. Restart server to load pVAD speaker gate.';
+                // Mark all buttons as done
+                document.querySelectorAll('.vp-btn').forEach(b => {
+                  b.classList.add('done');
+                  b.querySelector('.vp-check').textContent = '✓';
+                });
+              } else if (data.status === 'ok') {
+                btn.classList.remove('recording');
+                btn.classList.add('done');
+                btn.querySelector('.vp-check').textContent = '✓';
+                btn.querySelector('.vp-text').textContent = `"${phrase}"`;
+                vpCount++;
+                $('vp-status').textContent = `${vpCount}/${VP_PROMPTS.length} recorded`;
+              } else {
+                btn.classList.remove('recording');
+                $('vp-status').textContent = 'Error: ' + (data.error || 'unknown');
+              }
+            } catch (err) {
+              btn.classList.remove('recording');
+              $('vp-status').textContent = 'Upload error: ' + err.message;
+            }
+          };
+          rec.start();
+          setTimeout(() => rec.stop(), 3500);
+        } catch (err) {
+          btn.classList.remove('recording');
+          $('vp-status').textContent = 'Mic error: ' + err.message;
+        }
+      });
+      container.appendChild(btn);
+    });
+  }
+
+  // ── Check pVAD status ──────────────────────────────────────────────────────
+  async function checkPvadStatus() {
+    try {
+      const r = await fetch('/pVAD/status');
+      const d = await r.json();
+      const badge = $('pvad-badge');
+      if (badge) {
+        if (d.loaded) {
+          badge.classList.remove('hidden');
+          badge.title = `pVAD active — speaker-gated barge-in (${d.speaker})`;
+        } else {
+          badge.classList.add('hidden');
+        }
+      }
+    } catch (_) {}
+  }
+
+  // ── Check enrollment on load ───────────────────────────────────────────────
+  async function initEnrollment() {
+    try {
+      const r = await fetch('/enroll/check');
+      const d = await r.json();
+      if (d.voice_enrolled) {
+        $('vp-hint').textContent = 'Voice already enrolled. pVAD speaker gate active on restart.';
+        $('vp-status').textContent = 'Enrolled ✓';
+        $('vp-status').classList.add('enrolled');
+      }
+      buildVoicePrompts();
+    } catch (_) {
+      buildVoicePrompts();
+    }
+  }
+
+  initEnrollment();
+  checkPvadStatus();
+
   $('micBtn').onclick = () => on ? stop() : start();
   document.addEventListener('keydown', e => {
     if (e.code === 'Space' && on && playCtx) {
-      // local interrupt: drop scheduled playback so user feels barge-in immediately
       try { playCtx.close(); } catch {}
       playCtx = new AudioContext({ sampleRate: 24000 });
       playT = playCtx.currentTime;

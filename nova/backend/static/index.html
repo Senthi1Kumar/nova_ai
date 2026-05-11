@@ -9,7 +9,10 @@
 <body>
   <header>
     <div class="brand"><b>NOVA</b> &nbsp;·&nbsp; in-car voice agent</div>
-    <div class="pill"><span id="dot" class="dot idle"></span><span id="status">idle</span></div>
+    <div class="pill">
+      <span id="pvad-badge" class="pvad-badge hidden" title="pVAD speaker gate">🔐</span>
+      <span id="dot" class="dot idle"></span><span id="status">idle</span>
+    </div>
   </header>
 
   <main>
@@ -29,6 +32,12 @@
         <div class="tab" data-doc="conversation">CHAT</div>
       </div>
       <pre class="doc" id="doc">(loading…)</pre>
+
+      <!-- ── Voice fingerprint enrollment ── -->
+      <h3 style="margin-top:8px">Voice Enrollment</h3>
+      <p class="hint" id="vp-hint">Record 5 phrases to enroll your voice. Required for speaker-gated barge-in.</p>
+      <div id="voice-prompts" class="voice-prompts"></div>
+      <p id="vp-status" class="vp-status"></p>
     </aside>
   </main>
 

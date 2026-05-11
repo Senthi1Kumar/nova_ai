@@ -90,3 +90,21 @@ button.mic.on { background: radial-gradient(circle at 30% 30%, #ff6b6b 0%, #8a2a
 .doc { white-space: pre-wrap; font: 12px/1.55 ui-monospace, SFMono-Regular, monospace; background: #0a0e15; border: 1px solid var(--line); border-radius: 10px; padding: 10px; max-height: 280px; overflow: auto; color: #cfd8e3 }
 .hint { color: var(--muted); font-size: 13px }
 .err { color: var(--error); font-size: 12px; text-align: center }
+
+/* Voice enrollment */
+.pvad-badge { margin-right: 2px; font-size: 12px; cursor: help }
+.pvad-badge.hidden { display: none }
+.voice-prompts { display: flex; flex-direction: column; gap: 6px; margin-top: 4px }
+.vp-btn {
+  border: 1px solid var(--line); border-radius: 8px; padding: 6px 10px;
+  background: transparent; color: var(--muted); cursor: pointer;
+  font-size: 11px; display: flex; align-items: center; gap: 8px;
+  transition: all .15s; text-align: left; width: 100%
+}
+.vp-btn:hover { border-color: var(--accent); color: var(--fg) }
+.vp-btn.recording { border-color: var(--error); color: var(--error); pointer-events: none }
+.vp-btn.done { border-color: var(--accent); color: var(--accent); opacity: .5 }
+.vp-btn .vp-check { color: var(--accent); font-size: 12px; flex-shrink: 0; width: 14px }
+.vp-btn .vp-text { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap }
+.vp-status { font-size: 10px; color: var(--muted); margin-top: 4px; min-height: 1em }
+.vp-status.enrolled { color: var(--accent); font-weight: 600 }
