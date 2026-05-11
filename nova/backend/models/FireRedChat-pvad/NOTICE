@@ -1,0 +1,7 @@
+---
+license: "apache-2.0"
+---
+### fireredchat-pvad
+
+pvad.onnx: FireRedChat personalized VAD model
+speaker embedding weight: [speechbrain/spkrec-ecapa-voxceleb](https://huggingface.co/speechbrain/spkrec-ecapa-voxceleb) (license: "apache-2.0")
