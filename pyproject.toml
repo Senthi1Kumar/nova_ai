@@ -18,7 +18,7 @@ dependencies = [
     "pydub",
     # onnxruntime-gpu – uncomment exactly ONE line below for your platform.
     # Jetson / ARM64 (Thor):
-    # "onnxruntime-gpu @ https://pypi.jetson-ai-lab.io/sbsa/cu130/onnxruntime-gpu/onnxruntime_gpu-1.24.0-cp312-cp312-linux_aarch64.whl ; platform_machine == 'aarch64'",
+    # "onnxruntime-gpu @ https://pypi.jetson-ai-lab.io/sbsa/cu130/+f/012/c10bef23a39f0/onnxruntime_gpu-1.24.0-cp312-cp312-linux_aarch64.whl#sha256=012c10bef23a39f074730d158b72f797a7314f2695c65835a0669b57282422f6  ; platform_machine == 'aarch64'",
     # x86_64 (Arch, etc.) – uses ort-nightly index:
     "onnxruntime-gpu; platform_machine == 'x86_64'",
     "pyaudio",
