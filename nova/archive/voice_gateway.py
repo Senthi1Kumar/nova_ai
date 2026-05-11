@@ -719,6 +719,8 @@ class LLM:
 
     def __init__(self) -> None:
         self.backend = os.getenv("NOVA_LLM_BACKEND", "openrouter").lower()
+        self.max_tokens = int(os.getenv("NOVA_LLM_MAX_TOKENS", "200"))
+        self.tool_max_tokens = int(os.getenv("NOVA_TOOL_MAX_TOKENS", "120"))
         if self.backend == "local":
             self.base_url = os.getenv("NOVA_LLM_BASE_URL", "http://localhost:8000/v1").rstrip("/")
             self.api_key = os.getenv("NOVA_LLM_API_KEY", "EMPTY")  # vLLM/llama.cpp ignore it
@@ -735,12 +737,13 @@ class LLM:
                 )
         logger.info(f"LLM backend: {self.backend} ({self.model} @ {self.base_url})")
 
-    def stream(self, messages: list[dict]) -> Iterator[str]:
-        yield from self._stream_request(messages, tools=None)
+    def stream(self, messages: list[dict], max_tokens: int | None = None) -> Iterator[str]:
+        yield from self._stream_request(messages, tools=None, max_tokens=max_tokens)
 
-    def _stream_request(self, messages: list[dict], tools: list[dict] | None) -> Iterator[str]:
+    def _stream_request(self, messages: list[dict], tools: list[dict] | None, max_tokens: int | None = None) -> Iterator[str]:
         import requests
-        body: dict = {"model": self.model, "messages": messages, "stream": True, "max_tokens": 200}
+        mt = max_tokens if max_tokens is not None else self.max_tokens
+        body: dict = {"model": self.model, "messages": messages, "stream": True, "max_tokens": mt}
         if tools:
             body["tools"] = tools
             body["tool_choice"] = "auto"
@@ -763,12 +766,13 @@ class LLM:
                 except Exception:
                     continue
 
-    def chat(self, messages: list[dict], tools: list[dict] | None = None) -> dict:
+    def chat(self, messages: list[dict], tools: list[dict] | None = None, max_tokens: int | None = None) -> dict:
         """Non-streaming completion. Used to detect tool_calls before deciding
         whether to stream the final answer or run a tool round-trip first.
         Returns the raw `choices[0].message` dict."""
         import requests
-        body: dict = {"model": self.model, "messages": messages, "max_tokens": 200}
+        mt = max_tokens if max_tokens is not None else self.tool_max_tokens
+        body: dict = {"model": self.model, "messages": messages, "max_tokens": mt}
         if tools:
             body["tools"] = tools
             body["tool_choice"] = "auto"
@@ -814,11 +818,13 @@ _NEWSY = ("news", "headline", "latest", "breaking", "today",
 _TOOL_TRIGGERS = re.compile(
     r"\b(news|weather|price|stock|score|score of|who won|when did|"
     r"how many|how much|latest|today|tomorrow|yesterday|currently|"
-    r"right now|search|look up|google|find out|forecast)\b",
+    r"right now|search|look up|google|find out|forecast|"
+    r"what happened|headlines|update on|tell me about|did .* happen|is .* true)\b",
     re.IGNORECASE,
 )
 _CONVERSATIONAL = re.compile(
-    r"^(hi|hello|hey|thanks|thank you|ok|okay|yes|no|cool|nice|great|sure)\b",
+    r"^(hi|hello|hey|thanks|thank you|ok|okay|yes|no|cool|nice|great|sure|"
+    r"bye|goodbye|see you|later|stop|wait|pause|continue|go on|repeat that)\b",
     re.IGNORECASE,
 )
 
@@ -830,6 +836,30 @@ def _needs_tools(prompt: str) -> bool:
     if len(s.split()) <= 3 and "?" not in s:
         return False
     return bool(_TOOL_TRIGGERS.search(s))
+
+
+def _extract_tool_calls_from_text(text: str) -> list[dict]:
+    """Fallback parser for Gemma 4 native tool syntax when llama.cpp doesn't
+    populate the tool_calls field (known edge-case in some builds)."""
+    pattern = re.compile(r'<\|tool_call>call:(\w+)\{(.*?)<tool_call\|>', re.DOTALL)
+    calls = []
+    for name, raw_args in pattern.findall(text):
+        # Replace Gemma's <|"|> ... <|"|> with standard quotes
+        cleaned = re.sub(r'<\|"\|>(.*?)<\|"\|>', r'"\1"', raw_args)
+        # Quote bare keys so json.loads has a chance
+        cleaned = re.sub(r'([a-zA-Z_][a-zA-Z0-9_]*)\s*:', r'"\1":', cleaned)
+        try:
+            args = json.loads("{" + cleaned + "}")
+        except Exception:
+            # Last-ditch: grab query= for web_search
+            m = re.search(r'"query"\s*:\s*"([^"]+)"', cleaned)
+            args = {"query": m.group(1)} if m else {}
+        calls.append({
+            "id": f"fallback_{len(calls)}",
+            "type": "function",
+            "function": {"name": name, "arguments": json.dumps(args)},
+        })
+    return calls
 
 
 def _serper_search(query: str, max_results: int = 3) -> str:
@@ -871,21 +901,6 @@ def _exec_tool(name: str, args: dict) -> str:
     if name == "web_search":
         return _serper_search(args.get("query", ""), int(args.get("max_results", 3)))
     return json.dumps({"error": f"unknown tool: {name}"})
-
-
-def split_sentences(text: str) -> list[str]:
-    parts, carry = [], ""
-    for p in SENT_END.split(text.strip()):
-        p = p.strip()
-        if not p:
-            continue
-        carry = f"{carry} {p}".strip() if carry else p
-        if len(carry) >= SENT_MIN_CHARS:
-            parts.append(carry)
-            carry = ""
-    if carry:
-        parts.append(carry)
-    return parts
 
 
 # ── Audio front-end (APM + VAD, inline) ───────────────────────────────────────
@@ -997,6 +1012,11 @@ class Session:
     async def ingest(self, audio_bytes: bytes) -> None:
         chunk = np.frombuffer(audio_bytes, dtype=np.int16)
         now = time.time()
+        # Once barge-in is triggered, route everything to STT immediately so
+        # we don't lose the start of the new utterance.
+        if self.barge_in.is_set():
+            await self.audio_q.put(chunk.astype(np.float32) / 32768.0)
+            return
         # If TTS is playing OR the browser is still draining buffered audio,
         # mic input is muted from STT — only the AEC barge-in path sees it.
         if self.tts_playing or now < self.tts_drain_until:
@@ -1025,6 +1045,7 @@ class Session:
         accum = np.zeros(0, dtype=np.float32)
         stt_streaming = hasattr(self.stt, "feed_chunk")
         loop = asyncio.get_running_loop()
+        vad_windows_processed = 0
         while True:
             chunk_f32 = await self.audio_q.get()
             accum = np.concatenate([accum, chunk_f32])
@@ -1060,6 +1081,13 @@ class Session:
                                              "data": partial})
                     if self.silent_chunks >= self.silence_limit:
                         await self._finalize_turn()
+                # Prevent unbounded growth during continuous noise or barge-in backlog
+                if accum.size > SR * 30:
+                    accum = accum[-SR * 5:]
+                # Yield control every few windows so other tasks don't starve
+                vad_windows_processed += 1
+                if vad_windows_processed % 4 == 0:
+                    await asyncio.sleep(0)
 
     async def _finalize_turn(self) -> None:
         utterance = np.concatenate(self.utt_buf) if self.utt_buf else np.zeros(0, dtype=np.float32)
@@ -1067,7 +1095,11 @@ class Session:
         was_in_turn = self.in_turn
         self.in_turn = False
         self.silent_chunks = 0
-        self.silero.reset_states()
+        try:
+            if hasattr(self.silero, 'reset_states'):
+                self.silero.reset_states()
+        except Exception:
+            pass
 
         # Per-turn latency metrics (Phase 4 instrumentation).
         t_vad_end = time.time()
@@ -1216,16 +1248,37 @@ class Session:
 
         Returns the (possibly augmented) message list. Single round-trip max.
         """
-        if not os.getenv("SERPER_API_KEY") or not _needs_tools(user_text):
+        if not os.getenv("SERPER_API_KEY") or os.getenv("NOVA_ENABLE_TOOLS", "1") != "1":
+            return msgs
+        if not (os.getenv("NOVA_ALWAYS_TOOLS") == "1" or _needs_tools(user_text)):
             return msgs
         try:
-            reply = self.llm.chat(msgs, tools=SERPER_TOOLS)
+            reply = self.llm.chat(msgs, tools=SERPER_TOOLS, max_tokens=self.llm.tool_max_tokens)
         except Exception as e:
             logger.warning(f"tool pre-call failed: {e}")
             return msgs
+
         tool_calls = reply.get("tool_calls") or []
+
+        # Fallback: some llama.cpp builds return tool syntax in content instead
+        # of the native tool_calls array (Gemma 4 edge-case).
+        if not tool_calls and reply.get("content"):
+            tool_calls = _extract_tool_calls_from_text(reply["content"])
+
         if not tool_calls:
             return msgs
+
+        # Deduplicate: Gemma 4 occasionally emits the same call twice.
+        seen: set[tuple[str, str]] = set()
+        deduped: list[dict] = []
+        for tc in tool_calls:
+            fn = tc.get("function", {})
+            key = (fn.get("name", ""), fn.get("arguments", ""))
+            if key not in seen:
+                seen.add(key)
+                deduped.append(tc)
+        tool_calls = deduped
+
         # Append the assistant's tool_call message first (OpenAI protocol).
         msgs = msgs + [{
             "role": "assistant",
@@ -1284,18 +1337,25 @@ class Session:
                         self.turn_metrics["llm_ttft_ms"] = int(
                             (time.time() - vad_end_at) * 1000)
                     buf += delta
-                    # Try clause-level break first (fast TTFB), then anything
-                    # remaining will get flushed at the end.
+                    # Try clause-level break first (fast TTFB).
                     while True:
                         m = CLAUSE_BREAK.search(buf)
-                        if not m:
-                            break
-                        chunk = buf[: m.start() + 1].strip()
-                        buf = buf[m.end():]
-                        if len(chunk) >= SENT_MIN_CHARS or not first_sentence_emitted[0]:
-                            asyncio.run_coroutine_threadsafe(sent_q.put(chunk), loop)
-                            full_text_parts.append(chunk)
+                        if m:
+                            chunk = buf[: m.start() + 1].strip()
+                            buf = buf[m.end():]
+                            if len(chunk) >= SENT_MIN_CHARS or not first_sentence_emitted[0]:
+                                asyncio.run_coroutine_threadsafe(sent_q.put(chunk), loop)
+                                full_text_parts.append(chunk)
+                                first_sentence_emitted[0] = True
+                            continue
+                        # Emergency flush: if buffer is very long with no break,
+                        # ship it anyway so TTS doesn't stall on a run-on sentence.
+                        if len(buf) >= 140 and not first_sentence_emitted[0]:
+                            asyncio.run_coroutine_threadsafe(sent_q.put(buf.strip()), loop)
+                            full_text_parts.append(buf.strip())
                             first_sentence_emitted[0] = True
+                            buf = ""
+                        break
                 tail = buf.strip()
                 if tail:
                     asyncio.run_coroutine_threadsafe(sent_q.put(tail), loop)
@@ -1361,12 +1421,18 @@ class Session:
         try:
             await asyncio.gather(synth_consumer(), play_consumer())
         finally:
-            await prod_task
+            barge_happened = self.barge_in.is_set()
+            if not barge_happened:
+                await prod_task
             self.tts_playing = False
-            total_dur_s = total_tts_samples / TTS_SR if total_tts_samples else 0.0
-            elapsed_s = time.time() - self.tts_started_at if self.tts_started_at else 0.0
-            remaining_s = max(0.0, total_dur_s - elapsed_s)
-            self.tts_drain_until = time.time() + remaining_s + 0.7
+            if barge_happened:
+                # Clear drain lock immediately so the next turn can start.
+                self.tts_drain_until = 0.0
+            else:
+                total_dur_s = total_tts_samples / TTS_SR if total_tts_samples else 0.0
+                elapsed_s = time.time() - self.tts_started_at if self.tts_started_at else 0.0
+                remaining_s = max(0.0, total_dur_s - elapsed_s)
+                self.tts_drain_until = time.time() + remaining_s + 0.7
             self.tts_started_at = 0.0
         full = " ".join(full_text_parts)
         self.last_assistant = full
