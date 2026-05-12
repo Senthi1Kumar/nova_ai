@@ -4,11 +4,11 @@
   --fg: #e6ecf3; --muted: #7e8a9c; --accent: #4cd2c8; --accent-2: #4f7cff;
   --user: #ffd166; --error: #ff6b6b;
 }
-html,body { height: 100% }
+html,body { height: 100%; overflow: hidden }
 body {
   margin: 0; background: radial-gradient(1200px 600px at 70% -10%, #14223a 0%, var(--bg-0) 60%);
   color: var(--fg); font: 15px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
-  display: grid; grid-template-rows: auto 1fr auto; min-height: 100vh;
+  display: grid; grid-template-rows: auto minmax(0, 1fr) auto; height: 100vh;
 }
 header {
   padding: 18px 28px; display: flex; align-items: center; gap: 14px;
@@ -29,11 +29,19 @@ header {
 
 main {
   display: grid; grid-template-columns: minmax(0, 1fr) 360px; gap: 24px;
-  padding: 28px; max-width: 1200px; margin: 0 auto; width: 100%;
+  padding: 20px 28px; max-width: 1200px; margin: 0 auto; width: 100%;
+  min-height: 0; overflow: hidden;
 }
-@media (max-width: 900px) { main { grid-template-columns: 1fr } }
+@media (max-width: 900px) { main { grid-template-columns: 1fr; overflow-y: auto } }
 
-.turns { display: flex; flex-direction: column; gap: 12px; min-height: 60vh }
+.turns {
+  display: flex; flex-direction: column; gap: 12px;
+  min-height: 0; overflow-y: auto; overflow-x: hidden;
+  padding-right: 6px;
+  scrollbar-width: thin; scrollbar-color: var(--line) transparent;
+}
+.turns::-webkit-scrollbar { width: 8px }
+.turns::-webkit-scrollbar-thumb { background: var(--line); border-radius: 4px }
 .turn {
   padding: 14px 16px; border-radius: 14px; border: 1px solid var(--line);
   background: linear-gradient(180deg, rgba(255,255,255,0.02), rgba(255,255,255,0));
@@ -47,8 +55,10 @@ main {
 aside {
   display: flex; flex-direction: column; gap: 14px;
   border: 1px solid var(--line); border-radius: 16px; padding: 18px; background: var(--bg-1);
-  align-self: start; position: sticky; top: 20px;
+  min-height: 0; overflow-y: auto; align-self: stretch;
 }
+aside::-webkit-scrollbar { width: 8px }
+aside::-webkit-scrollbar-thumb { background: var(--line); border-radius: 4px }
 aside h3 { margin: 0 0 4px; font-size: 12px; letter-spacing: .12em; color: var(--muted); text-transform: uppercase; font-weight: 600 }
 .row { display: flex; gap: 8px; align-items: center; justify-content: space-between }
 .row .v { color: var(--fg); font-variant-numeric: tabular-nums }
@@ -60,10 +70,14 @@ footer {
   padding: 18px 28px; border-top: 1px solid var(--line);
   display: flex; align-items: center; gap: 16px; justify-content: center;
 }
-.mic-wrap { position: relative; display: inline-flex; align-items: center; justify-content: center }
+.mic-wrap {
+  position: relative; display: inline-flex; align-items: center; justify-content: center;
+  width: 76px; height: 76px; flex: 0 0 76px;
+}
 .mic-wrap::before, .mic-wrap::after {
   content: ""; position: absolute; inset: 0; border-radius: 50%;
   border: 2px solid var(--accent-2); opacity: 0; pointer-events: none;
+  will-change: transform, opacity;
 }
 body[data-state="listening"] .mic-wrap::before { animation: ring 1.6s ease-out infinite; border-color: var(--accent) }
 body[data-state="listening"] .mic-wrap::after  { animation: ring 1.6s ease-out infinite .8s; border-color: var(--accent) }
