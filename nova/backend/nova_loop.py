@@ -526,6 +526,16 @@ class Kyutai1BSTT:
 
 
 class NemotronStreamingSTT:
+    """
+    True cache-aware streaming STT for nvidia/nemotron-speech-streaming-en-0.6b.
+
+    Mirrors the pattern in NeMo's speech_to_text_cache_aware_streaming_infer.py:
+    each new audio chunk is encoded once via `conformer_stream_step`, with the
+    encoder cache (last-channel, last-time) and RNNT decoder state
+    (`previous_hypotheses`, `pred_out_stream`) threaded across calls. Cost per
+    partial is O(chunk), not O(utterance).
+    """
+
     def __init__(self) -> None:
         import torch
         from nemo.collections.asr.models import ASRModel
@@ -539,157 +549,170 @@ class NemotronStreamingSTT:
             map_location=self.device,
         ).to(self.device).eval()
 
+        # Optional override of att_context_size, e.g. "70,13" (left, right).
+        # Right context dictates streaming latency vs accuracy. Choices for
+        # this model: {0, 1, 6, 13}.
+        att_env = os.getenv("NOVA_NEMOTRON_ATT_CONTEXT")
+        if att_env:
+            try:
+                parts = [int(x) for x in att_env.split(",")]
+                if hasattr(self.model.encoder, "set_default_att_context_size"):
+                    self.model.encoder.set_default_att_context_size(att_context_size=parts)
+                    logger.info(f"Nemotron: att_context_size={parts}")
+            except Exception as e:
+                logger.warning(f"Nemotron: att_context override failed: {e}")
+
         if hasattr(self.model, "setup_streaming_params"):
             try:
                 self.model.setup_streaming_params()
-                logger.info("Nemotron: streaming params configured")
             except Exception as e:
                 logger.warning(f"Nemotron: setup_streaming_params failed: {e}")
 
-        self._partial_interval_s = max(
-            0.1, int(os.getenv("NOVA_NEMOTRON_PARTIAL_INTERVAL_MS", "200")) / 1000.0
+        # RNNT greedy decoding so `previous_hypotheses` is honored.
+        try:
+            from nemo.collections.asr.parts.submodules.rnnt_decoding import RNNTDecodingConfig
+            dec_cfg = RNNTDecodingConfig(fused_batch_size=-1, strategy="greedy")
+            if hasattr(self.model, "change_decoding_strategy"):
+                self.model.change_decoding_strategy(dec_cfg)
+        except Exception as e:
+            logger.warning(f"Nemotron: change_decoding_strategy failed: {e}")
+
+        # Derive raw-audio samples per streaming chunk from the encoder's
+        # streaming config: chunk_size is in *encoder* (post-subsampling) frames.
+        scfg = self.model.encoder.streaming_cfg
+        chunk_frames = getattr(scfg, "chunk_size", None)
+        if isinstance(chunk_frames, (list, tuple)):
+            chunk_frames = chunk_frames[0]
+        subsampling = (
+            getattr(self.model.encoder, "subsampling_factor", None)
+            or getattr(getattr(self.model, "cfg", None), "subsampling_factor", None)
+            or 8
         )
-        self._stability_ticks = max(
-            1, int(os.getenv("NOVA_NEMOTRON_STABILITY_TICKS", "2"))
-        )
-        self._max_utterance_s = max(
-            2.0, float(os.getenv("NOVA_NEMOTRON_MAX_UTTERANCE_S", "12.0"))
-        )
+        try:
+            win_stride = float(self.model.cfg.preprocessor.window_stride)
+        except Exception:
+            win_stride = 0.01
+        if chunk_frames and chunk_frames > 0:
+            self._chunk_samples = int(round(chunk_frames * subsampling * win_stride * SR))
+        else:
+            self._chunk_samples = int(0.08 * SR)
+        if self._chunk_samples <= 0:
+            self._chunk_samples = int(0.08 * SR)
 
         import threading
-        from concurrent.futures import ThreadPoolExecutor
-
         self._lock = threading.Lock()
-        self._infer_pool = ThreadPoolExecutor(
-            max_workers=1, thread_name_prefix="nemotron-stt")
-
-        self._utt_buf: list[np.ndarray] = []
-        self._last_partial_at: float = 0.0
-        self._last_partial_text: str = ""
-        self._stable_count: int = 0
-        self._inflight = None
+        self._reset_state()
 
         logger.info(
             f"STT backend: nemotron_streaming "
-            f"(partial_interval={self._partial_interval_s*1000:.0f}ms, "
-            f"stability={self._stability_ticks}, device={self.device})"
+            f"(cache-aware, chunk_samples={self._chunk_samples} "
+            f"≈{self._chunk_samples*1000.0/SR:.0f}ms, device={self.device})"
         )
+
+    def _reset_state(self) -> None:
+        (
+            self._cache_last_channel,
+            self._cache_last_time,
+            self._cache_last_channel_len,
+        ) = self.model.encoder.get_initial_cache_state(batch_size=1)
+        self._previous_hypotheses = None
+        self._pred_out_stream = None
+        self._step_num = 0
+        self._pending = np.zeros(0, dtype=np.float32)
+        self._last_text = ""
 
     def begin_utterance(self) -> None:
         with self._lock:
-            self._utt_buf.clear()
-            self._last_partial_at = 0.0
-            self._last_partial_text = ""
-            self._stable_count = 0
-            self._inflight = None
+            self._reset_state()
 
     def feed_chunk(self, chunk_f32: np.ndarray):
         if chunk_f32 is None or chunk_f32.size == 0:
             return None
         with self._lock:
-            self._utt_buf.append(chunk_f32.astype(np.float32, copy=False))
-            buf_seconds = sum(c.size for c in self._utt_buf) / SR
-
-        if buf_seconds > self._max_utterance_s:
-            return None
-
-        new_text = self._poll_inflight()
-
-        now = time.time()
-        with self._lock:
-            inflight = self._inflight
-        if inflight is None and (now - self._last_partial_at) >= self._partial_interval_s:
-            full = self._full_audio_np()
-            if full.size >= SR // 4:
-                self._last_partial_at = now
-                with self._lock:
-                    self._inflight = self._infer_pool.submit(
-                        self._transcribe_blocking, full)
-        return new_text
+            self._pending = np.concatenate(
+                [self._pending, chunk_f32.astype(np.float32, copy=False)]
+            )
+            new_text = None
+            while self._pending.size >= self._chunk_samples:
+                slab = self._pending[: self._chunk_samples]
+                self._pending = self._pending[self._chunk_samples:]
+                text = self._stream_step(slab, last=False)
+                if text and text != self._last_text:
+                    self._last_text = text
+                    new_text = text
+            return new_text
 
     def is_settled(self) -> bool:
-        return self._stable_count >= self._stability_ticks and bool(self._last_partial_text)
+        return bool(self._last_text)
 
     def finalize(self) -> str:
         with self._lock:
-            inflight = self._inflight
-        if inflight is not None:
-            try:
-                text = inflight.result(timeout=10.0)
-            except Exception as e:
-                logger.warning(f"nemotron-stream inflight failed: {e}")
-                text = ""
-            with self._lock:
-                self._inflight = None
+            if self._pending.size > 0:
+                slab = self._pending
+                if slab.size < self._chunk_samples:
+                    slab = np.pad(slab, (0, self._chunk_samples - slab.size))
+                self._pending = np.zeros(0, dtype=np.float32)
+                text = self._stream_step(slab, last=True)
                 if text:
-                    if text == self._last_partial_text:
-                        self._stable_count += 1
-                    else:
-                        self._stable_count = 0
-                        self._last_partial_text = text
+                    self._last_text = text
+            return self._last_text
 
-        if self.is_settled():
-            return self._last_partial_text
-
-        full = self._full_audio_np()
-        if full.size == 0:
-            return self._last_partial_text
-        final_text = self._transcribe_blocking(full)
-        return final_text or self._last_partial_text
-
-    def _poll_inflight(self):
-        with self._lock:
-            inflight = self._inflight
-        if inflight is None or not inflight.done():
-            return None
-        try:
-            text = inflight.result()
-        except Exception as e:
-            logger.warning(f"nemotron-stream partial failed: {e}")
-            text = ""
-        with self._lock:
-            self._inflight = None
-            if not text:
-                return None
-            if text == self._last_partial_text:
-                self._stable_count += 1
-                return None
-            self._stable_count = 0
-            self._last_partial_text = text
-            return text
-
-    def _full_audio_np(self) -> np.ndarray:
-        with self._lock:
-            if not self._utt_buf:
-                return np.zeros(0, dtype=np.float32)
-            return np.concatenate(self._utt_buf, dtype=np.float32)
-
-    def _transcribe_blocking(self, audio_f32: np.ndarray) -> str:
-        if audio_f32.size == 0:
-            return ""
+    def _stream_step(self, audio_chunk: np.ndarray, last: bool) -> str:
         import torch
         try:
-            with torch.no_grad():
-                results = self.model.transcribe(
-                    audio=audio_f32,
-                    batch_size=1,
+            with torch.inference_mode():
+                wav = torch.from_numpy(audio_chunk).unsqueeze(0).to(self.device)
+                length = torch.tensor([audio_chunk.shape[0]], device=self.device)
+                processed_signal, processed_signal_length = self.model.preprocessor(
+                    input_signal=wav, length=length
                 )
-            if isinstance(results, list) and len(results) > 0:
-                hyp = results[0]
-                if hasattr(hyp, "text"):
-                    return hyp.text.strip()
-                elif isinstance(hyp, str):
-                    return hyp.strip()
-                elif isinstance(hyp, dict):
-                    return hyp.get("text", "").strip()
-            elif isinstance(results, str):
-                return results.strip()
-            elif isinstance(results, dict):
-                return results.get("text", "").strip()
-            return ""
+                drop_extra = (
+                    0
+                    if self._step_num == 0
+                    else getattr(self.model.encoder.streaming_cfg, "drop_extra_pre_encoded", 0)
+                )
+                (
+                    pred_out_stream,
+                    transcribed_texts,
+                    cache_last_channel,
+                    cache_last_time,
+                    cache_last_channel_len,
+                    previous_hypotheses,
+                ) = self.model.conformer_stream_step(
+                    processed_signal=processed_signal,
+                    processed_signal_length=processed_signal_length,
+                    cache_last_channel=self._cache_last_channel,
+                    cache_last_time=self._cache_last_time,
+                    cache_last_channel_len=self._cache_last_channel_len,
+                    keep_all_outputs=last,
+                    previous_hypotheses=self._previous_hypotheses,
+                    previous_pred_out=self._pred_out_stream,
+                    drop_extra_pre_encoded=drop_extra,
+                    return_transcription=True,
+                )
+            self._cache_last_channel = cache_last_channel
+            self._cache_last_time = cache_last_time
+            self._cache_last_channel_len = cache_last_channel_len
+            self._previous_hypotheses = previous_hypotheses
+            self._pred_out_stream = pred_out_stream
+            self._step_num += 1
+            return self._extract_text(transcribed_texts)
         except Exception as e:
-            logger.warning(f"nemotron transcribe failed: {e}")
+            logger.warning(f"nemotron stream_step failed: {e}")
             return ""
+
+    @staticmethod
+    def _extract_text(hyps) -> str:
+        if not hyps:
+            return ""
+        h = hyps[0] if isinstance(hyps, (list, tuple)) else hyps
+        if isinstance(h, str):
+            return h.strip()
+        if hasattr(h, "text"):
+            return (h.text or "").strip()
+        if isinstance(h, dict):
+            return (h.get("text") or "").strip()
+        return ""
 
 
 class PocketTTS:
