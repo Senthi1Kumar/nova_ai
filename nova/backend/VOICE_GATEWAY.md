@@ -110,13 +110,43 @@ The gateway speaks OpenAI-compatible chat completions. Either point it at
 OpenRouter (default, requires `OPENROUTER_API_KEY`) or run any local server
 that exposes `/v1/chat/completions` — vLLM, Ollama, llama.cpp.
 
-`llama.cpp` example with Gemma 2 2B (fits 4 GB VRAM at Q4):
+**Auto-launched llama.cpp (recommended):** `nova_loop.py` will spawn
+`llama-server` for you and shut it down on Ctrl-C. Presets live in
+`nova/backend/configs/llama/`.
 
 ```bash
-llama-server \
-  -hf bartowski/gemma-2-2b-it-GGUF:Q4_K_M \
+# 1. Copy a preset template and point `cwd:` at your local llama.cpp checkout.
+cd nova/backend/configs/llama
+cp gemma-4-e4b.yaml.example gemma-4-e4b.yaml      # or qwen3.6-35b-mtp.yaml.example
+$EDITOR gemma-4-e4b.yaml                          # set cwd: /your/path/to/llama.cpp
+                                                  # (the binary defaults to ./build/bin/llama-server)
+
+# 2. Pick the active preset in .env (see #------ Voice Gateway/Nova Loop ------ section).
+#    NOVA_LLAMA_PRESET=gemma-4-e4b
+#    NOVA_LLAMA_PRESET=qwen3.6-35b-mtp
+#    NOVA_DISABLE_LLAMA=1   # skip auto-launch if llama-server is already running
+```
+
+Each preset is a YAML file with `cwd`, `binary`, and an `args:` list — add a
+new file to the directory to register a new model. The `*.yaml` files are
+gitignored (host-specific paths); only the `*.yaml.example` templates are
+committed.
+
+If you'd rather run llama.cpp by hand, set `NOVA_DISABLE_LLAMA=1` and start
+it yourself:
+
+```bash
+./build/bin/llama-server \
+  -hf unsloth/gemma-4-E4B-it-GGUF:Q8_0 \
+  --alias "unsloth/gemma-4-E4B-it" \
   --host 0.0.0.0 --port 8080 \
-  --n-gpu-layers 999 --ctx-size 4096
+  --threads -1 --n-gpu-layers 999 \
+  --ctx-size 128000 \
+  --temp 1.0 \
+  --top-p 0.95 \
+  --top-k 64 \
+  --jinja \
+  --reasoning off
 ```
 
 ### 4. Enroll your voice (required for pVAD barge-in)
@@ -151,19 +181,20 @@ Open `http://localhost:8001`, click the mic, talk. The browser handles mic
 capture + 16 kHz PCM upload via `AudioWorkletNode` and plays back received
 24 kHz PCM frames through `AudioBufferSource`.
 
-## Streaming STT (Qwen3-ASR rolling buffer)
+## Streaming STT (Nemotron native streaming)
 
-The default `Qwen3StreamingSTT` runs partial transcribes on a 3 s rolling
-window every 400 ms while the user is speaking. Identical consecutive
-partials trigger an early settle; otherwise on silence-end one final cold
-transcribe runs against the full utterance buffer.
+The default `NemotronStreamingSTT` (nvidia/nemotron-speech-streaming-en-0.6b)
+uses NeMo's native streaming ASR with per-chunk partials and cache-aware
+encoding (`NOVA_NEMOTRON_ATT_CONTEXT` controls the (left, right) context
+size). The model loads from Hugging Face on first run (~3 GB, cached in
+`HF_HOME`).
 
-Also available: `NemotronStreamingSTT` (nvidia/nemotron-speech-streaming-en-0.6b)
-which uses NeMo's native streaming ASR with per-chunk partials. Switch via
-`NOVA_STT_BACKEND=nemotron_streaming`. The Nemotron model loads from Hugging
-Face at first run (~3 GB, cached in HF_HOME).
+Also available: `Qwen3StreamingSTT` — runs partial transcribes on a 3 s
+rolling window every 400 ms; identical consecutive partials settle early,
+otherwise a final cold transcribe runs on silence-end. Switch via
+`NOVA_STT_BACKEND=qwen3_streaming`.
 
-Switch back to single-call STT for A/B with `NOVA_STT_BACKEND=qwen3_0_6b`.
+Switch to single-call STT for A/B with `NOVA_STT_BACKEND=qwen3_0_6b`.
 
 ## pVAD — speaker-gated barge-in
 
@@ -216,7 +247,7 @@ end-of-speech → first audio frame on the wire.
 
 | Var | Default | Notes |
 |---|---|---|
-| `NOVA_STT_BACKEND` | `qwen3_streaming` | `qwen3_streaming` / `qwen3_0_6b` / `kyutai_1b` / `moonshine` / `nemotron_streaming` |
+| `NOVA_STT_BACKEND` | `nemotron_streaming` | `nemotron_streaming` (default) / `qwen3_streaming` / `qwen3_0_6b` / `kyutai_1b` / `moonshine` |
 | `NOVA_QWEN3_LANGUAGE` | `English` | Pinned so noise stays in-language |
 | `NOVA_QWEN3_PARTIAL_INTERVAL_MS` | `400` | Streaming partial cadence |
 | `NOVA_QWEN3_PARTIAL_WINDOW_S` | `3.0` | Rolling-window length |
