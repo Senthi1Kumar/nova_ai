@@ -1,0 +1,40 @@
+# llama-server preset: Qwen3.6-35B-A3B with MTP speculative draft
+# Selected when NOVA_LLAMA_PRESET=qwen3.6-35b-mtp (or via NOVA_LLAMA_CONFIG=<abs path>).
+
+cwd: /home/user/repos/llama.cpp
+binary: ./build/bin/llama-server
+
+args:
+  - -hf
+  - unsloth/Qwen3.6-35B-A3B-MTP-GGUF:UD-Q4_K_XL
+  - --alias
+  - unsloth/Qwen3.6-35B-A3B
+  - --host
+  - 0.0.0.0
+  - --port
+  - "8080"
+  - -ngl
+  - "99"
+  - -c
+  - "262144"
+  - -fa
+  - "on"
+  - -np
+  - "1"
+  - --spec-type
+  - draft-mtp
+  - --spec-draft-n-max
+  - "2"
+  - --temp
+  - "1.0"
+  - --top-p
+  - "0.95"
+  - --top-k
+  - "20"
+  - --min-p
+  - "0.0"
+  - --presence-penalty
+  - "1.5"
+  - --chat-template-kwargs
+  - '{"enable_thinking":true,"preserve_thinking":true}'
+  - --jinja

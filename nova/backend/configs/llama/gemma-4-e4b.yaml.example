@@ -1,0 +1,30 @@
+# llama-server preset: Gemma 4 E4B (Q8_0)
+# Selected when NOVA_LLAMA_PRESET=gemma-4-e4b (or via NOVA_LLAMA_CONFIG=<abs path>).
+
+cwd: /home/user/repos/llama.cpp
+binary: ./build/bin/llama-server  # or if you've copied the bin to the root just change to ./llama-server
+
+args:
+  - -hf
+  - unsloth/gemma-4-E4B-it-GGUF:Q8_0
+  - --alias
+  - unsloth/gemma-4-E4B-it
+  - --host
+  - 0.0.0.0
+  - --port
+  - "8080"
+  - --threads
+  - "-1"
+  - --n-gpu-layers
+  - "999"
+  - --ctx-size
+  - "128000"
+  - --temp
+  - "1.0"
+  - --top-p
+  - "0.95"
+  - --top-k
+  - "64"
+  - --jinja
+  - --reasoning
+  - off
