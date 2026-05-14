@@ -260,9 +260,12 @@ end-of-speech → first audio frame on the wire.
 | `NOVA_POCKET_VOICE` | `alba` | Pocket-TTS voice name |
 | `NOVA_VAD_THRESHOLD` | `0.65` | Silero per-frame voice prob (car-noise tuned) |
 | `NOVA_VAD_MIN_RMS_DB` | `-45` | Energy floor for RMS gate |
-| `NOVA_SILENCE_END_MS` | `400` | End-of-utterance silence |
+| `NOVA_SILENCE_END_MS` | `800` | End-of-utterance silence (was 400 for Qwen3, raised for Nemotron native streaming) |
 | `NOVA_MIN_SPEECH_MS` | `500` | Drop turns shorter than this |
-| `NOVA_SMART_TURN_THRESHOLD` | `0.5` | Drops if model unsure speaker is done |
+| `NOVA_SMART_TURN_THRESHOLD` | `0.5` | Min prob to accept end-of-turn |
+| `NOVA_SMART_TURN_REPRIEVE_MS` | `1500` | On smart-turn reject, demand this much more silence instead of discarding audio |
+| `NOVA_SMART_TURN_MAX_REPRIEVES` | `2` | Cap reprieves per turn; force-finalize after |
+| `NOVA_MAX_UTTERANCE_S` | `12.0` | Hard cap on speech duration before forced finalize |
 | `NOVA_AEC_GUARD_MS` | `100` | Skip first N ms of TTS for barge-in (was 500) |
 | `NOVA_BARGE_IN_THRESHOLD` | `0.35` | pVAD prob for interrupt |
 | `NOVA_BARGE_IN_FRAMES` | `2` | Consecutive frames to confirm barge-in |

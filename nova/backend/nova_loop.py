@@ -54,6 +54,13 @@ VAD_MIN_RMS_DB = float(os.getenv("NOVA_VAD_MIN_RMS_DB", "-45"))  # NEW: energy f
 SILENCE_END_MS = int(os.getenv("NOVA_SILENCE_END_MS", "400"))
 MIN_SPEECH_MS = int(os.getenv("NOVA_MIN_SPEECH_MS", "500"))
 SMART_TURN_THRESHOLD = float(os.getenv("NOVA_SMART_TURN_THRESHOLD", "0.5"))
+# When smart-turn rejects ("not done yet"), keep the turn open and demand this
+# many extra ms of silence before re-checking, instead of discarding the audio.
+SMART_TURN_REPRIEVE_MS = int(os.getenv("NOVA_SMART_TURN_REPRIEVE_MS", "1500"))
+# Cap reprieves per turn — after this many, force-finalize regardless.
+SMART_TURN_MAX_REPRIEVES = int(os.getenv("NOVA_SMART_TURN_MAX_REPRIEVES", "2"))
+# Hard cap on total speech duration before we finalize, smart-turn or not.
+MAX_UTTERANCE_S = float(os.getenv("NOVA_MAX_UTTERANCE_S", "12.0"))
 AEC_GUARD_MS = int(os.getenv("NOVA_AEC_GUARD_MS", "100"))  # ↓ was 500
 BARGE_IN_THRESHOLD = float(os.getenv("NOVA_BARGE_IN_THRESHOLD", "0.35"))
 BARGE_IN_FRAMES = int(os.getenv("NOVA_BARGE_IN_FRAMES", "2"))
@@ -1064,6 +1071,11 @@ class Session:
         self.last_assistant: str = ""
         self.turn_started_at: float = 0.0
         self.turn_metrics: dict[str, float] = {}
+        # Smart-turn reprieve state: when smart-turn rejects mid-thought, we
+        # keep the turn open instead of discarding. Force-accept on next
+        # silence_end once we've used up the reprieve budget.
+        self._smart_turn_reprieves: int = 0
+        self._force_finalize: bool = False
         # NEW: noise-floor tracker for RMS gating
         self._noise_floor_db = -60.0
         self._noise_samples: deque[float] = deque(maxlen=50)
@@ -1159,7 +1171,10 @@ class Session:
                                 self.executor, self.stt.feed_chunk, window)
                             if partial:
                                 await self.emit({"type": "transcript_partial", "data": partial})
-                        if self.silent_chunks >= self.silence_limit:
+                        if self._exceeded_max_utterance():
+                            self._force_finalize = True
+                            await self._finalize_turn()
+                        elif self.silent_chunks >= self.silence_limit:
                             await self._finalize_turn()
                     continue
                 # ── end RMS gate ─────────────────────────────────────────────
@@ -1179,6 +1194,10 @@ class Session:
                             self.executor, self.stt.feed_chunk, window)
                         if partial:
                             await self.emit({"type": "transcript_partial", "data": partial})
+                    if self._exceeded_max_utterance():
+                        # Speaker hasn't paused but we've hit the hard cap — finalize anyway.
+                        self._force_finalize = True
+                        await self._finalize_turn()
                 elif self.in_turn:
                     self.silent_chunks += 1
                     self.utt_buf.append(window)
@@ -1187,13 +1206,21 @@ class Session:
                             self.executor, self.stt.feed_chunk, window)
                         if partial:
                             await self.emit({"type": "transcript_partial", "data": partial})
-                    if self.silent_chunks >= self.silence_limit:
+                    if self._exceeded_max_utterance():
+                        self._force_finalize = True
+                        await self._finalize_turn()
+                    elif self.silent_chunks >= self.silence_limit:
                         await self._finalize_turn()
                 if accum.size > SR * 30:
                     accum = accum[-SR * 5:]
                 vad_windows_processed += 1
                 if vad_windows_processed % 4 == 0:
                     await asyncio.sleep(0)
+
+    def _exceeded_max_utterance(self) -> bool:
+        if not self.in_turn or not self.turn_started_at:
+            return False
+        return (time.time() - self.turn_started_at) >= MAX_UTTERANCE_S
 
     async def _finalize_turn(self) -> None:
         utterance = np.concatenate(self.utt_buf) if self.utt_buf else np.zeros(0, dtype=np.float32)
@@ -1217,21 +1244,47 @@ class Session:
         if utterance.size < min_samples:
             if stt_streaming:
                 self.stt.begin_utterance()
+            self._smart_turn_reprieves = 0
+            self._force_finalize = False
             return
 
-        if self.smart_turn is not None:
+        if self.smart_turn is not None and not self._force_finalize:
             try:
                 t0 = time.time()
                 prob = await loop.run_in_executor(
                     self.executor, self.smart_turn.predict, utterance)
                 metrics["smart_turn_ms"] = int((time.time() - t0) * 1000)
                 if prob < SMART_TURN_THRESHOLD:
-                    logger.info(f"smart-turn rejected (p={prob:.2f}) — ignoring utterance")
-                    if stt_streaming:
-                        self.stt.begin_utterance()
-                    return
+                    # "Speaker isn't done" — keep the turn open, keep the STT
+                    # encoder cache warm, demand more silence next time.
+                    # After SMART_TURN_MAX_REPRIEVES we force-accept regardless
+                    # so a chronically uncertain smart-turn can't strand us.
+                    if self._smart_turn_reprieves < SMART_TURN_MAX_REPRIEVES:
+                        self._smart_turn_reprieves += 1
+                        # Restore in-turn state — undo the housekeeping at the
+                        # top of this method so accumulation can continue.
+                        self.in_turn = was_in_turn
+                        self.utt_buf = [utterance]  # re-stash so next chunk grows it
+                        # Push silence-end deadline out by REPRIEVE_MS:
+                        # subtract (REPRIEVE_MS / VAD_WIN_MS) from silent_chunks
+                        # so we demand that many extra ms of silence before
+                        # re-checking. Floor at 0 — never make it easier to fire.
+                        reprieve_chunks = max(1, int(SMART_TURN_REPRIEVE_MS / (VAD_WIN / SR * 1000)))
+                        self.silent_chunks = max(0, self.silence_limit - reprieve_chunks)
+                        logger.info(
+                            f"smart-turn reprieve {self._smart_turn_reprieves}/{SMART_TURN_MAX_REPRIEVES} "
+                            f"(p={prob:.2f}) — keeping turn open"
+                        )
+                        return
+                    logger.info(
+                        f"smart-turn still uncertain (p={prob:.2f}) but reprieve budget exhausted — finalizing"
+                    )
             except Exception as e:
                 logger.warning(f"smart-turn failed: {e}")
+
+        # Committed to finalize — clear reprieve state for next turn.
+        self._smart_turn_reprieves = 0
+        self._force_finalize = False
 
         t_stt = time.time()
         if stt_streaming:
