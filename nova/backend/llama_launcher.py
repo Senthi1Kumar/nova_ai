@@ -25,6 +25,15 @@ _CONFIG_DIR = Path(__file__).parent / "configs" / "llama"
 _DEFAULT_PRESET = "gemma-4-e4b"
 
 
+def _flag_value(args: list[str], flag: str) -> Optional[str]:
+    """Return the value following `flag` in args, or None if absent/terminal."""
+    try:
+        idx = args.index(flag)
+    except ValueError:
+        return None
+    return args[idx + 1] if idx + 1 < len(args) else None
+
+
 def _resolve_config_path() -> Optional[Path]:
     """Pick the active preset YAML.
 
@@ -74,6 +83,13 @@ def spawn() -> Optional["subprocess.Popen[bytes]"]:
     if not (os.path.isfile(resolved) and os.access(resolved, os.X_OK)):
         logger.warning("llama-server binary not executable: %s — skipping", resolved)
         return None
+
+    # Mirror the preset's --alias into NOVA_LLM_MODEL so callers don't have to
+    # duplicate the model name in .env. User-set values always win.
+    alias = _flag_value(args, "--alias")
+    if alias and not os.environ.get("NOVA_LLM_MODEL"):
+        os.environ["NOVA_LLM_MODEL"] = alias
+        logger.info("Set NOVA_LLM_MODEL=%s from preset --alias", alias)
 
     cmd = [binary, *args]
     logger.info("Launching llama-server [%s]: %s (cwd=%s)", cfg_path.name, " ".join(cmd), cwd)

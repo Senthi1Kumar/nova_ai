@@ -27,4 +27,4 @@ args:
   - "64"
   - --jinja
   - --reasoning
-  - off
+  - "off"  # quote required — YAML parses bare off/on/yes/no as booleans
