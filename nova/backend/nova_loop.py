@@ -973,14 +973,17 @@ def _serper_search(query: str, max_results: int = 3) -> str:
 
 
 def _tavily_search(query: str, max_results: int = 3) -> str:
-    """Tavily search — returns extracted page content + a direct answer.
+    """Tavily search — returns the synthesized answer + minimal source list.
 
-    Unlike Serper (SERP snippets only), Tavily fetches and extracts the actual
-    page content, and with include_answer="advanced" returns an LLM-synthesized
-    answer string. That answer alone is usually enough for a single-turn voice
-    reply, avoiding the "check the respective sites" problem.
+    Optimized for voice: by default the LLM sees just Tavily's `answer` string
+    (an LLM-synthesized cross-source summary) plus titles + URLs. Per-result
+    extracted content is dropped because (a) the answer field already covers
+    it and (b) 3 × ~700 chars of content blows the prompt up by ~2K tokens,
+    adding 3-5 s to TTFB.
 
-    Returns JSON: {"answer": str, "results": [{"title", "url", "content"}...]}
+    Set NOVA_TAVILY_VERBOSE=1 to opt back into full content per result. If
+    Tavily doesn't return an `answer` (rare), we fall back to truncated
+    content snippets so the LLM still has something to say.
     """
     api_key = os.getenv("TAVILY_API_KEY", "")
     if not api_key:
@@ -998,13 +1001,31 @@ def _tavily_search(query: str, max_results: int = 3) -> str:
             include_answer="advanced",  # LLM-synthesized direct answer (+1 cr)
             include_raw_content=False,
         )
-        results = [
-            {"title": r.get("title", ""), "url": r.get("url", ""), "content": r.get("content", "")}
-            for r in (resp.get("results") or [])[:max_results]
-        ]
-        out: dict = {"results": results, "query": query}
-        if resp.get("answer"):
-            out["answer"] = resp["answer"]
+        answer = resp.get("answer") or ""
+        verbose = os.getenv("NOVA_TAVILY_VERBOSE", "0") == "1"
+        raw = (resp.get("results") or [])[:max_results]
+        if verbose:
+            sources = [
+                {"title": r.get("title", ""), "url": r.get("url", ""), "content": r.get("content", "")}
+                for r in raw
+            ]
+        elif answer:
+            # Answer already summarizes across sources — give the LLM just titles
+            # so it can cite, not re-summarize.
+            sources = [{"title": r.get("title", ""), "url": r.get("url", "")} for r in raw]
+        else:
+            # No answer string — fall back to truncated content (~150 chars/result).
+            sources = [
+                {
+                    "title": r.get("title", ""),
+                    "url": r.get("url", ""),
+                    "content": (r.get("content", "") or "")[:150],
+                }
+                for r in raw
+            ]
+        out: dict = {"query": query, "sources": sources}
+        if answer:
+            out["answer"] = answer
         return json.dumps(out, ensure_ascii=False)
     except Exception as e:
         logger.warning(f"Tavily search failed: {e}")

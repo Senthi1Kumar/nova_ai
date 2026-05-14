@@ -19,6 +19,10 @@ args:
   - "999"
   - --ctx-size
   - "128000"
+  # Re-use KV cache across non-contiguous prefix matches (incl. across tool
+  # roundtrips). Drops post-tool-call TTFB by 100-500 ms.
+  - --cache-reuse
+  - "256"
   - --temp
   - "1.0"
   - --top-p
