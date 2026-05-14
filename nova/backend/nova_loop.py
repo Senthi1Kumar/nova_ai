@@ -23,7 +23,7 @@ import time
 from collections import deque
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any, Iterable, Iterator
+from typing import Any, Iterator
 
 import numpy as np
 import torch
@@ -140,7 +140,7 @@ def _rms_dbfs(samples_f32: np.ndarray) -> float:
 # ── Model wrappers ────────────────────────────────────────────────────────────
 
 def make_stt():
-    backend = os.getenv("NOVA_STT_BACKEND", "qwen3_streaming").lower()
+    backend = os.getenv("NOVA_STT_BACKEND", "nemotron_streaming").lower()
     if backend in ("qwen3_streaming", "qwen3_stream"):
         return Qwen3StreamingSTT()
     if backend == "qwen3_0_6b":
@@ -1727,4 +1727,12 @@ async def pvad_status():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8001, log_level="info")
+    from llama_launcher import spawn as _llama_spawn, shutdown as _llama_shutdown
+
+    llama_proc = _llama_spawn()
+    try:
+        uvicorn.run(app, host="0.0.0.0", port=8001, log_level="info")
+    except KeyboardInterrupt:
+        logger.info("KeyboardInterrupt — shutting down")
+    finally:
+        _llama_shutdown(llama_proc)
