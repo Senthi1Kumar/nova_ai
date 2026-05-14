@@ -972,9 +972,78 @@ def _serper_search(query: str, max_results: int = 3) -> str:
         return json.dumps({"error": str(e), "query": query})
 
 
+def _tavily_search(query: str, max_results: int = 3) -> str:
+    """Tavily search — returns extracted page content + a direct answer.
+
+    Unlike Serper (SERP snippets only), Tavily fetches and extracts the actual
+    page content, and with include_answer="advanced" returns an LLM-synthesized
+    answer string. That answer alone is usually enough for a single-turn voice
+    reply, avoiding the "check the respective sites" problem.
+
+    Returns JSON: {"answer": str, "results": [{"title", "url", "content"}...]}
+    """
+    api_key = os.getenv("TAVILY_API_KEY", "")
+    if not api_key:
+        return json.dumps({"error": "TAVILY_API_KEY not set", "query": query})
+    try:
+        from tavily import TavilyClient  # type: ignore
+    except ImportError as e:
+        return json.dumps({"error": f"tavily-python not installed: {e}", "query": query})
+    try:
+        client = TavilyClient(api_key=api_key)
+        resp = client.search(
+            query=query,
+            search_depth=os.getenv("NOVA_TAVILY_DEPTH", "basic"),  # basic=1cr, advanced=2cr
+            max_results=max(1, min(max_results, 5)),
+            include_answer="advanced",  # LLM-synthesized direct answer (+1 cr)
+            include_raw_content=False,
+        )
+        results = [
+            {"title": r.get("title", ""), "url": r.get("url", ""), "content": r.get("content", "")}
+            for r in (resp.get("results") or [])[:max_results]
+        ]
+        out: dict = {"results": results, "query": query}
+        if resp.get("answer"):
+            out["answer"] = resp["answer"]
+        return json.dumps(out, ensure_ascii=False)
+    except Exception as e:
+        logger.warning(f"Tavily search failed: {e}")
+        return json.dumps({"error": str(e), "query": query, "_fallback": True})
+
+
+def _web_search(query: str, max_results: int = 3) -> str:
+    """Dispatch web search to the configured provider, with fallback.
+
+    Provider selection:
+      NOVA_SEARCH_PROVIDER=tavily  → Tavily only
+      NOVA_SEARCH_PROVIDER=serper  → Serper only
+      NOVA_SEARCH_PROVIDER=auto    → Tavily if TAVILY_API_KEY set, else Serper.
+                                     On Tavily error (rate-limit, network),
+                                     transparently falls back to Serper.
+    Default: auto.
+    """
+    provider = os.getenv("NOVA_SEARCH_PROVIDER", "auto").lower()
+    has_tavily = bool(os.getenv("TAVILY_API_KEY"))
+    has_serper = bool(os.getenv("SERPER_API_KEY"))
+
+    if provider == "tavily" or (provider == "auto" and has_tavily):
+        result = _tavily_search(query, max_results)
+        # On Tavily failure in auto mode, try Serper if we have a key
+        if provider == "auto" and has_serper:
+            try:
+                parsed = json.loads(result)
+                if parsed.get("_fallback") or parsed.get("error"):
+                    logger.info(f"Tavily fell back to Serper: {parsed.get('error', 'no results')}")
+                    return _serper_search(query, max_results)
+            except (ValueError, TypeError):
+                pass
+        return result
+    return _serper_search(query, max_results)
+
+
 def _exec_tool(name: str, args: dict) -> str:
     if name == "web_search":
-        return _serper_search(args.get("query", ""), int(args.get("max_results", 3)))
+        return _web_search(args.get("query", ""), int(args.get("max_results", 3)))
     return json.dumps({"error": f"unknown tool: {name}"})
 
 
@@ -1387,7 +1456,8 @@ class Session:
             logger.info("memory consolidated")
 
     def _maybe_tool_roundtrip(self, msgs: list[dict], user_text: str) -> list[dict]:
-        if not os.getenv("SERPER_API_KEY") or os.getenv("NOVA_ENABLE_TOOLS", "1") != "1":
+        has_search_key = bool(os.getenv("TAVILY_API_KEY") or os.getenv("SERPER_API_KEY"))
+        if not has_search_key or os.getenv("NOVA_ENABLE_TOOLS", "1") != "1":
             return msgs
         if not (os.getenv("NOVA_ALWAYS_TOOLS") == "1" or _needs_tools(user_text)):
             return msgs

@@ -71,6 +71,9 @@ dependencies = [
     "httpx>=0.28.1",
     "sounddevice>=0.5.0",
     "numpy>=2.2.6",
+    # Web search for the web_search tool — Tavily is LLM-optimized (returns
+    # extracted content + optional direct answer), Serper kept as fallback.
+    "tavily-python>=0.5.0",
 ]
 
 [tool.uv]

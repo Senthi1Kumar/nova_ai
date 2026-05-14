@@ -207,11 +207,21 @@ and echo. Streaming at 10ms granularity, it feeds exactly 160-sample
 Without enrollment, barge-in falls back to AEC-cleaned Silero VAD
 (no speaker gate — any voice can interrupt).
 
-## Tool calling (Serper)
+## Tool calling (Tavily / Serper)
 
-When `SERPER_API_KEY` is set, the gateway exposes a single `web_search` tool
-to the LLM. Before each user-message → assistant streaming pass, the gateway
-runs a cheap regex (`_needs_tools`) over the transcript:
+When `TAVILY_API_KEY` (preferred) or `SERPER_API_KEY` is set, the gateway
+exposes a single `web_search` tool to the LLM. Tavily returns extracted page
+content plus an LLM-synthesized direct answer string (`include_answer="advanced"`)
+— much better than Serper's SERP snippets for one-turn voice answers. Serper
+remains as a fallback for rate-limits / outages.
+
+Provider selection via `NOVA_SEARCH_PROVIDER`:
+
+- `auto` (default) — Tavily if `TAVILY_API_KEY` is set, falls back to Serper on error.
+- `tavily` / `serper` — pin to one.
+
+Before each user-message → assistant streaming pass, the gateway runs a cheap
+regex (`_needs_tools`) over the transcript:
 
 - Casual chat ("hi", "thanks", "what's 2+2?") → tools skipped, single
   streaming call.
@@ -277,7 +287,10 @@ end-of-speech → first audio frame on the wire.
 | `NOVA_MEMORY` | `1` | Persona + auto-memory loop |
 | `NOVA_MEM_DIR` | `./persona` | Where USER/MEMORY live |
 | `NOVA_MEMORY_CONSOLIDATE_EVERY` | `5` | Turns between memory dedupe passes |
-| `SERPER_API_KEY` | *(unset)* | Enables `web_search` tool when set |
+| `TAVILY_API_KEY` | *(unset)* | Preferred web_search provider — returns extracted content + direct answer |
+| `SERPER_API_KEY` | *(unset)* | Fallback web_search provider (SERP snippets) |
+| `NOVA_SEARCH_PROVIDER` | `auto` | `auto` / `tavily` / `serper` |
+| `NOVA_TAVILY_DEPTH` | `basic` | `basic` (1 cr/req) or `advanced` (2 cr/req) |
 
 ## What this is NOT
 
