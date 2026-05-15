@@ -1,0 +1,3 @@
+# Nova personas — host-specific overrides
+# Only commit the .yaml.example templates; users copy them to .yaml and edit.
+*.yaml
