@@ -23,7 +23,7 @@ import time
 from collections import deque
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Iterator, Optional
 
 import numpy as np
 import torch
@@ -45,7 +45,11 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname
 SR = 16_000
 VAD_WIN = 512
 APM_FRAME = 160
-CLAUSE_BREAK = re.compile(r"(?<=[.!?,;:—])\s+")
+# Sentence-break only — NOT clause-break. Splitting on commas/colons/em-dashes
+# fragments a single sentence into many short pocket-tts calls, which (a) makes
+# prosody glitchy at boundaries and (b) means a mid-sentence barge-in drops the
+# rest of the queued clauses. Splitting on .!? gives whole sentences to TTS.
+CLAUSE_BREAK = re.compile(r"(?<=[.!?])\s+")
 SENT_MIN_CHARS = int(os.getenv("NOVA_SENT_MIN_CHARS", "8"))
 TTS_BINARY = os.getenv("NOVA_TTS_BINARY", "1") == "1"
 
@@ -64,33 +68,58 @@ MAX_UTTERANCE_S = float(os.getenv("NOVA_MAX_UTTERANCE_S", "12.0"))
 AEC_GUARD_MS = int(os.getenv("NOVA_AEC_GUARD_MS", "100"))  # ↓ was 500
 BARGE_IN_THRESHOLD = float(os.getenv("NOVA_BARGE_IN_THRESHOLD", "0.35"))
 BARGE_IN_FRAMES = int(os.getenv("NOVA_BARGE_IN_FRAMES", "2"))
+# Initial-window stricter barge-in: pVAD/AEC often score Nova's own TTS
+# near-perfectly when AEC residue leaks (alba TTS voice → enrolled user voice
+# false match). For the first N ms of TTS playback we demand a higher prob
+# AND a longer streak before honoring barge-in.
+BARGE_IN_INITIAL_MS = int(os.getenv("NOVA_BARGE_IN_INITIAL_MS", "1500"))
+BARGE_IN_INITIAL_THRESHOLD = float(os.getenv("NOVA_BARGE_IN_INITIAL_THRESHOLD", "0.85"))
+BARGE_IN_INITIAL_FRAMES = int(os.getenv("NOVA_BARGE_IN_INITIAL_FRAMES", "6"))
 
-SYSTEM_PROMPT = os.getenv(
-    "NOVA_SYSTEM_PROMPT",
-    # ── CRITICAL RULES (placed first for small-model attention) ──
-    "CRITICAL RULES:\n"
-    "1. Your name is Nova. The driver's name is NOT Nova. Address the driver as 'you' or by their actual name.\n"
-    "2. NEVER start a reply with 'Nova' or 'Nova,'. NEVER call the driver Nova.\n"
-    "3. NEVER invent facts. If you don't know something, say 'I'm not sure' — do not guess.\n"
-    "4. NEVER mention Tesla or any car brand unless the driver explicitly brings it up.\n"
-    "5. Keep every reply under 3 short sentences. Be direct. No filler.\n\n"
-    # ── PERSONALITY ──
-    "You are Nova, a voice assistant in the driver's car. "
-    "You are helpful, brief, and slightly casual. "
-    "You are NOT the driver — you are the assistant. "
-    "Always reply in English.\n\n"
-    # ── TRANSCRIPTION ──
-    "The driver's speech comes from speech-to-text and may have errors. "
-    "If a transcript is garbled, guess the meaning rather than asking to repeat. "
-    "If the driver's message ends abruptly mid-sentence, reply with 'Go on?' or 'What were you saying?'\n\n"
-    # ── TOOLS ──
-    "Web search: use ONLY for explicit questions about current events, weather, news, or prices. "
-    "NEVER search for general conversation, introductions, or things the driver tells you about themselves. "
-    "After a search, give 1-2 plain spoken sentences — no source names or URLs.\n\n"
-    # ── SAFETY ──
-    "Vehicle controls are hardware-managed. Do not simulate controlling them. "
-    "If you don't know something, just say so honestly."
-)
+# Persona system — see nova/backend/configs/personas/*.yaml.example.
+# NOVA_SYSTEM_PROMPT (legacy env var) still wins if set; otherwise we load
+# the selected persona YAML and assemble its sections.
+_PERSONA_DIR = Path(__file__).parent / "configs" / "personas"
+_DEFAULT_PERSONA = "driver"
+_PERSONA_SECTIONS = ("critical_rules", "identity", "style",
+                     "transcription", "silence", "tools", "safety")
+
+
+def _resolve_persona_path() -> Optional[Path]:
+    explicit = os.getenv("NOVA_PERSONA_CONFIG")
+    if explicit:
+        return Path(explicit)
+    name = os.getenv("NOVA_PERSONA", _DEFAULT_PERSONA)
+    local = _PERSONA_DIR / f"{name}.yaml"
+    if local.is_file():
+        return local
+    example = _PERSONA_DIR / f"{name}.yaml.example"
+    if example.is_file():
+        return example
+    return None
+
+
+def _load_persona() -> dict:
+    """Load the active persona YAML; return a dict with at least `system_prompt`."""
+    import yaml
+    path = _resolve_persona_path()
+    if path is None:
+        return {"name": "fallback", "voice": "alba", "language": "en",
+                "system_prompt": "You are Nova, a helpful voice assistant. Be brief."}
+    try:
+        cfg = yaml.safe_load(path.open()) or {}
+    except Exception as e:
+        logger.warning(f"persona YAML failed to load ({path}): {e}")
+        return {"name": "fallback", "voice": "alba", "language": "en",
+                "system_prompt": "You are Nova, a helpful voice assistant. Be brief."}
+    parts = [str(cfg.get(s, "")).strip() for s in _PERSONA_SECTIONS]
+    cfg["system_prompt"] = "\n\n".join(p for p in parts if p)
+    return cfg
+
+
+_PERSONA = _load_persona()
+SYSTEM_PROMPT = os.getenv("NOVA_SYSTEM_PROMPT", _PERSONA["system_prompt"])
+logger.info(f"Persona: {_PERSONA.get('name', '?')} (voice={_PERSONA.get('voice', '?')})")
 
 LATIN_ONLY = os.getenv("NOVA_LATIN_ONLY", "1") == "1"
 
@@ -1200,6 +1229,13 @@ class Session:
         if self.tts_playing or now < self.tts_drain_until:
             elapsed_ms = (now - self.tts_started_at) * 1000 if self.tts_started_at else 0
             if elapsed_ms >= AEC_GUARD_MS:
+                # During the initial window, AEC residue and TTS-leak through the
+                # mic can falsely score very high against the user's voiceprint.
+                # Demand stricter prob + longer streak until TTS has been playing
+                # long enough for AEC to converge cleanly.
+                in_initial = elapsed_ms < AEC_GUARD_MS + BARGE_IN_INITIAL_MS
+                thr = BARGE_IN_INITIAL_THRESHOLD if in_initial else BARGE_IN_THRESHOLD
+                frames_needed = BARGE_IN_INITIAL_FRAMES if in_initial else BARGE_IN_FRAMES
                 # ── pVAD (FireRedChat): target-speaker-gated barge-in ─────
                 if self.pvad is not None:
                     chunk_f32 = chunk.astype(np.float32) / 32768.0
@@ -1209,20 +1245,26 @@ class Session:
                         frame = self._pvad_buf[:160]
                         self._pvad_buf = self._pvad_buf[160:]
                         p = self.pvad.is_target_speaking(frame)
-                        if p > BARGE_IN_THRESHOLD:
+                        if p > thr:
                             self.barge_streak += 1
-                            if self.barge_streak >= BARGE_IN_FRAMES and not self.barge_in.is_set():
-                                logger.info(f"barge-in (pvad p={p:.2f}, streak={self.barge_streak})")
+                            if self.barge_streak >= frames_needed and not self.barge_in.is_set():
+                                logger.info(
+                                    f"barge-in (pvad p={p:.2f}, streak={self.barge_streak}, "
+                                    f"phase={'initial' if in_initial else 'steady'})"
+                                )
                                 self.barge_in.set()
                         else:
                             self.barge_streak = 0
                 else:
                     # Fallback: AEC-cleaned Silero VAD (no speaker gate)
                     p = self.fe.vad_prob_clean(chunk)
-                    if p > BARGE_IN_THRESHOLD:
+                    if p > thr:
                         self.barge_streak += 1
-                        if self.barge_streak >= BARGE_IN_FRAMES and not self.barge_in.is_set():
-                            logger.info(f"barge-in (cleaned p={p:.2f}, streak={self.barge_streak})")
+                        if self.barge_streak >= frames_needed and not self.barge_in.is_set():
+                            logger.info(
+                                f"barge-in (cleaned p={p:.2f}, streak={self.barge_streak}, "
+                                f"phase={'initial' if in_initial else 'steady'})"
+                            )
                             self.barge_in.set()
                     else:
                         self.barge_streak = 0
