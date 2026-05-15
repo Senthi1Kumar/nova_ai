@@ -207,6 +207,43 @@ and echo. Streaming at 10ms granularity, it feeds exactly 160-sample
 Without enrollment, barge-in falls back to AEC-cleaned Silero VAD
 (no speaker gate — any voice can interrupt).
 
+## Personas
+
+The system prompt is no longer hard-coded — it lives in YAML under
+`nova/backend/configs/personas/<name>.yaml`. Each file declares `name`,
+`voice`, `language`, and a set of prompt sections that get concatenated:
+`critical_rules`, `identity`, `style`, `transcription`, `silence`, `tools`,
+`safety`. Select the active persona via `NOVA_PERSONA=<name>` (default
+`driver`). Use `NOVA_PERSONA_CONFIG=/abs/path.yaml` to bypass the lookup.
+
+```bash
+cd nova/backend/configs/personas
+cp driver.yaml.example driver.yaml
+$EDITOR driver.yaml      # tweak identity/style/tools/etc.
+```
+
+Adding a new persona = drop another YAML in the directory and point
+`NOVA_PERSONA` at it. The legacy `NOVA_SYSTEM_PROMPT` env var still wins
+over the YAML if set.
+
+## Loadtest
+
+`nova/backend/loadtest_client.py` connects N concurrent WS sessions to a
+running gateway, plays audio at real-time rate, and reports p50/p95 timing
+for each pipeline stage (speech_started, transcript, generation_start,
+first_audio, generation_done) plus the server-side `turn_metrics`.
+
+```bash
+# Single session, synthetic noise (won't transcribe, but stresses pipeline)
+uv run nova/backend/loadtest_client.py --workers 1 --turns 3
+
+# 4 sessions × 5 turns with a real WAV (any sample rate, mono preferred)
+uv run nova/backend/loadtest_client.py --workers 4 --turns 5 --wav samples/hello.wav
+```
+
+Use it to verify a config change actually moved p95 TTFB before believing
+the eyeball impression from a single log line.
+
 ## Tool calling (Tavily / Serper)
 
 When `TAVILY_API_KEY` (preferred) or `SERPER_API_KEY` is set, the gateway
