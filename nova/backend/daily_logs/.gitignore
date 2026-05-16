@@ -1,0 +1,5 @@
+# Daily session diaries — user-specific content (locations, preferences,
+# topics discussed), same convention as persona/MEMORY.md.
+# Keep the directory itself + this gitignore; ignore generated diary files.
+*.md
+!.gitkeep

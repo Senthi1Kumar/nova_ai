@@ -22,9 +22,9 @@ dependencies = [
     # x86_64 (Arch, etc.) – uses ort-nightly index:
     "onnxruntime-gpu; platform_machine == 'x86_64'",
     "pyaudio",
-    "torch<2.10",
-    "torchvision<0.25",
-    "torchaudio<2.10",
+    "torch",
+    "torchvision",
+    "torchaudio",
     "torchcodec",
     "coloredlogs",
     "flatbuffers",
@@ -74,6 +74,14 @@ dependencies = [
     # Web search for the web_search tool — Tavily is LLM-optimized (returns
     # extracted content + optional direct answer), Serper kept as fallback.
     "tavily-python>=0.5.0",
+    # Persistent memory layer (NovaMemoryLayer): mem0 in fully self-hosted
+    # mode — local LLM via llama.cpp, local sentence-transformers embedder,
+    # local Postgres + pgvector store (already used for asyncpg in this repo).
+    # No cloud calls leave the box. Postgres setup: see NOVA_LOOP.md.
+    "mem0ai>=0.1.0",
+    "pgvector>=0.3",
+    "psycopg[binary]>=3.2",
+    "sentence-transformers>=3.0",
 ]
 
 [tool.uv]

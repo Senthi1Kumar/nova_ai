@@ -62,7 +62,7 @@ nova/backend/
     MEMORY.md               # auto-grown durable facts (gitignored)
   models/
     FireRedChat-pvad/       # pvad.onnx + ECAPA-TDNN speaker model
-  VOICE_GATEWAY.md          # this doc
+  NOVA_LOOP.md          # this doc
 nova/archive/
   voice_gateway.py          # pre-pVAD version (archived)
 ```
@@ -78,7 +78,7 @@ Before running `uv sync`, uncomment the correct line in `pyproject.toml`:
 
 - **NVIDIA Jetson (Thor / ARM64):**
   Uncomment the line with `@ https://pypi.jetson-ai-lab.io/...` and comment the plain `"onnxruntime-gpu"` line.
-- **AMD64/Intel (Arch Linux, etc.):**
+- **AMD64/Intel (Ubuntu, etc.):**
   Uncomment the plain `"onnxruntime-gpu"` line and comment the Jetson URL line.
 
 ```bash
@@ -206,6 +206,83 @@ and echo. Streaming at 10ms granularity, it feeds exactly 160-sample
 
 Without enrollment, barge-in falls back to AEC-cleaned Silero VAD
 (no speaker gate — any voice can interrupt).
+
+## Persistent memory (mem0 + pgvector)
+
+Nova has a persistent memory layer (`nova_memory_layer.py`) that records every
+turn during a session and lets downstream agents replay what was discussed.
+Three components, all on-device:
+
+- **mem0** for semantic recall — local llama-server is the LLM, local
+  sentence-transformers does embeddings, Postgres + pgvector is the store.
+- **SessionJournal** — every turn's `{timestamp, role, text, tool_calls, metrics}`
+  is appended in RAM and flushed to `session_logs/session_<id>_<ts>.json` on
+  WS disconnect.
+- **DiaryCompactor** — on disconnect, the LLM summarises the session into 3-5
+  bullets which are appended to `daily_logs/YYYY-MM-DD.md` (a Markdown diary
+  other tools can grep / read).
+
+### One-time setup
+
+The memory layer needs Postgres with the pgvector extension. On Ubuntu / Debian:
+
+```bash
+# 1. Install Postgres
+sudo apt-get update
+sudo apt-get install -y postgresql postgresql-contrib
+sudo systemctl enable --now postgresql
+
+# 2. Install pgvector. apt has it for most Postgres versions;
+#    if not, fall back to building from source.
+PG_MAJOR=$(psql --version | awk '{print $3}' | cut -d. -f1)
+sudo apt-get install -y "postgresql-$PG_MAJOR-pgvector" || (
+  sudo apt-get install -y build-essential "postgresql-server-dev-$PG_MAJOR" git
+  git clone --branch v0.8.2 https://github.com/pgvector/pgvector.git /tmp/pgvector
+  cd /tmp/pgvector && make && sudo make install
+)
+
+# 3. Create the Nova database + user
+sudo -u postgres psql -c "CREATE USER nova WITH PASSWORD 'nova_dev';"
+sudo -u postgres psql -c "CREATE DATABASE nova_db OWNER nova;"
+
+# 4. Enable the extension + run a health check.
+#    CREATE EXTENSION needs SUPERUSER, so run as `postgres`, not `nova`:
+sudo -u postgres psql -d nova_db -f nova/backend/sql/setup_pgvector.pgsql
+```
+
+The script runs `CREATE EXTENSION vector` and confirms the extension loaded.
+After this one-time step, the `nova` role can use vector columns without
+needing superuser. mem0 creates the actual memories table on first use.
+
+> **Note on the `.pgsql` extension** — we use `.pgsql` (not `.sql`) so editors
+> and linters use the PostgreSQL dialect; the generic-SQL parser flags
+> Postgres-specific keywords like `CREATE EXTENSION`.
+
+### Fail-open
+
+If pgvector init fails (extension missing, wrong credentials, postgres down),
+NovaMemoryLayer logs a warning and continues in "journal-only" mode — sessions
+still get serialized to `session_logs/`, the daily diary still gets appended
+(via deterministic fallback if the LLM call also fails), and semantic recall
+just returns empty results. Nova's existing `persona/MEMORY.md` path is
+independent and keeps working regardless.
+
+### Where downstream agents read
+
+| Path | Content | Format |
+|---|---|---|
+| `nova/backend/daily_logs/YYYY-MM-DD.md` | LLM-summarised diary per day | Markdown, append-only |
+| `nova/backend/session_logs/session_<id>_<ts>.json` | Full structured turns of one session | JSON |
+| Postgres `nova_db.nova_memories` table | mem0 fact embeddings + metadata | pgvector |
+
+Files-on-disk is the chosen access pattern — downstream agents need only read
+permission, no IPC, no shared process. The Postgres table can also be queried
+directly from any tool that wants semantic search.
+
+### Knobs
+
+See `.env.example` under "Persistent memory layer" — `NOVA_MEMORY_USER_ID`,
+`NOVA_MEM_RECALL_K`, `NOVA_MEM0_DISABLED`, `NOVA_MEM0_PG_*`.
 
 ## Personas
 

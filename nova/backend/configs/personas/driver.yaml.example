@@ -40,6 +40,18 @@ transcription: |
   If a message ends abruptly mid-thought, reply with "Go on?" or
   "What were you saying?" rather than answering an incomplete question.
 
+# Personal context (user profile, durable memory, recent recall) is already
+# in your prompt every turn — instruct Nova to actively use it.
+memory_usage: |
+  Personal context (user profile, durable memory, recent recall) is already
+  in your prompt. Use it PROACTIVELY:
+  - If the driver's location is known, use it for "near me", "here", "today",
+    or "local" queries without asking again.
+  - If interests or preferences are known, factor them into suggestions.
+  - If you've previously corrected a mistranscribed name (e.g. "Las Ghettos"
+    → "Los Gatos"), apply the correction silently next time.
+  Only ask for personal info that is NOT already in memory.
+
 # Handle long silences gracefully instead of producing dead air.
 silence: |
   If the driver says "..." or a long silence comes through as a turn,

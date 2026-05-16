@@ -82,7 +82,7 @@ BARGE_IN_INITIAL_FRAMES = int(os.getenv("NOVA_BARGE_IN_INITIAL_FRAMES", "6"))
 _PERSONA_DIR = Path(__file__).parent / "configs" / "personas"
 _DEFAULT_PERSONA = "driver"
 _PERSONA_SECTIONS = ("critical_rules", "identity", "style",
-                     "transcription", "silence", "tools", "safety")
+                     "transcription", "memory_usage", "silence", "tools", "safety")
 
 
 def _resolve_persona_path() -> Optional[Path]:
@@ -1190,6 +1190,13 @@ class Session:
         self.last_assistant: str = ""
         self.turn_started_at: float = 0.0
         self.turn_metrics: dict[str, float] = {}
+        # Tool calls captured during _maybe_tool_roundtrip for the current turn,
+        # consumed when the memory layer records the assistant turn.
+        self.turn_tool_calls: list[dict] = []
+        # Persistent memory (mem0 + diary). May be None if the layer failed to load.
+        self.memory = models.get("memory_layer")
+        if self.memory is not None:
+            self.memory.start_new_session()
         # Smart-turn reprieve state: when smart-turn rejects mid-thought, we
         # keep the turn open instead of discarding. Force-accept on next
         # silence_end once we've used up the reprieve budget.
@@ -1452,11 +1459,40 @@ class Session:
         logger.info("turn_metrics: " + " ".join(f"{k}={int(v)}" for k, v in m.items()))
         await self.emit({"type": "turn_metrics", "data": m})
 
-        if MEMORY_ENABLED and full:
-            asyncio.create_task(self._memory_after_turn(text))
+        if (MEMORY_ENABLED or self.memory is not None) and full:
+            # Snapshot per-turn metadata before the next turn mutates it.
+            tool_calls_snapshot = list(self.turn_tool_calls)
+            metrics_snapshot = dict(m)
+            asyncio.create_task(self._memory_after_turn(text, full,
+                                                       tool_calls_snapshot,
+                                                       metrics_snapshot))
 
-    async def _memory_after_turn(self, user_text: str) -> None:
+    async def _memory_after_turn(self, user_text: str, assistant_text: str = "",
+                                 tool_calls: list | None = None,
+                                 metrics: dict | None = None) -> None:
         loop = asyncio.get_running_loop()
+
+        # Persistent memory layer: record turns + semantic ingest.
+        if self.memory is not None:
+            try:
+                from datetime import datetime, timezone
+                ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+                self.memory.add_turn("user", user_text, ts=ts, metrics=metrics)
+                if assistant_text:
+                    self.memory.add_turn("assistant", assistant_text, ts=ts,
+                                         tool_calls=tool_calls or None,
+                                         metrics=metrics)
+                # Fire-and-forget mem0 ingest (one local LLM call, ~300-800 ms).
+                if assistant_text:
+                    await loop.run_in_executor(self.executor,
+                                               self.memory.ingest_turn_pair,
+                                               user_text, assistant_text)
+            except Exception as e:
+                logger.warning(f"memory layer add/ingest failed (non-fatal): {e}")
+
+        # Legacy MEMORY.md path — keep for now; mem0 is additive.
+        if not MEMORY_ENABLED:
+            return
         try:
             await loop.run_in_executor(self.executor, self._update_memory, user_text)
         except Exception as e:
@@ -1545,6 +1581,11 @@ class Session:
                 seen.add(key)
                 deduped.append(tc)
         tool_calls = deduped
+        # Stash a compact view for the memory layer to record on this turn.
+        for tc in tool_calls:
+            fn = tc.get("function", {})
+            self.turn_tool_calls.append({"name": fn.get("name", ""),
+                                         "arguments": fn.get("arguments", "")})
 
         msgs = msgs + [{
             "role": "assistant",
@@ -1573,6 +1614,25 @@ class Session:
         persona = load_persona()
         sys_prompt = SYSTEM_PROMPT + ("\\n\\n" + persona if persona else "")
         msgs = [{"role": "system", "content": sys_prompt}, *self.history[-10:]]
+
+        # Reset per-turn tool-call buffer; _maybe_tool_roundtrip will populate it.
+        self.turn_tool_calls = []
+
+        # Semantic recall from persistent memory (mem0). Inject as a second
+        # system message so it's clearly separated from the persona prompt.
+        if self.memory is not None:
+            try:
+                k = max(1, int(os.getenv("NOVA_MEM_RECALL_K", "5")))
+                recall_lines = await loop.run_in_executor(
+                    self.executor, self.memory.recall, user_text, k)
+                if recall_lines:
+                    msgs.insert(1, {
+                        "role": "system",
+                        "content": "Relevant prior context:\n" + "\n".join(
+                            f"- {line}" for line in recall_lines),
+                    })
+            except Exception as e:
+                logger.warning(f"memory recall failed (non-fatal): {e}")
 
         msgs = await loop.run_in_executor(self.executor, self._maybe_tool_roundtrip, msgs, user_text)
 
@@ -1744,6 +1804,14 @@ async def lifespan(app: FastAPI):
     else:
         logger.info("pVAD (FireRedChat): import unavailable — AEC+Silero only")
     # ── end pVAD ───────────────────────────────────────────────────────
+    # ── Persistent memory layer (mem0-backed; fail-open) ───────────────────
+    memory_layer = None
+    try:
+        from nova_memory_layer import NovaMemoryLayer  # type: ignore
+        memory_layer = NovaMemoryLayer(user_id=os.getenv("NOVA_MEMORY_USER_ID", "driver"))
+    except Exception as e:
+        logger.warning(f"NovaMemoryLayer disabled: {e}")
+    # ── end memory layer ──────────────────────────────────────────────────
     app.state.models = {
         "stt": make_stt(),
         "tts": tts,
@@ -1751,6 +1819,7 @@ async def lifespan(app: FastAPI):
         "silero": load_silero_vad(onnx=True),
         "smart_turn": smart_turn,
         "pvad": pvad,
+        "memory_layer": memory_layer,
     }
     app.state.executor = ThreadPoolExecutor(max_workers=4)
     await tts.warmup_stream()
@@ -1809,6 +1878,14 @@ async def ws(ws: WebSocket) -> None:
         pass
     finally:
         loop_task.cancel()
+        # Flush session journal + diary compaction. Done after WS close so it
+        # doesn't block the disconnect handshake. Pass _llm_oneshot in so the
+        # diary summarizer can use the same local LLM path Nova uses.
+        if sess.memory is not None:
+            try:
+                await sess.memory.close_session(llm_oneshot=sess._llm_oneshot)
+            except Exception as e:
+                logger.warning(f"memory close_session failed (non-fatal): {e}")
 
 
 # ── Voice fingerprint enrollment ──────────────────────────────────────────────
