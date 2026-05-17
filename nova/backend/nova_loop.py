@@ -828,6 +828,14 @@ class PocketTTS:
         except Exception as e:
             logger.warning(f"Pocket-TTS stream warmup failed: {e}")
 
+def make_tts():
+    """Pick a TTS backend per NOVA_TTS_ENGINE. Defaults to pocket-tts so
+    existing deployments are unaffected."""
+    engine = os.getenv("NOVA_TTS_ENGINE", "pocket-tts").lower()
+    if engine not in ("pocket-tts", "pocket"):
+        logger.warning(f"NOVA_TTS_ENGINE={engine!r} not recognised; using pocket-tts")
+    return PocketTTS()
+
 
 class LLM:
     def __init__(self) -> None:
@@ -1783,7 +1791,7 @@ async def lifespan(app: FastAPI):
             smart_turn.predict(np.zeros(8000, dtype=np.float32))
     except Exception as e:
         logger.warning(f"smart-turn disabled: {e}")
-    tts = PocketTTS()
+    tts = make_tts()
     # ── FireRed pVAD: personalised speaker gate for barge-in ──────────
     pvad = None
     if _PVAD_AVAILABLE:

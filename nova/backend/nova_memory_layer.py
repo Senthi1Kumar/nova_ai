@@ -115,6 +115,22 @@ class NovaMemoryLayer:
         self.journal = SessionJournal(user_id=self.user_id, session_logs_dir=self.session_logs_dir)
 
     def _init_mem0(self) -> None:
+        # Read these BEFORE doing anything to env or importing mem0.
+        llm_model = os.getenv("NOVA_MEM0_LLM_MODEL") or os.getenv("NOVA_LLM_MODEL", "unsloth/gemma-4-E4B-it")
+        llm_base_url = os.getenv("NOVA_MEM0_LLM_BASE_URL") or os.getenv("NOVA_LLM_BASE_URL", "http://localhost:8080/v1")
+        embed_model = os.getenv("NOVA_MEM0_EMBED_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
+
+        # Scrub any env that mem0's openai LLM wrapper might auto-detect
+        # (it ignores config.openai_base_url in v2 and reads env instead;
+        # also auto-uses OPENROUTER_API_KEY when present). Save the user's
+        # original OPENROUTER_API_KEY only — Nova's own LLM class doesn't
+        # touch OPENAI_* env vars (it builds its own httpx requests).
+        self._saved_openrouter = os.environ.pop("OPENROUTER_API_KEY", None)
+        os.environ["OPENAI_API_KEY"] = "local-dummy"
+        os.environ["OPENAI_BASE_URL"] = llm_base_url
+
+        # Import mem0 AFTER env is fixed up so any module-level client init
+        # inside mem0 sees our local llama-server config.
         try:
             from mem0 import Memory  # type: ignore
         except Exception as e:
@@ -127,13 +143,6 @@ class NovaMemoryLayer:
         # Vector store → local Postgres with pgvector extension
         # mem0's "openai" provider name is misleading — it just speaks the
         # OpenAI HTTP wire format. We point it at our llama-server.
-        llm_model = os.getenv("NOVA_MEM0_LLM_MODEL") or os.getenv("NOVA_LLM_MODEL", "unsloth/gemma-4-E4B-it")
-        llm_base_url = os.getenv("NOVA_MEM0_LLM_BASE_URL") or os.getenv("NOVA_LLM_BASE_URL", "http://localhost:8080/v1")
-        embed_model = os.getenv("NOVA_MEM0_EMBED_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
-        # mem0's OpenAI client still requires *some* key string; the local
-        # llama-server doesn't validate it.
-        os.environ.setdefault("OPENAI_API_KEY", "local-dummy")
-        os.environ.setdefault("OPENAI_BASE_URL", llm_base_url)
 
         # Postgres connection — defaults match the NOVA_DB_URL in .env.example.
         # Override via NOVA_MEM0_PG_* env vars (or NOVA_DB_URL parsing later).
@@ -225,19 +234,27 @@ class NovaMemoryLayer:
         """Return up to k short bullet strings semantically related to `query`."""
         if not (self._mem_ready and self._mem) or not query:
             return []
-        try:
-            res = self._mem.search(query=query, user_id=self.user_id, limit=k)
-            # mem0 returns either {"results": [...]} or a raw list depending on version.
-            items = res.get("results", res) if isinstance(res, dict) else res
-            lines: list[str] = []
-            for item in items[:k]:
-                memo = item.get("memory") if isinstance(item, dict) else None
-                if memo:
-                    lines.append(str(memo).strip())
-            return lines
-        except Exception as e:
-            logger.warning(f"mem0.search failed (non-fatal): {e}")
-            return []
+        # mem0 v2 deprecated `user_id=` on .search() — must use filters={}.
+        # Older versions accepted both, so try the new API first and fall back.
+        for kwargs in (
+            {"query": query, "filters": {"user_id": self.user_id}, "limit": k},
+            {"query": query, "user_id": self.user_id, "limit": k},
+        ):
+            try:
+                res = self._mem.search(**kwargs)
+                items = res.get("results", res) if isinstance(res, dict) else res
+                lines: list[str] = []
+                for item in items[:k]:
+                    memo = item.get("memory") if isinstance(item, dict) else None
+                    if memo:
+                        lines.append(str(memo).strip())
+                return lines
+            except TypeError:
+                continue  # API mismatch — try the next kwargs shape
+            except Exception as e:
+                logger.warning(f"mem0.search failed (non-fatal): {e}")
+                return []
+        return []
 
     # ── session lifecycle ──────────────────────────────────────────────────
 

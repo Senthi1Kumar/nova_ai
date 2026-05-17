@@ -227,32 +227,36 @@ Three components, all on-device:
 The memory layer needs Postgres with the pgvector extension. On Ubuntu / Debian:
 
 ```bash
-# 1. Install Postgres
+# 1. Install Postgres + pgvector (Ubuntu 24.04 ships postgresql-16-pgvector
+#    via apt; pick the package matching your Postgres major version)
 sudo apt-get update
-sudo apt-get install -y postgresql postgresql-contrib
+sudo apt-get install -y postgresql postgresql-contrib postgresql-16-pgvector
 sudo systemctl enable --now postgresql
 
-# 2. Install pgvector. apt has it for most Postgres versions;
-#    if not, fall back to building from source.
-PG_MAJOR=$(psql --version | awk '{print $3}' | cut -d. -f1)
-sudo apt-get install -y "postgresql-$PG_MAJOR-pgvector" || (
-  sudo apt-get install -y build-essential "postgresql-server-dev-$PG_MAJOR" git
-  git clone --branch v0.8.2 https://github.com/pgvector/pgvector.git /tmp/pgvector
-  cd /tmp/pgvector && make && sudo make install
-)
-
-# 3. Create the Nova database + user
+# 2. Create the Nova database + user
 sudo -u postgres psql -c "CREATE USER nova WITH PASSWORD 'nova_dev';"
 sudo -u postgres psql -c "CREATE DATABASE nova_db OWNER nova;"
 
-# 4. Enable the extension + run a health check.
+# 3. Enable the extension + run a health check.
 #    CREATE EXTENSION needs SUPERUSER, so run as `postgres`, not `nova`:
 sudo -u postgres psql -d nova_db -f nova/backend/sql/setup_pgvector.pgsql
+
+# Expected output: extension row "vector | 0.6.x" (or whatever apt ships)
 ```
 
 The script runs `CREATE EXTENSION vector` and confirms the extension loaded.
 After this one-time step, the `nova` role can use vector columns without
 needing superuser. mem0 creates the actual memories table on first use.
+
+If your distro doesn't have `postgresql-<NN>-pgvector` in apt (e.g. PG 17/18
+or a non-standard repo), build pgvector from source:
+
+```bash
+PG_MAJOR=$(psql --version | awk '{print $3}' | cut -d. -f1)
+sudo apt-get install -y build-essential "postgresql-server-dev-$PG_MAJOR" git
+git clone --branch v0.8.2 https://github.com/pgvector/pgvector.git /tmp/pgvector
+cd /tmp/pgvector && make && sudo make install
+```
 
 > **Note on the `.pgsql` extension** — we use `.pgsql` (not `.sql`) so editors
 > and linters use the PostgreSQL dialect; the generic-SQL parser flags
@@ -381,6 +385,7 @@ end-of-speech → first audio frame on the wire.
 | `NOVA_LLM_BASE_URL` | OpenRouter | e.g. `http://localhost:8080/v1` |
 | `NOVA_LLM_MODEL` | `openai/gpt-4o-mini` | Match local server's model |
 | `NOVA_SYSTEM_PROMPT` | concise English | Override per deployment |
+| `NOVA_TTS_ENGINE` | `pocket-tts` | TTS backend (currently pocket-tts; other backends wired via `make_tts` factory) |
 | `NOVA_POCKET_VOICE` | `alba` | Pocket-TTS voice name |
 | `NOVA_VAD_THRESHOLD` | `0.65` | Silero per-frame voice prob (car-noise tuned) |
 | `NOVA_VAD_MIN_RMS_DB` | `-45` | Energy floor for RMS gate |

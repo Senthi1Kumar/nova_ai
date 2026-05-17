@@ -22,6 +22,17 @@
   let pendingAudioSr = 0;
   function playPCM(i16, sr) {
     if (!playCtx) return;
+    // Recreate the AudioContext if the incoming sample rate doesn't match.
+    // The browser's automatic resample-on-play is unreliable across
+    // Chrome/Firefox for big mismatches and often produces silence — recreate
+    // at the source SR instead. Defensive against any future TTS backend
+    // with a non-24 kHz output rate.
+    if (Math.abs(playCtx.sampleRate - sr) > 100) {
+      console.log(`[nova] playCtx SR ${playCtx.sampleRate} → ${sr}, recreating`);
+      try { playCtx.close(); } catch (_) {}
+      playCtx = new AudioContext({ sampleRate: sr });
+      playT = playCtx.currentTime;
+    }
     const f32 = new Float32Array(i16.length);
     for (let i = 0; i < i16.length; i++) f32[i] = i16[i] / 32768;
     const buf = playCtx.createBuffer(1, f32.length, sr);

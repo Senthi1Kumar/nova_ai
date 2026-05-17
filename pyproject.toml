@@ -22,9 +22,9 @@ dependencies = [
     # x86_64 (Arch, etc.) – uses ort-nightly index:
     "onnxruntime-gpu; platform_machine == 'x86_64'",
     "pyaudio",
-    "torch",
-    "torchvision",
-    "torchaudio",
+    "torch>=2.9,<2.10",
+    "torchvision>=0.24,<0.25",
+    "torchaudio>=2.9,<2.10",
     "torchcodec",
     "coloredlogs",
     "flatbuffers",
@@ -66,7 +66,7 @@ dependencies = [
     "nemo-toolkit[asr]>=2.7.3",
     "kokoro-onnx>=0.5.0",
     "pocket-tts>=2.1.0",
-    "moshi>=0.2.13",
+    "moshi",
     "textual>=8.2.6",
     "httpx>=0.28.1",
     "sounddevice>=0.5.0",
@@ -80,7 +80,7 @@ dependencies = [
     # No cloud calls leave the box. Postgres setup: see NOVA_LOOP.md.
     "mem0ai>=0.1.0",
     "pgvector>=0.3",
-    "psycopg[binary]>=3.2",
+    "psycopg[binary,pool]>=3.2",
     "sentence-transformers>=3.0",
 ]
 
@@ -88,6 +88,9 @@ dependencies = [
 environments = [
     "sys_platform == 'linux' and platform_machine == 'x86_64'",
     "sys_platform == 'linux' and platform_machine == 'aarch64'",
+]
+override-dependencies = [
+    "torchcodec ; sys_platform == 'never'",
 ]
 
 [[tool.uv.index]]
@@ -106,7 +109,7 @@ onnxruntime-gpu = { index = "ort-nightly" }
 torch = { index = "pytorch-cu130" }
 torchvision = { index = "pytorch-cu130" }
 torchaudio = { index = "pytorch-cu130" }
-torchcodec = { index = "pytorch-cu130" }
+# torchcodec = { index = "pytorch-cu130" }
 # transformers pinned to PyPI release — moshi requires huggingface-hub<1.0,
 # which is incompatible with transformers git HEAD (needs hub>=1.5).
 
