@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Virtualenv
+.venv/
+
+# Env / secrets
+.env
+
+# LiteRT-LM artifacts (fetched from HF / generated at runtime, never committed)
+*.litertlm
+*.xnnpack_cache_*
+*_mldrift_program_cache.bin
+*_mldrift_weight_cache.bin
+default.profraw
+
+# Pocket-TTS runtime output
+runtime/
+
+# IDE
+.vscode/
+.idea/

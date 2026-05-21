@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>LiteRT-LM Native Voice Chat</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <main class="shell">
+    <section class="hero">
+      <div>
+        <p class="eyebrow">Local Edge AI</p>
+        <h1>LiteRT-LM Native Voice Chat</h1>
+        <p class="subtitle">Private on-device voice chat — Gemma-4 hears your speech natively (no Whisper), streams tokens with MTP, and replies through Pocket-TTS as gapless PCM audio.</p>
+      </div>
+      <div class="status-card">
+        <span id="statusDot" class="dot"></span>
+        <div>
+          <strong id="statusText">Checking engine...</strong>
+          <small id="statusDetails">Loading</small>
+        </div>
+      </div>
+    </section>
+
+    <section class="chat-card">
+      <div id="messages" class="messages">
+        <div class="message assistant">
+          <div class="bubble">Set <code>LITERT_MODEL_PATH</code> in <code>.env</code> to a Gemma-4 <code>.litertlm</code> file. Type a message, or press <strong>Hold to Talk</strong> — the model listens to your audio directly and replies as the audio streams back.</div>
+        </div>
+      </div>
+
+      <div class="voice-panel">
+        <button id="enableMicBtn" class="mic-btn" type="button" aria-label="Enable browser microphone permission">Enable Microphone</button>
+        <button id="recordBtn" class="record-btn" type="button" disabled>Hold to Talk</button>
+        <div class="voice-meta">
+          <strong id="voiceState">Click Enable Microphone first</strong>
+          <small id="micState">Microphone permission check pending</small>
+          <small>Push-to-talk → Gemma-4 native audio → streamed tokens → Pocket-TTS PCM, all in one SSE turn.</small>
+        </div>
+      </div>
+
+      <form id="chatForm" class="composer">
+        <textarea id="prompt" rows="2" placeholder="Ask your LiteRT-LM model..." autocomplete="off"></textarea>
+        <button id="sendBtn" type="submit">Send</button>
+      </form>
+    </section>
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
