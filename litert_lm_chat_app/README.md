@@ -41,10 +41,31 @@ bandwidth is better spent on the decoder.
 
 ## Setup
 
-### 1) Create and activate the venv
+### 1) Get the code
+
+This app lives on the `litert-chat-app` branch of the Nova AI repository.
+Two ways to grab it:
+
+**Option A — clone just this branch (recommended if you only want the chat app):**
 
 ```bash
+git clone -b litert-chat-app --single-branch \
+  https://github.com/Senthi1Kumar/nova_ai.git
+cd nova_ai/litert_lm_chat_app
+```
+
+**Option B — clone the full repo and switch:**
+
+```bash
+git clone https://github.com/Senthi1Kumar/nova_ai.git
+cd nova_ai
+git checkout litert-chat-app
 cd litert_lm_chat_app
+```
+
+### 2) Create and activate the venv
+
+```bash
 python3 -m venv .venv
 source .venv/bin/activate
 ```
@@ -55,14 +76,14 @@ source .venv/bin/activate
 > `which python` — it must point inside `.venv/bin/`. If it doesn't, just
 > call the venv's binary directly: `./.venv/bin/python run.py`.
 
-### 2) Install dependencies
+### 3) Install dependencies
 
 ```bash
 pip install -r requirements.txt
 cp .env.example .env
 ```
 
-### 3) Download a Gemma-4 LiteRT model
+### 4) Download a Gemma-4 LiteRT model
 
 From Hugging Face:
 
@@ -74,7 +95,7 @@ hf download litert-community/gemma-4-E2B-it-litert-lm \
   gemma-4-E2B-it.litertlm --local-dir .
 ```
 
-### 4) Configure `.env`
+### 5) Configure `.env`
 
 ```env
 LITERT_MODEL_PATH=/absolute/path/to/gemma-4-E2B-it.litertlm
@@ -87,7 +108,7 @@ POCKET_TTS_LANGUAGE=english
 TAVILY_API_KEY=tvly-...           # optional, enables web_search tool
 ```
 
-### 5) Run
+### 6) Run
 
 ```bash
 python run.py
