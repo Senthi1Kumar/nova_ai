@@ -157,14 +157,32 @@ def chat(req: ChatRequest):
 
 
 @app.post("/api/chat/stream")
-def chat_stream(req: ChatRequest):
+async def chat_stream(
+    message: str = Form(...),
+    session_id: str | None = Form(default=None),
+    image: UploadFile | None = File(default=None),
+):
+    """Text chat, optionally with an attached image. Multipart in, SSE out."""
+    image_path: Path | None = None
+    if image is not None and image.filename:
+        suffix = Path(image.filename).suffix or ".jpg"
+        with NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            image_path = Path(tmp.name)
+            tmp.write(await image.read())
+
     try:
-        session_id, chunk_iterator = chat_service.send_stream(req.message, req.session_id)
+        if image_path is not None:
+            active_sid, chunk_iterator = chat_service.send_text_with_image_stream(
+                message, image_path, session_id)
+        else:
+            active_sid, chunk_iterator = chat_service.send_stream(message, session_id)
     except LiteRTNotReady as exc:
+        if image_path is not None:
+            image_path.unlink(missing_ok=True)
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 
     def event_stream():
-        yield sse("session", {"session_id": session_id})
+        yield sse("session", {"session_id": active_sid})
         try:
             for chunk in chunk_iterator:
                 tok = extract_text(chunk)
@@ -175,6 +193,12 @@ def chat_stream(req: ChatRequest):
             yield sse("done", {})
         except Exception as exc:
             yield sse("error", {"error": str(exc)})
+        finally:
+            if image_path is not None:
+                try:
+                    image_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
 
@@ -192,12 +216,23 @@ def text_to_speech(req: ChatRequest):
 async def voice_chat_stream(
     audio: UploadFile = File(...),
     session_id: str | None = Form(default=None),
+    image: UploadFile | None = File(default=None),
 ):
-    """Native audio -> Gemma-4 -> clause-split -> Pocket-TTS streaming PCM."""
+    """Native audio -> Gemma-4 -> clause-split -> Pocket-TTS streaming PCM.
+
+    Optional `image` multipart field attaches a vision frame to the turn.
+    """
     suffix = Path(audio.filename or "rec.webm").suffix or ".webm"
     with NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
         temp_path = Path(tmp.name)
         tmp.write(await audio.read())
+
+    image_path: Path | None = None
+    if image is not None and image.filename:
+        img_suffix = Path(image.filename).suffix or ".jpg"
+        with NamedTemporaryFile(delete=False, suffix=img_suffix) as itmp:
+            image_path = Path(itmp.name)
+            itmp.write(await image.read())
 
     cfg = get_settings()
 
@@ -215,7 +250,8 @@ async def voice_chat_stream(
             yield sse("status", {"stage": "transcode"})
             wav_path = _transcode_to_wav16k(temp_path)
             yield sse("status", {"stage": "encode"})
-            active_sid, chunk_iter = chat_service.send_audio_stream(wav_path, active_sid)
+            active_sid, chunk_iter = chat_service.send_audio_stream(
+                wav_path, active_sid, image_path=image_path)
             yield sse("session", {"session_id": active_sid})
 
             for chunk in chunk_iter:
@@ -255,7 +291,7 @@ async def voice_chat_stream(
         except Exception as exc:
             yield sse("error", {"error": f"Voice streaming failed: {exc}"})
         finally:
-            for p in (temp_path, wav_path):
+            for p in (temp_path, wav_path, image_path):
                 if p is not None:
                     try:
                         p.unlink(missing_ok=True)

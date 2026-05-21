@@ -8,7 +8,31 @@ const voiceState = document.getElementById('voiceState');
 const micState = document.getElementById('micState');
 const statusDot = document.getElementById('statusDot');
 const statusText = document.getElementById('statusText');
-const statusDetails = document.getElementById('statusDetails');
+const statusChips = document.getElementById('statusChips');
+const statusModel = document.getElementById('statusModel');
+const metricsPill = document.getElementById('metricsPill');
+const metricsSummaryText = document.getElementById('metricsSummaryText');
+const mAudio = document.getElementById('m-audio');
+const mTtft = document.getElementById('m-ttft');
+const mTts = document.getElementById('m-tts');
+const mTotal = document.getElementById('m-total');
+const mTokens = document.getElementById('m-tokens');
+const mTps = document.getElementById('m-tps');
+const snapBtn = document.getElementById('snapBtn');
+const attachBtn = document.getElementById('attachBtn');
+const fileInput = document.getElementById('fileInput');
+const attachStrip = document.getElementById('attachStrip');
+const attachThumb = document.getElementById('attachThumb');
+const attachLabel = document.getElementById('attachLabel');
+const attachClear = document.getElementById('attachClear');
+const camModal = document.getElementById('camModal');
+const camVideo = document.getElementById('camVideo');
+const camCanvas = document.getElementById('camCanvas');
+const camCapture = document.getElementById('camCapture');
+const camCancel = document.getElementById('camCancel');
+
+let stagedImage = null;          // { blob, url, filename }
+let camStream = null;
 
 let sessionId = localStorage.getItem('litert_session_id') || null;
 let busy = false;
@@ -232,6 +256,32 @@ async function requestMicrophonePermission(showSuccessMessage = true) {
   }
 }
 
+function basename(path) {
+  if (!path) return '';
+  const parts = String(path).split(/[\\/]/);
+  return parts[parts.length - 1] || path;
+}
+
+function renderEngineStatus(data) {
+  statusChips.innerHTML = '';
+  const chips = [
+    { key: 'LLM', val: data.backend || '?' },
+    { key: 'audio', val: data.audio_backend || '?' },
+    { key: 'vision', val: data.vision_backend || '?' },
+    { key: 'MTP', val: data.speculative_decoding ? 'on' : 'off',
+      cls: data.speculative_decoding ? 'on' : 'off' },
+  ];
+  for (const c of chips) {
+    const el = document.createElement('span');
+    el.className = 'chip' + (c.cls ? ' ' + c.cls : '');
+    el.innerHTML = `<span class="chip-key">${c.key}</span> ${c.val}`;
+    statusChips.appendChild(el);
+  }
+  const model = basename(data.model_path);
+  statusModel.textContent = model || '';
+  statusModel.title = data.model_path || '';
+}
+
 async function checkHealth() {
   try {
     const res = await fetch('/api/health');
@@ -241,9 +291,14 @@ async function checkHealth() {
     statusDot.classList.toggle('ok', engineLoaded);
     statusDot.classList.toggle('bad', !engineLoaded);
     statusText.textContent = engineLoaded ? 'Engine ready' : 'Engine not ready';
-    statusDetails.textContent = engineLoaded
-      ? `${data.backend} (LLM) · ${data.audio_backend} (audio) · MTP=${data.speculative_decoding} · ${data.model_path}`
-      : (data.error || 'Check server logs');
+
+    if (engineLoaded) {
+      renderEngineStatus(data);
+    } else {
+      statusChips.innerHTML = '';
+      statusModel.textContent = data.error || 'Check server logs';
+      statusModel.title = '';
+    }
 
     const ttsOk = Boolean(data.tts?.available && data.tts?.enabled);
     const ttsLoaded = Boolean(data.tts?.loaded);
@@ -256,13 +311,194 @@ async function checkHealth() {
     sttAvailable = false;
     statusDot.className = 'dot bad';
     statusText.textContent = 'Server offline';
-    statusDetails.textContent = String(err);
+    statusChips.innerHTML = '';
+    statusModel.textContent = String(err);
+    statusModel.title = '';
     voiceState.textContent = 'Voice unavailable: server offline';
     sendBtn.disabled = true;
     recordBtn.disabled = true;
     enableMicBtn.disabled = false;
   }
 }
+
+function fmtMs(v) { return v == null ? '—' : `${v} ms`; }
+function fmtN(v)  { return v == null ? '—' : String(v); }
+
+function renderMetrics(m) {
+  if (!m) return;
+  metricsSummaryText.textContent =
+    `${m.total_ttfb_ms ?? '—'} ms · ${m.decode_tok_per_s ?? '—'} tok/s`;
+  mAudio.textContent  = fmtMs(m.audio_dur_ms);
+  mTtft.textContent   = fmtMs(m.llm_ttft_ms);
+  mTts.textContent    = fmtMs(m.tts_ttfb_ms);
+  mTotal.textContent  = fmtMs(m.total_ttfb_ms);
+  mTokens.textContent = fmtN(m.tokens);
+  mTps.textContent    = m.decode_tok_per_s == null ? '—' : `${m.decode_tok_per_s} /s`;
+  metricsPill.hidden = false;
+}
+
+metricsPill.addEventListener('click', () => {
+  const open = metricsPill.getAttribute('aria-expanded') === 'true';
+  metricsPill.setAttribute('aria-expanded', open ? 'false' : 'true');
+});
+
+function setStagedImage(blob, filename) {
+  clearStagedImage();
+  stagedImage = { blob, url: URL.createObjectURL(blob), filename };
+  attachThumb.src = stagedImage.url;
+  attachLabel.textContent = filename;
+  attachStrip.hidden = false;
+}
+
+function clearStagedImage() {
+  if (stagedImage) {
+    URL.revokeObjectURL(stagedImage.url);
+    stagedImage = null;
+  }
+  attachThumb.removeAttribute('src');
+  attachStrip.hidden = true;
+}
+
+function addImageMessage(blob) {
+  const row = document.createElement('div');
+  row.className = 'message user';
+  const bubble = document.createElement('div');
+  bubble.className = 'bubble';
+  const img = document.createElement('img');
+  img.src = URL.createObjectURL(blob);
+  img.style.maxWidth = '320px';
+  img.style.borderRadius = '12px';
+  img.style.display = 'block';
+  bubble.appendChild(img);
+  row.appendChild(bubble);
+  messagesEl.appendChild(row);
+  messagesEl.scrollTop = messagesEl.scrollHeight;
+}
+
+attachClear.addEventListener('click', clearStagedImage);
+
+attachBtn.addEventListener('click', () => fileInput.click());
+fileInput.addEventListener('change', () => {
+  const f = fileInput.files && fileInput.files[0];
+  if (!f) return;
+  setStagedImage(f, f.name);
+  fileInput.value = '';
+});
+
+async function openCamera() {
+  if (!navigator.mediaDevices?.getUserMedia) {
+    addMessage('assistant', '[Camera error] getUserMedia not available in this browser context.');
+    return;
+  }
+  try {
+    camStream = await navigator.mediaDevices.getUserMedia({
+      video: { width: { ideal: 1280 }, height: { ideal: 720 }, facingMode: 'user' },
+      audio: false,
+    });
+    camVideo.srcObject = camStream;
+    camModal.hidden = false;
+  } catch (err) {
+    addMessage('assistant', `[Camera error] ${err?.message || err}`);
+  }
+}
+
+function closeCamera() {
+  if (camStream) {
+    camStream.getTracks().forEach(t => t.stop());
+    camStream = null;
+  }
+  camVideo.srcObject = null;
+  camModal.hidden = true;
+}
+
+snapBtn.addEventListener('click', openCamera);
+camCancel.addEventListener('click', closeCamera);
+
+function extOfMime(type) {
+  const map = { 'image/jpeg': 'jpg', 'image/jpg': 'jpg', 'image/png': 'png',
+                'image/webp': 'webp', 'image/gif': 'gif', 'image/bmp': 'bmp' };
+  return map[type] || (type?.split('/')[1] || 'png');
+}
+
+// Paste image from clipboard (screenshot, copy-from-webpage, etc.)
+document.addEventListener('paste', (e) => {
+  if (busy) return;
+  // Skip if paste target is the textarea AND clipboard has text — let normal text paste happen.
+  const items = e.clipboardData?.items || [];
+  for (const item of items) {
+    if (item.type && item.type.startsWith('image/')) {
+      const blob = item.getAsFile();
+      if (blob) {
+        const name = `paste-${Date.now()}.${extOfMime(blob.type)}`;
+        setStagedImage(blob, name);
+        e.preventDefault();
+        return;
+      }
+    }
+  }
+});
+
+// Drag & drop — accept files or image URLs dragged from other tabs.
+const dropTarget = document.querySelector('.chat-card');
+function isDragWithImage(e) {
+  const types = e.dataTransfer?.types || [];
+  return types.includes('Files') || types.includes('text/uri-list') || types.includes('text/plain');
+}
+['dragenter', 'dragover'].forEach((ev) => {
+  dropTarget.addEventListener(ev, (e) => {
+    if (!isDragWithImage(e)) return;
+    e.preventDefault();
+    dropTarget.classList.add('drop-hover');
+  });
+});
+['dragleave', 'dragend', 'drop'].forEach((ev) => {
+  dropTarget.addEventListener(ev, () => dropTarget.classList.remove('drop-hover'));
+});
+dropTarget.addEventListener('drop', async (e) => {
+  if (busy) return;
+  e.preventDefault();
+  // 1) Files dropped from desktop / file manager
+  const file = e.dataTransfer?.files?.[0];
+  if (file && file.type.startsWith('image/')) {
+    setStagedImage(file, file.name);
+    return;
+  }
+  // 2) Image URL dropped from another browser tab
+  const url = e.dataTransfer?.getData('text/uri-list')
+           || e.dataTransfer?.getData('text/plain');
+  if (!url) return;
+  try {
+    const res = await fetch(url, { mode: 'cors' });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const blob = await res.blob();
+    if (!blob.type.startsWith('image/')) throw new Error(`not an image (got ${blob.type || 'unknown'})`);
+    const ext = extOfMime(blob.type);
+    const name = url.split('/').pop()?.split('?')[0] || `drop-${Date.now()}.${ext}`;
+    setStagedImage(blob, name);
+  } catch (err) {
+    addMessage('assistant',
+      `[Drop hint] couldn't fetch the image directly (${err.message}). ` +
+      `Many sites block cross-origin fetches — drag the image to your desktop first, then drop it here.`);
+  }
+});
+
+camCapture.addEventListener('click', () => {
+  if (!camStream) return closeCamera();
+  const w = camVideo.videoWidth || 1280;
+  const h = camVideo.videoHeight || 720;
+  // Cap longest edge at 1024 px to keep prefill tokens reasonable.
+  const scale = Math.min(1, 1024 / Math.max(w, h));
+  const cw = Math.round(w * scale);
+  const ch = Math.round(h * scale);
+  camCanvas.width = cw;
+  camCanvas.height = ch;
+  const ctx = camCanvas.getContext('2d');
+  ctx.drawImage(camVideo, 0, 0, cw, ch);
+  camCanvas.toBlob((blob) => {
+    if (blob) setStagedImage(blob, `snap-${Date.now()}.jpg`);
+    closeCamera();
+  }, 'image/jpeg', 0.85);
+});
 
 async function readSseResponse(res, onEvent) {
   if (!res.ok) {
@@ -310,19 +546,34 @@ async function postFormStream(url, formData, onEvent) {
 }
 
 async function sendTextMessage(text) {
-  if (!text || busy) return;
+  if ((!text && !stagedImage) || busy) return;
   busy = true;
   updateVoiceButtons();
-  addMessage('user', text);
+
+  const fd = new FormData();
+  fd.append('message', text || '');
+  if (sessionId) fd.append('session_id', sessionId);
+  if (stagedImage) {
+    fd.append('image', stagedImage.blob, stagedImage.filename);
+    addImageMessage(stagedImage.blob);
+  }
+  if (text) addMessage('user', text);
   const assistantBubble = addMessage('assistant', '');
 
+  // Consume the staged image now — one-shot binding.
+  clearStagedImage();
+
   try {
-    await postJsonStream('/api/chat/stream', { message: text, session_id: sessionId }, (event, data) => {
+    await postFormStream('/api/chat/stream', fd, (event, data) => {
       if (event === 'session') {
         sessionId = data.session_id;
         localStorage.setItem('litert_session_id', sessionId);
       } else if (event === 'token') {
         appendText(assistantBubble, data.text || '');
+      } else if (event === 'tool_call') {
+        addToolPill(data.name || 'tool', JSON.stringify(data.args || {}));
+      } else if (event === 'tool_result') {
+        addToolPill(data.name || 'tool', data.ok ? 'ok' : 'failed');
       } else if (event === 'error') {
         appendText(assistantBubble, `\n\n[Error] ${data.error}`);
       }
@@ -339,6 +590,7 @@ async function sendTextMessage(text) {
 form.addEventListener('submit', async (event) => {
   event.preventDefault();
   const text = promptEl.value.trim();
+  if (!text && !stagedImage) return;
   promptEl.value = '';
   await sendTextMessage(text);
 });
@@ -427,6 +679,11 @@ async function uploadRecordingStreaming() {
   const formData = new FormData();
   formData.append('audio', blob, 'recording.webm');
   if (sessionId) formData.append('session_id', sessionId);
+  if (stagedImage) {
+    formData.append('image', stagedImage.blob, stagedImage.filename);
+    addImageMessage(stagedImage.blob);
+    clearStagedImage();
+  }
 
   const queue = new AudioQueue(getAudioCtx());
   if (audioCtx.state === 'suspended') {
@@ -456,7 +713,8 @@ async function uploadRecordingStreaming() {
         // debug-only; canonical text is the token stream
       } else if (event === 'turn_metrics') {
         console.debug('turn_metrics', data);
-        voiceState.textContent = `TTFB ${data.total_ttfb_ms ?? '?'}ms · ${data.decode_tok_per_s ?? '?'} tok/s`;
+        renderMetrics(data);
+        voiceState.textContent = 'Voice turn complete';
       } else if (event === 'warning') {
         appendText(assistantBubble, `\n\n[TTS warning] ${data.warning}`);
       } else if (event === 'error') {

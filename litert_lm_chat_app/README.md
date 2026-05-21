@@ -3,6 +3,7 @@
 A local FastAPI chat app powered by **LiteRT-LM** with:
 
 - Gemma-4 native audio understanding (no Whisper)
+- Gemma-4 native vision — webcam snap or image upload, attached one-shot to any text or voice turn
 - MTP (speculative decoding) for fast streaming LLM output
 - Tavily web-search tool calling
 - Pocket-TTS streaming PCM over SSE
@@ -101,6 +102,7 @@ hf download litert-community/gemma-4-E2B-it-litert-lm \
 LITERT_MODEL_PATH=/absolute/path/to/gemma-4-E2B-it.litertlm
 LITERT_BACKEND=GPU                # or CPU if VRAM-bound
 LITERT_AUDIO_BACKEND=CPU
+LITERT_VISION_BACKEND=GPU         # drop to CPU if VRAM-bound
 LITERT_ENABLE_SPECULATIVE=true    # MTP — set false on CPU backend
 TTS_ENABLED=true
 POCKET_TTS_VOICE=alba

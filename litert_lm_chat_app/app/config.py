@@ -9,6 +9,7 @@ class Settings(BaseSettings):
     litert_model_path: str = ''
     litert_backend: str = 'GPU'
     litert_audio_backend: str = 'CPU'
+    litert_vision_backend: str = 'GPU'
     litert_cache_dir: str | None = None
     litert_system_prompt: str = 'You are a helpful local AI assistant running with LiteRT-LM.'
     litert_enable_speculative: bool = True

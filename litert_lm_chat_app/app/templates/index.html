@@ -16,9 +16,10 @@
       </div>
       <div class="status-card">
         <span id="statusDot" class="dot"></span>
-        <div>
+        <div class="status-body">
           <strong id="statusText">Checking engine...</strong>
-          <small id="statusDetails">Loading</small>
+          <div id="statusChips" class="status-chips"></div>
+          <small id="statusModel" class="status-model"></small>
         </div>
       </div>
     </section>
@@ -38,13 +39,49 @@
           <small id="micState">Microphone permission check pending</small>
           <small>Push-to-talk → Gemma-4 native audio → streamed tokens → Pocket-TTS PCM, all in one SSE turn.</small>
         </div>
+        <button id="metricsPill" class="metrics-pill" type="button" hidden aria-expanded="false" aria-label="Toggle latency metrics">
+          <span class="metrics-summary">
+            <span class="metrics-icon">⏱</span>
+            <span id="metricsSummaryText">— ms · — tok/s</span>
+          </span>
+          <dl class="metrics-grid" id="metricsGrid">
+            <dt>audio dur</dt><dd id="m-audio">—</dd>
+            <dt>LLM TTFT</dt><dd id="m-ttft">—</dd>
+            <dt>TTS TTFB</dt><dd id="m-tts">—</dd>
+            <dt>total TTFB</dt><dd id="m-total">—</dd>
+            <dt>tokens</dt><dd id="m-tokens">—</dd>
+            <dt>decode</dt><dd id="m-tps">—</dd>
+          </dl>
+        </button>
+      </div>
+
+      <div id="attachStrip" class="attach-strip" hidden>
+        <div class="attach-chip">
+          <img id="attachThumb" alt="staged attachment" />
+          <span id="attachLabel">image</span>
+          <button id="attachClear" type="button" title="Remove attachment" aria-label="Remove attachment">×</button>
+        </div>
       </div>
 
       <form id="chatForm" class="composer">
+        <button id="snapBtn" class="icon-btn" type="button" title="Snap from webcam" aria-label="Snap a webcam frame">📷</button>
+        <button id="attachBtn" class="icon-btn" type="button" title="Attach an image file" aria-label="Attach an image file">🖼</button>
+        <input id="fileInput" type="file" accept="image/*" hidden />
         <textarea id="prompt" rows="2" placeholder="Ask your LiteRT-LM model..." autocomplete="off"></textarea>
         <button id="sendBtn" type="submit">Send</button>
       </form>
     </section>
+
+    <div id="camModal" class="cam-modal" hidden>
+      <div class="cam-modal-inner">
+        <video id="camVideo" autoplay playsinline muted></video>
+        <canvas id="camCanvas" hidden></canvas>
+        <div class="cam-actions">
+          <button id="camCancel" type="button" class="icon-btn">Cancel</button>
+          <button id="camCapture" type="button" class="record-btn">Capture</button>
+        </div>
+      </div>
+    </div>
   </main>
 
   <script src="/static/app.js"></script>

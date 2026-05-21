@@ -68,6 +68,7 @@ class LiteRTChatService:
             kwargs = {
                 "backend": self._backend(self.settings.litert_backend),
                 "audio_backend": self._backend(self.settings.litert_audio_backend),
+                "vision_backend": self._backend(self.settings.litert_vision_backend),
                 "enable_speculative_decoding": self.settings.litert_enable_speculative,
             }
             if self.settings.litert_cache_dir:
@@ -103,6 +104,7 @@ class LiteRTChatService:
             "model_path": self.settings.litert_model_path,
             "backend": self.settings.litert_backend,
             "audio_backend": self.settings.litert_audio_backend,
+            "vision_backend": self.settings.litert_vision_backend,
             "speculative_decoding": self.settings.litert_enable_speculative,
             "error": self.ready_error,
             "active_conversations": len(self._conversations),
@@ -161,15 +163,39 @@ class LiteRTChatService:
         audio_path: str | Path,
         session_id: Optional[str] = None,
         prompt_hint: str = "",
+        image_path: Optional[str | Path] = None,
     ) -> tuple[str, Iterator[dict]]:
         handle = self._get_or_create(session_id)
         hint = prompt_hint or self.settings.audio_prompt_hint
 
         def iterator() -> Iterator[dict]:
             with handle.lock:
+                parts: list = [hint]
+                if image_path:
+                    parts.append(litert_lm.Content.ImageFile(
+                        absolute_path=str(Path(image_path).resolve())))
+                parts.append(litert_lm.Content.AudioFile(
+                    absolute_path=str(Path(audio_path).resolve())))
+                contents = litert_lm.Contents.of(*parts)
+                for chunk in handle.conversation.send_message_async(contents):
+                    yield chunk
+
+        return handle.session_id, iterator()
+
+    def send_text_with_image_stream(
+        self,
+        message: str,
+        image_path: str | Path,
+        session_id: Optional[str] = None,
+    ) -> tuple[str, Iterator[dict]]:
+        handle = self._get_or_create(session_id)
+
+        def iterator() -> Iterator[dict]:
+            with handle.lock:
                 contents = litert_lm.Contents.of(
-                    hint,
-                    litert_lm.Content.AudioFile(absolute_path=str(Path(audio_path).resolve())),
+                    message,
+                    litert_lm.Content.ImageFile(
+                        absolute_path=str(Path(image_path).resolve())),
                 )
                 for chunk in handle.conversation.send_message_async(contents):
                     yield chunk
