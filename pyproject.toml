@@ -80,8 +80,8 @@ dependencies = [
     # No cloud calls leave the box. Postgres setup: see NOVA_LOOP.md.
     "mem0ai>=0.1.0",
     "pgvector>=0.3",
-    "psycopg[binary,pool]>=3.2",
     "sentence-transformers>=3.0",
+    "psycopg[c,pool]>=3.3.4",
 ]
 
 [tool.uv]
