@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+import os
 import threading
 import uuid
 from dataclasses import dataclass
@@ -7,7 +9,26 @@ from pathlib import Path
 from typing import Dict, Iterator, Optional
 
 from app.config import Settings
-from app.tools import add_numbers, tavily_search
+from app.tools import (
+    add_numbers,
+    mapbox_category_search,
+    mapbox_directions,
+    mapbox_ground_location,
+    mapbox_isochrone,
+    mapbox_map_match,
+    mapbox_matrix,
+    mapbox_optimize_route,
+    mapbox_place_details,
+    mapbox_reverse_geocode,
+    mapbox_search_and_geocode,
+    mapbox_static_map,
+    tavily_extract,
+    tavily_research,
+    tavily_search,
+)
+
+log = logging.getLogger("litert_app.service")
+_DEBUG_CHUNKS = os.environ.get("LITERT_DEBUG_CHUNKS", "").lower() in ("1", "true", "yes")
 
 try:
     import litert_lm
@@ -19,7 +40,26 @@ class LiteRTNotReady(RuntimeError):
     pass
 
 
-DEFAULT_TOOLS = [tavily_search, add_numbers]
+DEFAULT_TOOLS = [
+    # Web
+    tavily_search,
+    tavily_extract,
+    tavily_research,
+    # Maps (Mapbox MCP — only effective if MAPBOX_ACCESS_TOKEN is set)
+    mapbox_search_and_geocode,
+    mapbox_reverse_geocode,
+    mapbox_ground_location,
+    mapbox_place_details,
+    mapbox_directions,
+    mapbox_isochrone,
+    mapbox_matrix,
+    mapbox_category_search,
+    mapbox_static_map,
+    mapbox_optimize_route,
+    mapbox_map_match,
+    # Trivial
+    add_numbers,
+]
 
 
 @dataclass
@@ -214,28 +254,43 @@ def extract_text(payload: dict) -> str:
     return "".join(parts)
 
 
-def extract_tool_events(chunk: dict) -> list[tuple[str, dict]]:
-    """Yield (kind, payload) for tool_call / tool_result items in a chunk.
+_TOOL_CALL_TYPES = {"tool_call", "function_call", "toolCall", "functionCall"}
+_TOOL_RESULT_TYPES = {"tool_result", "tool_response", "function_response",
+                      "toolResult", "functionResponse"}
 
-    LiteRT-LM emits content items with `type == "tool_call"` carrying
-    {name, args} and `type == "tool_result"` carrying {name, result/output}.
-    Shapes are verified at runtime; unknown shapes are skipped silently.
+
+def extract_tool_events(chunk: dict) -> list[tuple[str, dict]]:
+    """Yield (kind, payload) for tool/function call+result items in a chunk.
+
+    Covers the variant shapes Gemma/LiteRT have used: snake_case (`tool_call`,
+    `tool_result`) and Gemma's `function_call` / `function_response`. Unknown
+    shapes log once (when LITERT_DEBUG_CHUNKS=1) and are skipped.
     """
     out: list[tuple[str, dict]] = []
     if not chunk:
         return out
+    if _DEBUG_CHUNKS:
+        log.debug("raw chunk: %s", chunk)
     for item in chunk.get("content", []) or []:
+        if not isinstance(item, dict):
+            continue
         t = item.get("type")
-        if t == "tool_call":
-            out.append(("tool_call", {
-                "name": item.get("name") or item.get("tool_name") or "",
-                "args": item.get("args") or item.get("arguments") or {},
-            }))
-        elif t == "tool_result":
-            summary = item.get("result") or item.get("output") or item.get("text") or ""
-            out.append(("tool_result", {
-                "name": item.get("name") or item.get("tool_name") or "",
-                "ok": item.get("ok", True),
+        if t in _TOOL_CALL_TYPES:
+            payload = {
+                "name": item.get("name") or item.get("tool_name") or item.get("function_name") or "",
+                "args": item.get("args") or item.get("arguments") or item.get("input") or {},
+            }
+            log.info("tool_call extracted: %s args=%s", payload["name"], payload["args"])
+            out.append(("tool_call", payload))
+        elif t in _TOOL_RESULT_TYPES:
+            summary = (item.get("result") or item.get("output")
+                       or item.get("response") or item.get("text") or "")
+            payload = {
+                "name": item.get("name") or item.get("tool_name") or item.get("function_name") or "",
+                "ok": bool(item.get("ok", True)),
                 "summary": summary if isinstance(summary, str) else str(summary),
-            }))
+            }
+            log.info("tool_result extracted: %s ok=%s summary_len=%d",
+                     payload["name"], payload["ok"], len(payload["summary"]))
+            out.append(("tool_result", payload))
     return out

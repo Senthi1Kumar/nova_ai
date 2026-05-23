@@ -110,6 +110,39 @@ function addToolPill(name, label) {
   return pill;
 }
 
+function addImageUrlMessage(url, alt = 'tool image') {
+  const row = document.createElement('div');
+  row.className = 'message assistant';
+  const bubble = document.createElement('div');
+  bubble.className = 'bubble';
+  const img = document.createElement('img');
+  img.src = url;
+  img.alt = alt;
+  img.style.maxWidth = '480px';
+  img.style.borderRadius = '12px';
+  img.style.display = 'block';
+  bubble.appendChild(img);
+  row.appendChild(bubble);
+  messagesEl.appendChild(row);
+  messagesEl.scrollTop = messagesEl.scrollHeight;
+  return img;
+}
+
+function maybeRenderToolImage(toolName, summary) {
+  // tool_result.summary is whatever the Python tool returned. For Mapbox
+  // static_map (and any future tool that drops images on disk) we expect a
+  // JSON string with an `image_url` field served from /maps/ or /audio/.
+  if (typeof summary !== 'string') return;
+  const trimmed = summary.trim();
+  if (!trimmed.startsWith('{')) return;
+  try {
+    const obj = JSON.parse(trimmed);
+    if (obj && typeof obj.image_url === 'string' && obj.image_url) {
+      addImageUrlMessage(obj.image_url, toolName);
+    }
+  } catch (_) { /* not JSON — fine */ }
+}
+
 function isLocalHost() {
   return ['localhost', '127.0.0.1', '::1'].includes(window.location.hostname);
 }
@@ -574,6 +607,7 @@ async function sendTextMessage(text) {
         addToolPill(data.name || 'tool', JSON.stringify(data.args || {}));
       } else if (event === 'tool_result') {
         addToolPill(data.name || 'tool', data.ok ? 'ok' : 'failed');
+        maybeRenderToolImage(data.name || 'tool', data.summary);
       } else if (event === 'error') {
         appendText(assistantBubble, `\n\n[Error] ${data.error}`);
       }
@@ -709,6 +743,7 @@ async function uploadRecordingStreaming() {
         addToolPill(data.name || 'tool', JSON.stringify(data.args || {}));
       } else if (event === 'tool_result') {
         addToolPill(data.name || 'tool', data.ok ? 'ok' : 'failed');
+        maybeRenderToolImage(data.name || 'tool', data.summary);
       } else if (event === 'clause' || event === 'clause_end') {
         // debug-only; canonical text is the token stream
       } else if (event === 'turn_metrics') {

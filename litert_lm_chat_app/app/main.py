@@ -2,9 +2,15 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 import shutil
 import subprocess
 import time
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
 from contextlib import asynccontextmanager
 from pathlib import Path
 from tempfile import NamedTemporaryFile
@@ -24,6 +30,7 @@ from app.litert_service import (
     extract_text,
     extract_tool_events,
 )
+from app.mcp_bridge import MCPBridge, MCPNotReady, set_bridge
 from app.voice_service import PocketTTSService, VoiceNotReady
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -35,16 +42,47 @@ tts_service = PocketTTSService(settings)
 templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
 
 
+_mcp_bridge: MCPBridge | None = None
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global _mcp_bridge
+    if settings.mapbox_access_token:
+        bridge = MCPBridge(
+            url=settings.mapbox_mcp_url,
+            token=settings.mapbox_access_token,
+            name="mapbox",
+        )
+        try:
+            bridge.start(connect_timeout=20.0)
+            _mcp_bridge = bridge
+            set_bridge(bridge)
+        except MCPNotReady as exc:
+            logging.getLogger("litert_app.startup").warning(
+                "Mapbox MCP disabled: %s", exc
+            )
+    else:
+        logging.getLogger("litert_app.startup").info(
+            "Mapbox MCP disabled: MAPBOX_ACCESS_TOKEN not set"
+        )
+
     chat_service.start()
     yield
     chat_service.stop()
+    if _mcp_bridge is not None:
+        _mcp_bridge.stop()
+        set_bridge(None)
+        _mcp_bridge = None
 
 
 app = FastAPI(title="LiteRT-LM Native Voice Chat", version="2.0.0", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="static")
 app.mount("/audio", StaticFiles(directory=str(ROOT_DIR / settings.tts_output_dir)), name="audio")
+
+_MAPS_DIR = ROOT_DIR / settings.maps_output_dir
+_MAPS_DIR.mkdir(parents=True, exist_ok=True)
+app.mount("/maps", StaticFiles(directory=str(_MAPS_DIR)), name="maps")
 
 
 class ChatRequest(BaseModel):
@@ -128,6 +166,13 @@ async def index(request: Request):
 def health():
     data = chat_service.health()
     data["tts"] = tts_service.health()
+    data["mcp"] = {
+        "mapbox": {
+            "configured": bool(settings.mapbox_access_token),
+            "ready": bool(_mcp_bridge and _mcp_bridge.ready),
+            "tool_count": len(_mcp_bridge.tool_names) if _mcp_bridge else 0,
+        }
+    }
     return data
 
 

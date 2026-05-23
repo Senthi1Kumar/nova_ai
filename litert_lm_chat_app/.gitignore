@@ -17,7 +17,7 @@ __pycache__/
 *_mldrift_weight_cache.bin
 default.profraw
 
-# Pocket-TTS runtime output
+# Runtime output (Pocket-TTS WAVs, MCP-generated map PNGs, etc.)
 runtime/
 
 # IDE

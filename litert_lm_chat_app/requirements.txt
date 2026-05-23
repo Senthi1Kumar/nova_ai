@@ -8,3 +8,4 @@ pocket-tts
 scipy
 soundfile
 tavily-python>=0.5.0
+mcp>=1.10.0
