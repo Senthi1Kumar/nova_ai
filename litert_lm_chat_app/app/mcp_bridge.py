@@ -20,7 +20,7 @@ import asyncio
 import logging
 import threading
 from contextlib import AsyncExitStack
-from typing import Any, Optional
+from typing import Optional
 
 log = logging.getLogger("litert_app.mcp")
 
@@ -32,9 +32,9 @@ class MCPNotReady(RuntimeError):
 class MCPBridge:
     """One persistent streamable-HTTP MCP session, fronted by a sync API."""
 
-    def __init__(self, url: str, token: str, name: str = "mapbox"):
+    def __init__(self, url: str, token: str = "", name: str = "mcp"):
         self.url = url
-        self.token = token
+        self.token = token or ""
         self.name = name
 
         self._loop: Optional[asyncio.AbstractEventLoop] = None
@@ -50,10 +50,6 @@ class MCPBridge:
     # ---------- lifecycle ----------
 
     def start(self, connect_timeout: float = 20.0) -> None:
-        if not self.token:
-            raise MCPNotReady(
-                f"{self.name} MCP disabled: no access token configured"
-            )
         self._thread = threading.Thread(
             target=self._run_loop, name=f"mcp-{self.name}", daemon=True
         )
@@ -66,15 +62,16 @@ class MCPBridge:
             raise MCPNotReady(
                 f"{self.name} MCP connect failed: {self._connect_error}"
             )
-        log.info("%s MCP ready (%d tools): %s", self.name,
-                 len(self._tool_names), ", ".join(self._tool_names[:8]))
-        # Schema for the static-map tool changes between Mapbox MCP versions —
-        # log it once so we don't have to guess the arg shape.
-        sm = self._tool_schemas.get("static_map_image_tool")
-        if sm:
+        # One quiet line on startup; verbose tool list + schemas only when
+        # LITERT_DEBUG_CHUNKS=1 (set in app.litert_service module).
+        log.info("%s MCP ready (%d tools)", self.name, len(self._tool_names))
+        if log.isEnabledFor(logging.DEBUG):
+            log.debug("%s tools: %s", self.name, ", ".join(self._tool_names))
             import json as _json
-            log.info("%s static_map_image_tool schema: %s",
-                     self.name, _json.dumps(sm)[:600])
+            for name, schema in self._tool_schemas.items():
+                if schema:
+                    log.debug("%s %s schema: %s", self.name, name,
+                              _json.dumps(schema)[:600])
 
     def tool_schema(self, name: str):
         return self._tool_schemas.get(name)
@@ -123,7 +120,7 @@ class MCPBridge:
         from mcp.client.streamable_http import streamablehttp_client
 
         self._stack = AsyncExitStack()
-        headers = {"Authorization": f"Bearer {self.token}"}
+        headers = {"Authorization": f"Bearer {self.token}"} if self.token else None
 
         transport = await self._stack.enter_async_context(
             streamablehttp_client(self.url, headers=headers)
@@ -187,10 +184,16 @@ class MCPBridge:
             self._loop.run_until_complete(self._connect())
             self._ready.set()
             self._loop.run_forever()
-        except Exception as exc:
-            log.exception("%s MCP loop crashed", self.name)
+        except (asyncio.CancelledError, BaseException) as exc:
+            # CancelledError is BaseException, not Exception, so we catch
+            # broadly here. The outer start() handles surfacing this as
+            # MCPNotReady — we just silence the unhandled-thread spam.
             self._connect_error = repr(exc)
             self._ready.set()
+            if isinstance(exc, asyncio.CancelledError):
+                log.debug("%s MCP connect cancelled (sidecar likely down)", self.name)
+            else:
+                log.debug("%s MCP loop exited: %s", self.name, exc)
 
 
 # Module-level singleton so tool wrappers can grab the bridge without a DI mess.

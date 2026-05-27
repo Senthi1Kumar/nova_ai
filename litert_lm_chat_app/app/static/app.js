@@ -30,6 +30,7 @@ const camVideo = document.getElementById('camVideo');
 const camCanvas = document.getElementById('camCanvas');
 const camCapture = document.getElementById('camCapture');
 const camCancel = document.getElementById('camCancel');
+const newChatBtn = document.getElementById('newChatBtn');
 
 let stagedImage = null;          // { blob, url, filename }
 let camStream = null;
@@ -375,6 +376,31 @@ metricsPill.addEventListener('click', () => {
   metricsPill.setAttribute('aria-expanded', open ? 'false' : 'true');
 });
 
+async function startNewChat() {
+  if (busy) return;
+  const prevId = sessionId;
+  sessionId = null;
+  localStorage.removeItem('litert_session_id');
+  // Best-effort close server-side; ignore failures (engine may have hung).
+  if (prevId) {
+    try {
+      await fetch(`/api/session/${encodeURIComponent(prevId)}`, { method: 'DELETE' });
+    } catch (_) { /* ignore */ }
+  }
+  // Clear visible history + reset audio queue + hide metrics pill.
+  messagesEl.innerHTML = '';
+  if (audioCtx) {
+    try { audioCtx.close(); } catch (_) {}
+    audioCtx = null;
+  }
+  metricsPill.hidden = true;
+  clearStagedImage();
+  voiceState.textContent = 'New conversation — context cleared.';
+  addMessage('assistant', 'Fresh session. What can I help you with?');
+}
+
+newChatBtn.addEventListener('click', startNewChat);
+
 function setStagedImage(blob, filename) {
   clearStagedImage();
   stagedImage = { blob, url: URL.createObjectURL(blob), filename };
@@ -608,6 +634,9 @@ async function sendTextMessage(text) {
       } else if (event === 'tool_result') {
         addToolPill(data.name || 'tool', data.ok ? 'ok' : 'failed');
         maybeRenderToolImage(data.name || 'tool', data.summary);
+      } else if (event === 'compaction') {
+        addToolPill('compacted',
+          `${data.compacted_turns} turns → summary (${data.tokens_before}→${data.tokens_after} tok, saved ${data.tokens_saved})`);
       } else if (event === 'error') {
         appendText(assistantBubble, `\n\n[Error] ${data.error}`);
       }
@@ -744,6 +773,9 @@ async function uploadRecordingStreaming() {
       } else if (event === 'tool_result') {
         addToolPill(data.name || 'tool', data.ok ? 'ok' : 'failed');
         maybeRenderToolImage(data.name || 'tool', data.summary);
+      } else if (event === 'compaction') {
+        addToolPill('compacted',
+          `${data.compacted_turns} turns → summary (${data.tokens_before}→${data.tokens_after} tok, saved ${data.tokens_saved})`);
       } else if (event === 'clause' || event === 'clause_end') {
         // debug-only; canonical text is the token stream
       } else if (event === 'turn_metrics') {

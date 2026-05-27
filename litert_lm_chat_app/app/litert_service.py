@@ -11,21 +11,17 @@ from typing import Dict, Iterator, Optional
 from app.config import Settings
 from app.tools import (
     add_numbers,
-    mapbox_category_search,
-    mapbox_directions,
-    mapbox_ground_location,
-    mapbox_isochrone,
-    mapbox_map_match,
-    mapbox_matrix,
-    mapbox_optimize_route,
-    mapbox_place_details,
-    mapbox_reverse_geocode,
-    mapbox_search_and_geocode,
-    mapbox_static_map,
-    tavily_extract,
-    tavily_research,
-    tavily_search,
+    web_search,
+    google_search,
 )
+# Dormant fallbacks — re-import + add to DEFAULT_TOOLS to re-enable.
+# from app.tools import tavily_search, tavily_extract, tavily_research
+# from app.misc.mapbox_tools import (
+#     mapbox_search_and_geocode, mapbox_reverse_geocode, mapbox_ground_location,
+#     mapbox_place_details, mapbox_directions, mapbox_isochrone, mapbox_matrix,
+#     mapbox_category_search, mapbox_static_map, mapbox_optimize_route,
+#     mapbox_map_match,
+# )
 
 log = logging.getLogger("litert_app.service")
 _DEBUG_CHUNKS = os.environ.get("LITERT_DEBUG_CHUNKS", "").lower() in ("1", "true", "yes")
@@ -41,25 +37,26 @@ class LiteRTNotReady(RuntimeError):
 
 
 DEFAULT_TOOLS = [
-    # Web
-    tavily_search,
-    tavily_extract,
-    tavily_research,
-    # Maps (Mapbox MCP — only effective if MAPBOX_ACCESS_TOKEN is set)
-    mapbox_search_and_geocode,
-    mapbox_reverse_geocode,
-    mapbox_ground_location,
-    mapbox_place_details,
-    mapbox_directions,
-    mapbox_isochrone,
-    mapbox_matrix,
-    mapbox_category_search,
-    mapbox_static_map,
-    mapbox_optimize_route,
-    mapbox_map_match,
-    # Trivial
+    # Active: web_search + google_search are bridge proxies into the
+    # IResearcher FastMCP sidecar (start with `python -m app.tools_v2`).
+    # Brave + Serper logic lives in that sidecar, not in-process.
+    web_search,
+    google_search,
     add_numbers,
 ]
+
+
+@dataclass
+class TurnRecord:
+    """One round-trip in the conversation, in serializable form.
+
+    `user_text` captures whatever entered the prompt (text, audio-hint, etc.);
+    audio / image bytes are NOT preserved because we can't replay them — the
+    compactor summarizes from text only. `assistant_text` is the full reply
+    accumulated across stream chunks.
+    """
+    user_text: str
+    assistant_text: str = ""
 
 
 @dataclass
@@ -67,6 +64,11 @@ class ConversationHandle:
     session_id: str
     conversation: object
     lock: threading.Lock
+    turns: list[TurnRecord] = None   # type: ignore[assignment]
+
+    def __post_init__(self):
+        if self.turns is None:
+            self.turns = []
 
 
 class LiteRTChatService:
@@ -110,9 +112,16 @@ class LiteRTChatService:
                 "audio_backend": self._backend(self.settings.litert_audio_backend),
                 "vision_backend": self._backend(self.settings.litert_vision_backend),
                 "enable_speculative_decoding": self.settings.litert_enable_speculative,
+                "max_num_tokens": int(self.settings.litert_max_num_tokens),
             }
             if self.settings.litert_cache_dir:
+                Path(self.settings.litert_cache_dir).mkdir(parents=True, exist_ok=True)
                 kwargs["cache_dir"] = self.settings.litert_cache_dir
+            log.info("LiteRT Engine init: backend=%s audio=%s vision=%s MTP=%s max_tokens=%d",
+                     self.settings.litert_backend, self.settings.litert_audio_backend,
+                     self.settings.litert_vision_backend,
+                     self.settings.litert_enable_speculative,
+                     int(self.settings.litert_max_num_tokens))
 
             self._engine_cm = litert_lm.Engine(self.settings.litert_model_path, **kwargs)
             self.engine = self._engine_cm.__enter__()
@@ -146,6 +155,7 @@ class LiteRTChatService:
             "audio_backend": self.settings.litert_audio_backend,
             "vision_backend": self.settings.litert_vision_backend,
             "speculative_decoding": self.settings.litert_enable_speculative,
+            "max_num_tokens": int(self.settings.litert_max_num_tokens),
             "error": self.ready_error,
             "active_conversations": len(self._conversations),
         }
@@ -190,13 +200,7 @@ class LiteRTChatService:
 
     def send_stream(self, message: str, session_id: Optional[str] = None) -> tuple[str, Iterator[dict]]:
         handle = self._get_or_create(session_id)
-
-        def iterator() -> Iterator[dict]:
-            with handle.lock:
-                for chunk in handle.conversation.send_message_async(message):
-                    yield chunk
-
-        return handle.session_id, iterator()
+        return handle.session_id, self._run_turn(handle, user_label=message, sender=lambda c: c.send_message_async(message))
 
     def send_audio_stream(
         self,
@@ -207,20 +211,18 @@ class LiteRTChatService:
     ) -> tuple[str, Iterator[dict]]:
         handle = self._get_or_create(session_id)
         hint = prompt_hint or self.settings.audio_prompt_hint
+        label = "[voice]" + (" [image]" if image_path else "")
 
-        def iterator() -> Iterator[dict]:
-            with handle.lock:
-                parts: list = [hint]
-                if image_path:
-                    parts.append(litert_lm.Content.ImageFile(
-                        absolute_path=str(Path(image_path).resolve())))
-                parts.append(litert_lm.Content.AudioFile(
-                    absolute_path=str(Path(audio_path).resolve())))
-                contents = litert_lm.Contents.of(*parts)
-                for chunk in handle.conversation.send_message_async(contents):
-                    yield chunk
+        def _send(conv):
+            parts: list = [hint]
+            if image_path:
+                parts.append(litert_lm.Content.ImageFile(
+                    absolute_path=str(Path(image_path).resolve())))
+            parts.append(litert_lm.Content.AudioFile(
+                absolute_path=str(Path(audio_path).resolve())))
+            return conv.send_message_async(litert_lm.Contents.of(*parts))
 
-        return handle.session_id, iterator()
+        return handle.session_id, self._run_turn(handle, user_label=label, sender=_send)
 
     def send_text_with_image_stream(
         self,
@@ -229,18 +231,166 @@ class LiteRTChatService:
         session_id: Optional[str] = None,
     ) -> tuple[str, Iterator[dict]]:
         handle = self._get_or_create(session_id)
+        label = message + " [image]"
+
+        def _send(conv):
+            return conv.send_message_async(litert_lm.Contents.of(
+                message,
+                litert_lm.Content.ImageFile(
+                    absolute_path=str(Path(image_path).resolve())),
+            ))
+
+        return handle.session_id, self._run_turn(handle, user_label=label, sender=_send)
+
+    # ---------- shared streaming + history tracking ----------
+
+    # ---------- compaction ----------
+
+    _KEEP_RECENT_TURNS = 2
+    _COMPACT_RATIO = 0.70   # trigger when token count > this * max_num_tokens
+    _SUMMARY_TARGET_TOKENS = 250
+
+    def _count_tokens(self, text: str) -> int:
+        """Count tokens via engine.tokenize. Falls back to chars/4 on error."""
+        if self.engine is None:
+            return len(text) // 4
+        try:
+            return len(self.engine.tokenize(text))
+        except Exception:
+            return len(text) // 4
+
+    def _serialize_turns(self, turns: list["TurnRecord"]) -> str:
+        """Render turns to a flat string used for token counting + summarization."""
+        lines = []
+        for t in turns:
+            lines.append(f"User: {t.user_text}")
+            if t.assistant_text:
+                lines.append(f"Assistant: {t.assistant_text}")
+        return "\n".join(lines)
+
+    def _conversation_token_count(self, handle: "ConversationHandle") -> int:
+        sys_prompt = self.settings.litert_system_prompt
+        body = self._serialize_turns(handle.turns)
+        return self._count_tokens(sys_prompt + "\n" + body)
+
+    def _summarize(self, text: str) -> str:
+        """Run a throwaway summarizer conversation. Returns a short summary or
+        an empty string on failure (the caller falls back to keeping context)."""
+        if self.engine is None:
+            return ""
+        sys_msg = (
+            "You are a context-compactor. Condense the conversation below into "
+            f"under {self._SUMMARY_TARGET_TOKENS} tokens. Preserve: who the user is, "
+            "key facts established, tool results, the user's goals. Drop pleasantries. "
+            "Output as bullet points, no preamble. Do not narrate the conversation; "
+            "state the facts as the assistant's working memory."
+        )
+        try:
+            cm = self.engine.create_conversation(
+                messages=[{"role": "system", "content": [{"type": "text", "text": sys_msg}]}],
+                tools=[],
+            )
+            conv = cm.__enter__()
+            try:
+                response = conv.send_message(text)
+                return extract_text(response).strip()
+            finally:
+                cm.__exit__(None, None, None)
+        except Exception as exc:
+            log.warning("summarizer failed: %s", exc)
+            return ""
+
+    def _maybe_compact(self, handle: "ConversationHandle") -> Optional[dict]:
+        """Check usage; if over threshold, summarize old turns and rebuild the
+        conversation. Returns a synthetic SSE-shaped chunk describing the
+        compaction so the caller can pass it through to the client, or None."""
+        if self.engine is None or len(handle.turns) <= self._KEEP_RECENT_TURNS + 1:
+            return None
+        budget = int(self.settings.litert_max_num_tokens)
+        used = self._conversation_token_count(handle)
+        if used < int(budget * self._COMPACT_RATIO):
+            return None
+
+        log.info("compaction triggered: used=%d / budget=%d (%.0f%%)",
+                 used, budget, 100 * used / budget)
+        old_turns = handle.turns[:-self._KEEP_RECENT_TURNS]
+        recent_turns = handle.turns[-self._KEEP_RECENT_TURNS:]
+        summary = self._summarize(self._serialize_turns(old_turns))
+        if not summary:
+            log.warning("compaction: summarizer returned empty; aborting")
+            return None
+
+        # Rebuild conversation with the summary as a pseudo-assistant turn.
+        new_messages = [
+            {"role": "system",
+             "content": [{"type": "text", "text": self.settings.litert_system_prompt}]},
+            {"role": "assistant",
+             "content": [{"type": "text",
+                          "text": f"(memory of prior conversation)\n{summary}"}]},
+        ]
+        for t in recent_turns:
+            new_messages.append({"role": "user",
+                                 "content": [{"type": "text", "text": t.user_text}]})
+            if t.assistant_text:
+                new_messages.append({"role": "assistant",
+                                     "content": [{"type": "text", "text": t.assistant_text}]})
+
+        old_cm = getattr(handle.conversation, "_litert_context_manager", None)
+        try:
+            new_cm = self.engine.create_conversation(messages=new_messages, tools=DEFAULT_TOOLS)
+            new_conv = new_cm.__enter__()
+            setattr(new_conv, "_litert_context_manager", new_cm)
+        except Exception:
+            log.exception("compaction: failed to build new conversation; keeping old one")
+            return None
+
+        if old_cm is not None:
+            try:
+                old_cm.__exit__(None, None, None)
+            except Exception:
+                pass
+
+        handle.conversation = new_conv
+        compacted_count = len(old_turns)
+        handle.turns = list(recent_turns)
+        new_used = self._conversation_token_count(handle)
+        log.info("compaction done: %d turns -> summary (%d -> %d tokens, freed %d)",
+                 compacted_count, used, new_used, used - new_used)
+
+        # Synthetic chunk passed through the SSE generator unchanged — the
+        # /api/voice/chat/stream layer surfaces it as a `compaction` event.
+        return {
+            "_synthetic": "compaction",
+            "compacted_turns": compacted_count,
+            "tokens_before": used,
+            "tokens_after": new_used,
+            "tokens_saved": used - new_used,
+            "summary_preview": summary[:160] + ("…" if len(summary) > 160 else ""),
+        }
+
+    def _run_turn(self, handle: "ConversationHandle", user_label: str, sender) -> Iterator[dict]:
+        """Drive one chunk-iterator turn, accumulating the assistant text into
+        the handle's history. After the iterator drains, opportunistically
+        compact if the conversation is approaching the token budget."""
+        turn = TurnRecord(user_text=user_label[:2000])  # cap; not persisted
+        handle.turns.append(turn)
 
         def iterator() -> Iterator[dict]:
             with handle.lock:
-                contents = litert_lm.Contents.of(
-                    message,
-                    litert_lm.Content.ImageFile(
-                        absolute_path=str(Path(image_path).resolve())),
-                )
-                for chunk in handle.conversation.send_message_async(contents):
+                for chunk in sender(handle.conversation):
+                    txt = extract_text(chunk)
+                    if txt:
+                        turn.assistant_text += txt
                     yield chunk
+            # After stream drain — check budget, compact if needed.
+            try:
+                event = self._maybe_compact(handle)
+                if event is not None:
+                    yield event
+            except Exception:
+                log.exception("compaction failed; leaving conversation as-is")
 
-        return handle.session_id, iterator()
+        return iterator()
 
 
 def extract_text(payload: dict) -> str:
@@ -257,6 +407,21 @@ def extract_text(payload: dict) -> str:
 _TOOL_CALL_TYPES = {"tool_call", "function_call", "toolCall", "functionCall"}
 _TOOL_RESULT_TYPES = {"tool_result", "tool_response", "function_response",
                       "toolResult", "functionResponse"}
+
+
+def extract_synthetic_event(chunk: dict) -> Optional[tuple[str, dict]]:
+    """Return ('compaction', payload) for the marker chunk _run_turn emits
+    after a successful context-compaction, else None. Lets the SSE layer
+    forward a `compaction` event to the browser."""
+    if isinstance(chunk, dict) and chunk.get("_synthetic") == "compaction":
+        return ("compaction", {
+            "compacted_turns": chunk.get("compacted_turns"),
+            "tokens_before": chunk.get("tokens_before"),
+            "tokens_after": chunk.get("tokens_after"),
+            "tokens_saved": chunk.get("tokens_saved"),
+            "summary_preview": chunk.get("summary_preview", ""),
+        })
+    return None
 
 
 def extract_tool_events(chunk: dict) -> list[tuple[str, dict]]:

@@ -11,6 +11,11 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
+# Quiet third-party HTTP + MCP transport chatter. We still get our own
+# litert_app.mcp / litert_app.tools INFO lines; just the per-request
+# heartbeats from httpx and streamable-http negotiation are hidden.
+for _noisy in ("httpx", "httpcore", "mcp", "mcp.client.streamable_http"):
+    logging.getLogger(_noisy).setLevel(logging.WARNING)
 from contextlib import asynccontextmanager
 from pathlib import Path
 from tempfile import NamedTemporaryFile
@@ -27,11 +32,19 @@ from app.config import get_settings
 from app.litert_service import (
     LiteRTChatService,
     LiteRTNotReady,
+    extract_synthetic_event,
     extract_text,
     extract_tool_events,
 )
 from app.mcp_bridge import MCPBridge, MCPNotReady, set_bridge
 from app.voice_service import PocketTTSService, VoiceNotReady
+
+# Optional local extensions under app/misc/. App runs fine without them.
+try:
+    import app.misc  # noqa: F401
+    _MISC_AVAILABLE = True
+except ImportError:
+    _MISC_AVAILABLE = False
 
 BASE_DIR = Path(__file__).resolve().parent
 ROOT_DIR = BASE_DIR.parent
@@ -48,23 +61,20 @@ _mcp_bridge: MCPBridge | None = None
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _mcp_bridge
-    if settings.mapbox_access_token:
-        bridge = MCPBridge(
-            url=settings.mapbox_mcp_url,
-            token=settings.mapbox_access_token,
-            name="mapbox",
-        )
-        try:
-            bridge.start(connect_timeout=20.0)
-            _mcp_bridge = bridge
-            set_bridge(bridge)
-        except MCPNotReady as exc:
-            logging.getLogger("litert_app.startup").warning(
-                "Mapbox MCP disabled: %s", exc
-            )
-    else:
-        logging.getLogger("litert_app.startup").info(
-            "Mapbox MCP disabled: MAPBOX_ACCESS_TOKEN not set"
+    # Connect to the IResearcher FastMCP sidecar (started in another terminal
+    # via `python -m app.tools_v2`). If the sidecar isn't running we log a
+    # warning and continue — web_search / google_search will return an
+    # "unavailable" message until the sidecar comes online.
+    bridge = MCPBridge(url=settings.iresearcher_mcp_url, name="iresearcher")
+    try:
+        bridge.start(connect_timeout=10.0)
+        _mcp_bridge = bridge
+        set_bridge(bridge)
+    except MCPNotReady as exc:
+        logging.getLogger("litert_app.startup").warning(
+            "IResearcher MCP sidecar not reachable at %s — start it with "
+            "`python -m app.tools_v2`. (%s)",
+            settings.iresearcher_mcp_url, exc,
         )
 
     chat_service.start()
@@ -80,9 +90,11 @@ app = FastAPI(title="LiteRT-LM Native Voice Chat", version="2.0.0", lifespan=lif
 app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="static")
 app.mount("/audio", StaticFiles(directory=str(ROOT_DIR / settings.tts_output_dir)), name="audio")
 
-_MAPS_DIR = ROOT_DIR / settings.maps_output_dir
-_MAPS_DIR.mkdir(parents=True, exist_ok=True)
-app.mount("/maps", StaticFiles(directory=str(_MAPS_DIR)), name="maps")
+# /maps/ only mounted when the optional misc/ extensions are present.
+if _MISC_AVAILABLE:
+    _MAPS_DIR = ROOT_DIR / settings.maps_output_dir
+    _MAPS_DIR.mkdir(parents=True, exist_ok=True)
+    app.mount("/maps", StaticFiles(directory=str(_MAPS_DIR)), name="maps")
 
 
 class ChatRequest(BaseModel):
@@ -166,13 +178,6 @@ async def index(request: Request):
 def health():
     data = chat_service.health()
     data["tts"] = tts_service.health()
-    data["mcp"] = {
-        "mapbox": {
-            "configured": bool(settings.mapbox_access_token),
-            "ready": bool(_mcp_bridge and _mcp_bridge.ready),
-            "tool_count": len(_mcp_bridge.tool_names) if _mcp_bridge else 0,
-        }
-    }
     return data
 
 
@@ -230,6 +235,10 @@ async def chat_stream(
         yield sse("session", {"session_id": active_sid})
         try:
             for chunk in chunk_iterator:
+                ev = extract_synthetic_event(chunk)
+                if ev is not None:
+                    yield sse(ev[0], ev[1])
+                    continue
                 tok = extract_text(chunk)
                 if tok:
                     yield sse("token", {"text": tok})
@@ -300,6 +309,10 @@ async def voice_chat_stream(
             yield sse("session", {"session_id": active_sid})
 
             for chunk in chunk_iter:
+                ev = extract_synthetic_event(chunk)
+                if ev is not None:
+                    yield sse(ev[0], ev[1])
+                    continue
                 for kind, payload in extract_tool_events(chunk):
                     yield sse(kind, payload)
 

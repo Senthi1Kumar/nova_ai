@@ -5,8 +5,7 @@ A local FastAPI chat app powered by **LiteRT-LM** with:
 - Gemma-4 native audio understanding (no Whisper)
 - Gemma-4 native vision — webcam snap or image upload, attached one-shot to any text or voice turn
 - MTP (speculative decoding) for fast streaming LLM output
-- Tavily web search / extract / research tools
-- Mapbox MCP — 9 geocoding / routing / isochrone / map-image tools via Anthropic's Model Context Protocol
+- Brave Search + Serper (Google SERP / Shopping / Maps) web tools, exposed via the IResearcher FastMCP sidecar (`app/tools_v2.py`) — chat app connects over MCP
 - Pocket-TTS streaming PCM over SSE
 - Push-to-talk browser UI with gapless audio playback
 
@@ -156,90 +155,37 @@ Gemma-4 accepts audio directly via its USM-style encoder — the model hears
 the user and replies in one forward pass; there is no intermediate
 transcript.
 
-## MCP integration (Mapbox)
+## Run the IResearcher MCP sidecar
 
-This app demonstrates **MCP (Model Context Protocol)** by bridging the
-hosted Mapbox MCP server into LiteRT-LM's tool-calling. MCP is Anthropic's
-open protocol for letting LLM apps talk to external "tool servers" over a
-small JSON-RPC contract. Each MCP server exposes a set of tools
-(`list_tools` → `call_tool`), and a client wires those into the LLM's
-tool surface.
-
-### What's wired up
-
-We connect to `https://mcp.mapbox.com/mcp` over streamable-HTTP at app
-startup (a daemon thread holds the async `ClientSession` for the lifetime
-of the process) and expose 9 hand-picked Mapbox tools as Python functions
-that LiteRT-LM auto-registers from their docstrings:
-
-| Tool | What it does |
-| --- | --- |
-| `mapbox_search_and_geocode` | place name → address + coordinates |
-| `mapbox_reverse_geocode` | coordinates → address |
-| `mapbox_directions` | turn-by-turn routing + ETA |
-| `mapbox_isochrone` | area reachable within N minutes |
-| `mapbox_matrix` | many-to-many travel times |
-| `mapbox_category_search` | POIs by category near a place |
-| `mapbox_static_map` | render a map PNG with markers |
-| `mapbox_optimize_route` | optimal visiting order for 3-12 stops |
-| `mapbox_map_match` | snap a GPS trace to roads |
-
-Try voice prompts like *"How long to drive from MG Road Bangalore to the
-airport?"* or *"Show me coffee shops near MG Road"* — Gemma will pick the
-right tool, call it via the MCP bridge, and answer using the result.
-
-### How the bridge works
-
-```text
-LiteRT-LM Engine
-  │ tools = [tavily_search, mapbox_directions, ...]
-  │
-  │ Gemma emits tool_call("mapbox_directions", {...})
-  │     │
-  │     ▼
-  │ Python wrapper in app/tools.py
-  │     │ calls bridge.call_tool("directions_tool", {...})
-  │     ▼
-  │ MCPBridge (background asyncio loop in a daemon thread)
-  │     │ run_coroutine_threadsafe(session.call_tool(...), loop)
-  │     ▼
-  │ mcp.ClientSession over streamable-HTTP
-  │     │ POST JSON-RPC to https://mcp.mapbox.com/mcp
-  │     ▼
-  │ Mapbox MCP server (hosted) → calls real Mapbox APIs
-  │     │
-  │     ◀── CallToolResult.content (text or image)
-  │
-  ◀── tool_result fed back into Gemma's decode loop
-```
-
-The `app/mcp_bridge.py` module owns one persistent session per server, so
-the WebSocket / HTTP connection stays warm across turns. The sync↔async
-gap is bridged with `asyncio.run_coroutine_threadsafe` from the bridge's
-public `call_tool(name, args, timeout)`.
-
-### Enabling Mapbox
+The web-search tools (`web_search`, `google_search`) live in a separate
+FastMCP server (`app/tools_v2.py`) that exposes Brave + Serper APIs over
+MCP. Start it in a second terminal:
 
 ```bash
-# 1. Get a Mapbox public token: https://account.mapbox.com/access-tokens/
-# 2. Add to .env:
-echo 'MAPBOX_ACCESS_TOKEN=pk.eyJ...' >> .env
-# 3. Restart the server. Logs should show:
-#    INFO litert_app.mcp: mapbox MCP ready (20 tools): distance_tool, ...
+cd litert_lm_chat_app
+export BRAVE_API_KEY=...      # https://api.search.brave.com
+export SERPER_API_KEY=...     # https://serper.dev
+./.venv/bin/python -m app.tools_v2
 ```
 
-If `MAPBOX_ACCESS_TOKEN` is empty the bridge stays off, the tool wrappers
-return `"Map tool unavailable: Mapbox MCP not connected."`, and Gemma is
-told via the system prompt to not invoke them. The rest of the app
-(Tavily, vision, voice) continues to work normally.
+It listens on `http://127.0.0.1:8765/mcp`. The chat app connects at
+startup; if the sidecar isn't up you'll see a warning in the chat app
+log and the search tools will return *"IResearcher MCP sidecar not
+connected"* until you start it.
 
-### Adding more MCP servers
+Other MCP clients (Claude Desktop, Cursor, MCP Inspector) can also
+connect to the same endpoint — the sidecar exposes the full tool set:
 
-The bridge is reusable. To add a second server (e.g. GitHub MCP), copy
-the lifespan block in `app/main.py`, pass a different `url` + `token`,
-hold its `MCPBridge` instance under a different name, and write thin
-wrapper functions in `app/tools.py` that call `bridge.call_tool("…", {…})`.
-LiteRT-LM auto-discovers Python functions from their docstrings.
+| Tool | Backend |
+| --- | --- |
+| `web_search` | Brave Search API (keyword snippets, web / news) |
+| `google_search` | Serper (Google Shopping or Maps) |
+| `geocode` | Nominatim (forward + reverse, OpenStreetMap) |
+| `execute_sql_query` | Traccar / telematics DB (see prompts.py) |
+| `add_skill` | Returns the telematics skill system prompt |
+
+The chat app registers only `web_search` + `google_search` in
+`DEFAULT_TOOLS`; the rest are available for other clients.
 
 ## Tests
 
@@ -271,3 +217,29 @@ non-localhost. Use `http://localhost:8000` (not `0.0.0.0` or a LAN IP).
 **`litert_lm_conversation_send_message_stream failed` with no other
 context.** Usually means the engine ran out of memory mid-decode (KV cache
 grew past the limit). Switch to a smaller model or shorter conversation.
+
+**Model goes silent after 3-5 tool-using turns** (no token events, no error
+event, just `done`). Engine `max_num_tokens` budget was exhausted. Bump
+`LITERT_MAX_NUM_TOKENS` in `.env` (default 4096; the model's own default of
+~2048 is what causes the silent stop). Or click **↻ New chat** in the UI to
+reset the conversation (calls `DELETE /api/session/{id}`).
+
+**`VK_ERROR_OUT_OF_DEVICE_MEMORY` at startup**, followed by a wall of
+WebGPU `Invalid Buffer` validation errors. KV cache allocation overflowed
+your GPU VRAM. KV cache size ≈ `2 × layers × hidden × max_num_tokens × 2
+bytes`. For Gemma-4-E2B (24 layers, 2048 hidden, fp16) on a 4 GB card,
+`max_num_tokens` must stay ≤ ~4096. If you set it higher, drop it back in
+`.env` and restart:
+
+```env
+LITERT_MAX_NUM_TOKENS=4096      # 4 GB GPU
+LITERT_MAX_NUM_TOKENS=8192      # ≥ 6 GB GPU
+LITERT_MAX_NUM_TOKENS=16384     # ≥ 8 GB GPU
+```
+
+**Vision turn fails with `vision_litert_compiled_model_executor` /
+`Failed to get num packed bytes`.** GPU OOM during vision activations
+(image came in, vision encoder tried to allocate on GPU on top of LLM
+weights + KV cache). Set `LITERT_VISION_BACKEND=CPU` in `.env` — the
+vision encoder is small (~100 MB), CPU runs it in well under a second,
+and it stops competing for VRAM.
