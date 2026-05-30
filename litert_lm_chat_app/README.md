@@ -187,6 +187,102 @@ connect to the same endpoint — the sidecar exposes the full tool set:
 The chat app registers only `web_search` + `google_search` in
 `DEFAULT_TOOLS`; the rest are available for other clients.
 
+## Persistent memory layer (mem0 + pgvector)
+
+Adapted from Nova's `nova_memory_layer.py`. Three cooperating pieces:
+
+| Component | What | Where |
+| --- | --- | --- |
+| **SessionJournal** | every turn appended to a per-session JSON | `runtime/session_logs/session_<id>_<ts>.json` |
+| **DiaryCompactor** | on session close, Gemma-4 summarises 3-5 bullets, appended to today's diary | `runtime/daily_logs/YYYY-MM-DD.md` |
+| **mem0 + pgvector** | semantic recall — facts extracted by an LLM, embedded by sentence-transformers, stored in Postgres; top-K injected into the next session's system prompt | Postgres table |
+
+### How mem0 talks to LiteRT-LM (no llama-server required)
+
+mem0's `openai` LLM provider speaks the OpenAI HTTP wire format. We expose
+a tiny shim — `app/llm_shim.py` — that wraps the already-loaded LiteRT-LM
+engine as `/v1/chat/completions`. mem0 calls it for fact extraction; no
+second model is loaded. Fact-extraction LLM calls share the engine with
+chat (serialised by LiteRT-LM's per-conversation lock).
+
+Architecture:
+
+```text
+DURING SESSION (per turn):
+   user turn ends ──▶ memory.add_turn(user) + memory.add_turn(assistant)
+                            ↑
+                            └── sync, journal-only (no LLM call, no GPU work)
+
+AT SESSION CLOSE (↻ New chat OR app shutdown):
+   1. chat_service.close_all_sessions()    ← frees the LiteRT-LM engine
+   2. memory.batch_ingest_session()        ← mem0 processes the journal
+         │
+         ▼  for each (user, assistant) pair in the journal:
+   mem0.add() ──▶ POST /v1/chat/completions ──▶ LiteRT shim (throwaway conv)
+                                                       │
+                                                       ▼
+                          extracts durable facts ──▶ embeds (all-MiniLM-L6-v2, CPU)
+                                                       │
+                                                       ▼
+                                                   pgvector
+   3. memory.close_session(llm_oneshot)     ← diary summary appended
+   4. memory.start_new_session()            ← fresh journal for the next session
+```
+
+**Why ingest is deferred to session close**: LiteRT-LM only supports one
+conversation per engine. While the user's chat conversation is open, the
+shim can't spin up a second one for mem0 — the engine rejects with
+`FAILED_PRECONDITION: A session already exists`. So mem0 work is batched
+between conversation-close and engine-teardown, when the engine is free.
+
+### One-time Postgres setup
+
+```bash
+sudo apt-get install -y postgresql postgresql-contrib postgresql-16-pgvector
+sudo systemctl enable --now postgresql
+
+# DB + user (separate from Nova's nova_db so they don't collide)
+sudo -u postgres psql -c "CREATE USER nova WITH PASSWORD 'nova_dev';"
+sudo -u postgres psql -c "CREATE DATABASE litert_chat_db OWNER nova;"
+sudo -u postgres psql -d litert_chat_db -c "CREATE EXTENSION IF NOT EXISTS vector;"
+```
+
+If your distro doesn't have `postgresql-NN-pgvector` in apt, build from source —
+see the same instructions in `nova/backend/NOVA_LOOP.md`.
+
+### Fail-open behaviour
+
+If Postgres is down, pgvector missing, or the shim unreachable, the layer
+logs a warning and degrades to **journal-only** mode:
+
+- `runtime/session_logs/*.json` still get written on session close
+- `runtime/daily_logs/*.md` diary still gets appended (deterministic
+  fallback if the LLM call also fails)
+- Semantic recall returns empty; system prompt has no `PRIOR CONTEXT` block
+
+Chat continues to work without interruption.
+
+### Disabling
+
+```env
+NOVA_MEMORY=0           # disable everything
+NOVA_MEM0_DISABLED=1    # keep journal + diary, skip mem0 / Postgres
+```
+
+### Lifecycle
+
+| When | What happens |
+| --- | --- |
+| App startup | `MemoryLayer` initialised, mem0 connects to Postgres + shim |
+| Each user turn ends | `journal.add(user)` + `journal.add(assistant)`; background `mem0.add()` thread |
+| `↻ New chat` click (or `DELETE /api/session/<id>`) | Journal flushed → diary appended → fresh journal started |
+| App shutdown | Final journal flushed + diary appended |
+
+### Knobs
+
+See `.env.example` under "Persistent memory layer" — `NOVA_MEMORY*`,
+`NOVA_MEM0_*`, `NOVA_MEMORY_USER_ID`, `NOVA_MEM_RECALL_K`.
+
 ## Tests
 
 ```bash

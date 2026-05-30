@@ -3,87 +3,202 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>LiteRT-LM Native Voice Chat</title>
+  <title>Nova · LiteRT-LM Voice</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Geist:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
   <link rel="stylesheet" href="/static/styles.css" />
 </head>
 <body>
-  <main class="shell">
-    <section class="hero">
-      <div>
-        <p class="eyebrow">Local Edge AI</p>
-        <h1>LiteRT-LM Native Voice Chat</h1>
-        <p class="subtitle">Private on-device voice chat — Gemma-4 hears your speech natively (no Whisper), streams tokens with MTP, and replies through Pocket-TTS as gapless PCM audio.</p>
-      </div>
-      <div class="status-card">
-        <span id="statusDot" class="dot"></span>
-        <div class="status-body">
-          <strong id="statusText">Checking engine...</strong>
-          <div id="statusChips" class="status-chips"></div>
-          <small id="statusModel" class="status-model"></small>
-        </div>
-      </div>
-    </section>
+  <div class="ambient" aria-hidden="true">
+    <div class="grid-bg"></div>
+    <div class="vignette"></div>
+  </div>
 
-    <section class="chat-card">
-      <div id="messages" class="messages">
-        <div class="message assistant">
-          <div class="bubble">Set <code>LITERT_MODEL_PATH</code> in <code>.env</code> to a Gemma-4 <code>.litertlm</code> file. Type a message, or press <strong>Hold to Talk</strong> — the model listens to your audio directly and replies as the audio streams back.</div>
-        </div>
-      </div>
+  <header class="hud-top">
+    <div class="brand">
+      <span id="statusDot" class="dot"></span>
+      <span class="brand-text">NOVA</span>
+      <span class="brand-sub" id="brandSub">on-device</span>
+    </div>
+    <div class="brand-line" aria-hidden="true"></div>
+    <div class="hud-meta">
+      <span class="kv"><span class="k">SESSION</span><span id="sessionTag">—</span></span>
+      <span class="kv"><span class="k">CLOCK</span><span id="hudClock">--:--</span></span>
+      <button id="settingsBtn" class="settings-btn" type="button" aria-label="Engine settings">⚙</button>
+    </div>
+  </header>
 
-      <div class="voice-panel">
-        <button id="enableMicBtn" class="mic-btn" type="button" aria-label="Enable browser microphone permission">Enable Microphone</button>
-        <button id="recordBtn" class="record-btn" type="button" disabled>Hold to Talk</button>
-        <div class="voice-meta">
-          <strong id="voiceState">Click Enable Microphone first</strong>
-          <small id="micState">Microphone permission check pending</small>
-          <small>Push-to-talk → Gemma-4 native audio → streamed tokens → Pocket-TTS PCM, all in one SSE turn.</small>
-        </div>
-        <button id="newChatBtn" class="icon-btn new-chat-btn" type="button" title="Start a fresh conversation — clears history (use when the model stops replying)" aria-label="New chat">↻ New chat</button>
-        <button id="metricsPill" class="metrics-pill" type="button" hidden aria-expanded="false" aria-label="Toggle latency metrics">
-          <span class="metrics-summary">
-            <span class="metrics-icon">⏱</span>
-            <span id="metricsSummaryText">— ms · — tok/s</span>
-          </span>
-          <dl class="metrics-grid" id="metricsGrid">
-            <dt>audio dur</dt><dd id="m-audio">—</dd>
-            <dt>LLM TTFT</dt><dd id="m-ttft">—</dd>
-            <dt>TTS TTFB</dt><dd id="m-tts">—</dd>
-            <dt>total TTFB</dt><dd id="m-total">—</dd>
-            <dt>tokens</dt><dd id="m-tokens">—</dd>
-            <dt>decode</dt><dd id="m-tps">—</dd>
-          </dl>
-        </button>
-      </div>
+  <main class="hud">
+    <aside class="rail rail-left">
+      <div class="rail-title">QUICK ACTIONS</div>
+      <button class="tile tile-primary" id="recordBtn" type="button" disabled>
+        <span class="tile-icon" aria-hidden="true">●</span>
+        <span class="tile-body">
+          <span class="tile-label">Hold to Talk</span>
+          <span class="tile-sub" id="micState">Tap Enable Mic</span>
+        </span>
+      </button>
+      <button class="tile" id="snapBtn" type="button">
+        <span class="tile-icon" aria-hidden="true">◉</span>
+        <span class="tile-body">
+          <span class="tile-label">Snap</span>
+          <span class="tile-sub">Webcam frame</span>
+        </span>
+      </button>
+      <button class="tile" id="attachBtn" type="button">
+        <span class="tile-icon" aria-hidden="true">⊟</span>
+        <span class="tile-body">
+          <span class="tile-label">Attach</span>
+          <span class="tile-sub">Image file</span>
+        </span>
+      </button>
+      <input id="fileInput" type="file" accept="image/*" hidden />
+      <button class="tile tile-ghost" id="enableMicBtn" type="button">
+        <span class="tile-icon" aria-hidden="true">⌖</span>
+        <span class="tile-body">
+          <span class="tile-label">Enable Mic</span>
+          <span class="tile-sub">Browser permission</span>
+        </span>
+      </button>
+      <button class="tile tile-ghost" id="newChatBtn" type="button">
+        <span class="tile-icon" aria-hidden="true">↻</span>
+        <span class="tile-body">
+          <span class="tile-label">New chat</span>
+          <span class="tile-sub">Reset context</span>
+        </span>
+      </button>
+    </aside>
 
-      <div id="attachStrip" class="attach-strip" hidden>
-        <div class="attach-chip">
-          <img id="attachThumb" alt="staged attachment" />
+    <section class="stage">
+      <div class="captions captions-user" id="captionsUser" aria-live="polite"></div>
+
+      <div class="orb-wrap">
+        <div class="orb" id="orb" data-state="idle" role="img" aria-label="Nova voice orb">
+          <div class="orb-halo"></div>
+          <div class="orb-ring orb-ring-2"></div>
+          <div class="orb-ring orb-ring-1"></div>
+          <div class="orb-core"></div>
+          <div class="orb-highlight"></div>
+        </div>
+        <div class="orb-attach" id="attachChip" hidden>
+          <img id="attachThumb" alt="" />
           <span id="attachLabel">image</span>
-          <button id="attachClear" type="button" title="Remove attachment" aria-label="Remove attachment">×</button>
+          <button id="attachClear" type="button" aria-label="Remove">×</button>
         </div>
+        <div class="orb-tool-pill" id="toolPill" hidden></div>
       </div>
 
-      <form id="chatForm" class="composer">
-        <button id="snapBtn" class="icon-btn" type="button" title="Snap from webcam" aria-label="Snap a webcam frame">📷</button>
-        <button id="attachBtn" class="icon-btn" type="button" title="Attach an image file" aria-label="Attach an image file">🖼</button>
-        <input id="fileInput" type="file" accept="image/*" hidden />
-        <textarea id="prompt" rows="2" placeholder="Ask your LiteRT-LM model..." autocomplete="off"></textarea>
-        <button id="sendBtn" type="submit">Send</button>
-      </form>
+      <div class="captions captions-assistant" id="captionsAssistant" aria-live="polite"></div>
+
+      <div class="stage-foot">
+        <div class="state-line" id="stateLine">
+          <span class="hint-dot"></span>
+          <span id="stateLabel">Tap mic to talk</span>
+        </div>
+        <div class="typewriter" id="typewriter">
+          <span class="tw-prefix">try saying</span>
+          <span class="tw-text" id="tweText"></span>
+          <span class="tw-caret" aria-hidden="true"></span>
+        </div>
+      </div>
     </section>
 
-    <div id="camModal" class="cam-modal" hidden>
-      <div class="cam-modal-inner">
-        <video id="camVideo" autoplay playsinline muted></video>
-        <canvas id="camCanvas" hidden></canvas>
-        <div class="cam-actions">
-          <button id="camCancel" type="button" class="icon-btn">Cancel</button>
-          <button id="camCapture" type="button" class="record-btn">Capture</button>
+    <aside class="rail rail-right">
+      <div class="panel">
+        <div class="panel-title">ENGINE</div>
+        <div class="chips" id="statusChips"></div>
+        <div class="model-name" id="statusModel"></div>
+      </div>
+
+      <div class="panel panel-metrics" id="metricsPanel" hidden>
+        <div class="panel-title">LAST TURN</div>
+        <dl class="metrics-grid">
+          <div><dt>TTFT</dt><dd id="m-ttft">—</dd></div>
+          <div><dt>TTFB</dt><dd id="m-total">—</dd></div>
+          <div><dt>Audio</dt><dd id="m-audio">—</dd></div>
+          <div><dt>TTS</dt><dd id="m-tts">—</dd></div>
+          <div><dt>Tokens</dt><dd id="m-tokens">—</dd></div>
+          <div><dt>tok/s</dt><dd id="m-tps">—</dd></div>
+        </dl>
+      </div>
+    </aside>
+  </main>
+
+  <!-- ── Settings modal ────────────────────────────────────────────────── -->
+  <div id="settingsModal" class="modal" hidden aria-hidden="true">
+    <div class="modal-backdrop" data-close></div>
+    <form class="modal-card" id="settingsForm">
+      <header class="modal-head">
+        <div>
+          <h2>ENGINE SETTINGS</h2>
+          <p>Changing any of these tears down the current engine and rebuilds it. Conversations reset.</p>
         </div>
+        <button class="x" type="button" data-close aria-label="Close">×</button>
+      </header>
+
+      <fieldset class="modal-grid">
+        <label class="field">
+          <span class="field-label">LLM BACKEND</span>
+          <select name="backend" id="setBackend">
+            <option value="GPU">GPU</option>
+            <option value="CPU">CPU</option>
+          </select>
+          <span class="field-hint">CPU is safe everywhere; GPU is faster if VRAM allows.</span>
+        </label>
+
+        <label class="field">
+          <span class="field-label">AUDIO BACKEND</span>
+          <select name="audio_backend" id="setAudio">
+            <option value="CPU">CPU</option>
+            <option value="GPU">GPU</option>
+          </select>
+          <span class="field-hint">Gemma-4 audio encoder is CPU-only — leave on CPU.</span>
+        </label>
+
+        <label class="field">
+          <span class="field-label">VISION BACKEND</span>
+          <select name="vision_backend" id="setVision">
+            <option value="CPU">CPU</option>
+            <option value="GPU">GPU</option>
+          </select>
+          <span class="field-hint">CPU avoids vision OOM on ≤ 4 GB GPUs.</span>
+        </label>
+
+        <label class="field">
+          <span class="field-label">CONTEXT (max_num_tokens)</span>
+          <input type="number" name="max_num_tokens" id="setMaxTokens" min="1024" max="32768" step="512" />
+          <span class="field-hint">KV cache scales linearly. 4 GB GPU → keep ≤ 4096.</span>
+        </label>
+
+        <label class="field field-toggle">
+          <span class="field-label">MTP (speculative decoding)</span>
+          <span class="toggle">
+            <input type="checkbox" name="enable_speculative" id="setMTP" />
+            <span class="toggle-track"><span class="toggle-knob"></span></span>
+          </span>
+          <span class="field-hint">Universally recommended on GPU; ignored on CPU.</span>
+        </label>
+      </fieldset>
+
+      <footer class="modal-foot">
+        <span class="modal-status" id="setStatus"></span>
+        <button type="button" class="btn btn-ghost" data-close>Cancel</button>
+        <button type="submit" class="btn btn-primary" id="setApply">Apply &amp; restart</button>
+      </footer>
+    </form>
+  </div>
+
+  <div id="camModal" class="cam-modal" hidden>
+    <div class="cam-modal-inner">
+      <video id="camVideo" autoplay playsinline muted></video>
+      <canvas id="camCanvas" hidden></canvas>
+      <div class="cam-actions">
+        <button id="camCancel" type="button" class="btn btn-ghost">Cancel</button>
+        <button id="camCapture" type="button" class="btn btn-primary">Capture</button>
       </div>
     </div>
-  </main>
+  </div>
 
   <script src="/static/app.js"></script>
 </body>

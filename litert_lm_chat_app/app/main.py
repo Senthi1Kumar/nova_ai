@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import logging
+import os
+import re
 import shutil
 import subprocess
 import time
@@ -39,6 +42,11 @@ from app.litert_service import (
 from app.mcp_bridge import MCPBridge, MCPNotReady, set_bridge
 from app.voice_service import PocketTTSService, VoiceNotReady
 
+# Memory layer (SessionJournal + DiaryCompactor + optional mem0 semantic recall)
+# and the OpenAI-shim that lets mem0 talk to LiteRT-LM for fact extraction.
+from app.memory_layer import MemoryLayer
+from app import llm_shim
+
 # Optional local extensions under app/misc/. App runs fine without them.
 try:
     import app.misc  # noqa: F401
@@ -53,6 +61,35 @@ settings = get_settings()
 chat_service = LiteRTChatService(settings)
 tts_service = PocketTTSService(settings)
 templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
+
+# Memory layer singleton — instantiated in lifespan once the engine is up
+# (mem0 init needs the OpenAI shim, which needs chat_service).
+memory: MemoryLayer | None = None
+
+
+def _llm_oneshot_for_diary(prompt: str, max_tokens: int = 240) -> str:
+    """Used by MemoryLayer.close_session() to summarise the day. Returns
+    a short string; raises if the engine isn't loaded so the caller can
+    fall back to deterministic summary."""
+    if not chat_service.engine:
+        raise RuntimeError("engine not loaded")
+    import litert_lm
+    cm = chat_service.engine.create_conversation(
+        messages=[{"role": "system",
+                   "content": [{"type": "text",
+                                "text": "Be concise. Output only bullet points."}]}],
+        tools=[],
+    )
+    conv = cm.__enter__()
+    try:
+        response = conv.send_message(prompt)
+    finally:
+        cm.__exit__(None, None, None)
+    out = ""
+    for item in (response.get("content", []) or []):
+        if item.get("type") == "text":
+            out += item.get("text", "")
+    return out
 
 
 _mcp_bridge: MCPBridge | None = None
@@ -78,7 +115,44 @@ async def lifespan(app: FastAPI):
         )
 
     chat_service.start()
+
+    # Wire the OpenAI shim to the now-loaded engine BEFORE mem0 tries to use it.
+    llm_shim.configure(chat_service)
+
+    # Memory layer — opens its own DB connection inside mem0. Fail-open: if
+    # Postgres/mem0 isn't available the layer logs a warning and runs in
+    # journal-only mode.
+    global memory
+    if os.environ.get("NOVA_MEMORY", "1") != "0":
+        try:
+            memory = MemoryLayer(user_id=os.environ.get("NOVA_MEMORY_USER_ID", "user"))
+            chat_service.attach_memory(memory)
+        except Exception as exc:
+            logging.getLogger("litert_app.startup").warning(
+                "MemoryLayer init crashed: %s — continuing without memory", exc)
+            memory = None
+    else:
+        logging.getLogger("litert_app.startup").info(
+            "MemoryLayer disabled via NOVA_MEMORY=0")
+
     yield
+
+    # Memory close pipeline on shutdown:
+    #   1. close active chat conversations so the engine is free
+    #   2. batch-ingest journal into mem0 (uses the OpenAI shim → engine)
+    #   3. flush journal JSON + append today's diary entry
+    #   4. tear down the engine
+    if memory is not None:
+        try:
+            chat_service.close_all_sessions()
+            await asyncio.get_running_loop().run_in_executor(
+                None, memory.batch_ingest_session
+            )
+            await memory.close_session(llm_oneshot=_llm_oneshot_for_diary)
+        except Exception as exc:
+            logging.getLogger("litert_app.shutdown").warning(
+                "MemoryLayer close failed: %s", exc)
+
     chat_service.stop()
     if _mcp_bridge is not None:
         _mcp_bridge.stop()
@@ -89,6 +163,11 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="LiteRT-LM Native Voice Chat", version="2.0.0", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="static")
 app.mount("/audio", StaticFiles(directory=str(ROOT_DIR / settings.tts_output_dir)), name="audio")
+
+# OpenAI-compatible /v1 endpoints used by mem0's fact-extraction LLM client.
+# Routes are no-op until app.llm_shim.configure(chat_service) is called in
+# the lifespan (after the engine loads).
+app.include_router(llm_shim.router)
 
 # /maps/ only mounted when the optional misc/ extensions are present.
 if _MISC_AVAILABLE:
@@ -131,6 +210,80 @@ def _transcode_to_wav16k(src: Path) -> Path:
 
 def sse(event: str, data: dict) -> str:
     return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+
+_FRIENDLY_ERRORS = (
+    ("Failed to parse tool calls",
+     "I tried to use a tool but mangled the call. Try rephrasing — usually fewer special characters help."),
+    ("Failed to parse FC tool calls",
+     "I tried to use a tool but mangled the call. Try rephrasing — usually fewer special characters help."),
+    ("Input token ids are too long",
+     "I've hit the context limit for this conversation. Tap ↻ New chat to clear and continue."),
+    ("INVALID_ARGUMENT: Audio backend constraint",
+     "Engine audio backend mismatch — check ⚙ Settings, Gemma-4 requires audio=CPU."),
+    ("VK_ERROR_OUT_OF_DEVICE_MEMORY",
+     "GPU ran out of memory. Lower ctx in ⚙ Settings or switch a backend to CPU."),
+    ("miniaudio decoder",
+     "Couldn't decode the audio you sent. Try recording again."),
+)
+
+
+def _friendly_error(exc: Exception) -> str:
+    raw = str(exc)
+    logging.getLogger("litert_app.error").error("turn failed: %s", raw)
+    for needle, friendly in _FRIENDLY_ERRORS:
+        if needle in raw:
+            return friendly
+    # Truncate and strip template-looking tokens (`<|...|>`) so they don't
+    # leak into the caption.
+    cleaned = raw.replace("<|", "").replace("|>", "").strip()
+    return cleaned[:200] + ("…" if len(cleaned) > 200 else "")
+
+
+# ── Tool-call salvage ─────────────────────────────────────────────────────
+# When Gemma-4-E2B fails to emit the tool-call special tokens correctly, it
+# spells them out as literal text like  query:<|"|>...<|"|>.  LiteRT-LM's
+# grammar parser rejects this and raises INVALID_ARGUMENT. The model HAS
+# correctly figured out the query — we just need to extract it and call the
+# tool ourselves, then stream the snippets back as a normal reply.
+
+_SALVAGE_QUERY_RE = re.compile(r'query\s*:\s*<\|"\|>(.+?)<\|"\|>', re.DOTALL)
+_SALVAGE_TOOL_RE  = re.compile(r'call:(\w+)\s*\{', re.IGNORECASE)
+
+
+def _salvage_from_parse_error(exc_str: str) -> tuple[str, str] | None:
+    """Return (tool_name, query) if we recognise the leaked template pattern."""
+    if "Failed to parse" not in exc_str:
+        return None
+    tool_m = _SALVAGE_TOOL_RE.search(exc_str)
+    q_m = _SALVAGE_QUERY_RE.search(exc_str)
+    if not (tool_m and q_m):
+        return None
+    return tool_m.group(1).strip(), q_m.group(1).strip()
+
+
+def _format_search_for_speech(search_json_or_text: str) -> str:
+    """Turn a Brave/Serper JSON result blob into 2-3 spoken sentences."""
+    try:
+        data = json.loads(search_json_or_text)
+    except Exception:
+        return "I searched but couldn't parse the result. Try rephrasing."
+    if isinstance(data, dict) and data.get("error"):
+        return f"The search failed. {data['error']}"
+    results = (data.get("results") if isinstance(data, dict) else None) or []
+    if not results:
+        return "I searched but didn't find anything useful. Try rephrasing the question."
+    parts = ["Here's what I found."]
+    for r in results[:2]:
+        title = (r.get("title") or "").strip()
+        desc = (r.get("description") or r.get("snippet") or "").strip()
+        if title and desc:
+            parts.append(f"{title}. {desc}")
+        elif title:
+            parts.append(title)
+        elif desc:
+            parts.append(desc)
+    return " ".join(parts)
 
 
 def _emit_clause(text: str, idx: int, tts: PocketTTSService) -> Iterator[str]:
@@ -181,6 +334,40 @@ def health():
     return data
 
 
+class ReconfigRequest(BaseModel):
+    backend: str | None = None
+    audio_backend: str | None = None
+    vision_backend: str | None = None
+    max_num_tokens: int | None = Field(default=None, ge=1024, le=65536)
+    enable_speculative: bool | None = None
+
+
+@app.post("/api/engine/reconfigure")
+def reconfigure(req: ReconfigRequest):
+    """Tear down and rebuild the engine with new backend / KV-cache settings.
+
+    All active conversations are invalidated. Returns the new health snapshot
+    on success, or a 503 with the error message if init failed.
+    """
+    # Push field-level overrides into the cached Settings instance.
+    if req.backend:           settings.litert_backend = req.backend
+    if req.audio_backend:     settings.litert_audio_backend = req.audio_backend
+    if req.vision_backend:    settings.litert_vision_backend = req.vision_backend
+    if req.max_num_tokens:    settings.litert_max_num_tokens = int(req.max_num_tokens)
+    if req.enable_speculative is not None:
+        settings.litert_enable_speculative = bool(req.enable_speculative)
+
+    chat_service.stop()
+    chat_service.start()
+    health_data = chat_service.health()
+    if not health_data.get("engine_loaded"):
+        raise HTTPException(
+            status_code=503,
+            detail=health_data.get("error") or "engine failed to restart",
+        )
+    return {"ok": True, **health_data}
+
+
 @app.post("/api/session")
 def create_session():
     try:
@@ -190,8 +377,24 @@ def create_session():
 
 
 @app.delete("/api/session/{session_id}")
-def close_session(session_id: str):
+async def close_session(session_id: str):
+    # Step 1: tear down the user's chat conversation so the engine becomes
+    # free for mem0's throwaway conversations + the diary summariser.
     chat_service.close_session(session_id)
+    if memory is not None:
+        try:
+            # Step 2: batch-ingest the just-closed session's journal into mem0.
+            # Runs on a thread executor because mem0.add is sync + blocking.
+            await asyncio.get_running_loop().run_in_executor(
+                None, memory.batch_ingest_session
+            )
+            # Step 3: flush journal JSON + append today's diary.
+            await memory.close_session(llm_oneshot=_llm_oneshot_for_diary)
+        except Exception as exc:
+            logging.getLogger("litert_app.memory").warning(
+                "memory close pipeline failed: %s", exc)
+        # Step 4: start a fresh journal for the next session.
+        memory.start_new_session()
     return {"ok": True}
 
 
@@ -246,7 +449,7 @@ async def chat_stream(
                     yield sse(kind, payload)
             yield sse("done", {})
         except Exception as exc:
-            yield sse("error", {"error": str(exc)})
+            yield sse("error", {"error": _friendly_error(exc)})
         finally:
             if image_path is not None:
                 try:
@@ -345,9 +548,52 @@ async def voice_chat_stream(
                       _metrics(t0, first_token_ts, first_audio_ts, token_count))
             yield sse("done", {})
         except (LiteRTNotReady, VoiceNotReady) as exc:
-            yield sse("error", {"error": str(exc)})
+            yield sse("error", {"error": _friendly_error(exc)})
         except Exception as exc:
-            yield sse("error", {"error": f"Voice streaming failed: {exc}"})
+            # Salvage path: model botched tool-call sentinels. If we can
+            # extract the intended query, run the tool ourselves and speak
+            # the result so the user gets an answer instead of an error.
+            raw = str(exc)
+            salvaged = _salvage_from_parse_error(raw)
+            if salvaged:
+                tool_name, query = salvaged
+                logging.getLogger("litert_app.error").warning(
+                    "salvaging botched %s call with query=%r", tool_name, query)
+                yield sse("tool_call", {"name": tool_name + " (salvaged)", "args": {"query": query}})
+                try:
+                    from app.tools import _mcp_proxy
+                    raw_result = _mcp_proxy(
+                        "web_search",
+                        {"query": query, "search_type": "web", "num_results": 5},
+                        label="Web search",
+                    )
+                    yield sse("tool_result", {"name": tool_name, "ok": True, "summary": raw_result[:200]})
+                    speech = _format_search_for_speech(raw_result)
+                    yield sse("token", {"text": speech})
+                    # Stream the salvaged response through TTS clause-by-clause.
+                    clause_buf: list[str] = list(speech)
+                    cidx = 0
+                    while clause_buf:
+                        clause, clause_buf = maybe_flush_clause(
+                            clause_buf,
+                            min_chars=cfg.clause_min_chars,
+                            comma_min_chars=cfg.clause_comma_min_chars,
+                        )
+                        if clause:
+                            yield from _emit_clause(clause, cidx, tts_service)
+                            cidx += 1
+                        else:
+                            tail = "".join(clause_buf).strip()
+                            if tail:
+                                yield from _emit_clause(tail, cidx, tts_service)
+                            break
+                    yield sse("done", {})
+                    return
+                except Exception as salvage_exc:
+                    logging.getLogger("litert_app.error").exception(
+                        "salvage path also failed: %s", salvage_exc)
+                    # fall through to friendly error
+            yield sse("error", {"error": _friendly_error(exc)})
         finally:
             for p in (temp_path, wav_path, image_path):
                 if p is not None:

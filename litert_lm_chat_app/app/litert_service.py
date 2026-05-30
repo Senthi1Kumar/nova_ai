@@ -12,10 +12,12 @@ from app.config import Settings
 from app.tools import (
     add_numbers,
     web_search,
-    google_search,
 )
 # Dormant fallbacks — re-import + add to DEFAULT_TOOLS to re-enable.
-# from app.tools import tavily_search, tavily_extract, tavily_research
+# Small models (Gemma-4-E2B) tool-call more reliably with ONE web tool than
+# two; google_search lives at app.tools.google_search and on the sidecar but
+# is unregistered here so Gemma doesn't have to choose between them.
+# from app.tools import google_search, tavily_search, tavily_extract, tavily_research
 # from app.misc.mapbox_tools import (
 #     mapbox_search_and_geocode, mapbox_reverse_geocode, mapbox_ground_location,
 #     mapbox_place_details, mapbox_directions, mapbox_isochrone, mapbox_matrix,
@@ -37,11 +39,12 @@ class LiteRTNotReady(RuntimeError):
 
 
 DEFAULT_TOOLS = [
-    # Active: web_search + google_search are bridge proxies into the
-    # IResearcher FastMCP sidecar (start with `python -m app.tools_v2`).
-    # Brave + Serper logic lives in that sidecar, not in-process.
+    # Single web tool: small models (Gemma-4-E2B) malform tool calls less
+    # often when they don't have to choose between web_search and
+    # google_search. Brave snippets via the IResearcher FastMCP sidecar
+    # (start with `python -m app.tools_v2`); google_search still lives on
+    # the sidecar for other clients and can be re-added here when needed.
     web_search,
-    google_search,
     add_numbers,
 ]
 
@@ -85,6 +88,44 @@ class LiteRTChatService:
         self._conversations: Dict[str, ConversationHandle] = {}
         self._global_lock = threading.Lock()
         self.ready_error: Optional[str] = None
+        # Optional memory layer (SessionJournal + mem0). Wired by main.py
+        # after the engine + shim are ready. None = memory disabled.
+        self._memory = None
+
+    def attach_memory(self, memory) -> None:
+        """Hand the chat service a MemoryLayer instance. Called from
+        app.main.lifespan after the LLM shim is configured."""
+        self._memory = memory
+        log.info("memory layer attached: %s",
+                 "enabled" if getattr(memory, "enabled", False) else "journal-only")
+
+    def _build_system_prompt(self) -> str:
+        """Compose the system prompt for a fresh conversation.
+
+        Base persona from settings + optional 'PRIOR CONTEXT' block recalled
+        from mem0. The recall query is intentionally broad ('user context
+        preferences recent') because we don't have a user turn yet at session
+        start — mem0's embedding model surfaces the most relevant durable
+        facts from previous sessions.
+        """
+        base = self.settings.litert_system_prompt
+        if self._memory is None or not getattr(self._memory, "enabled", False):
+            return base
+        try:
+            k = int(os.environ.get("NOVA_MEM_RECALL_K", "5"))
+            recall = self._memory.recall_block(
+                "user context preferences recent topics", k=k
+            )
+        except Exception:
+            log.exception("memory recall at session start failed; using base prompt")
+            return base
+        if not recall:
+            return base
+        return (
+            base
+            + "\n\nPRIOR CONTEXT (durable facts recalled from previous sessions; "
+              "use only if relevant):\n" + recall
+        )
 
     def _backend(self, name: str):
         name = (name or "CPU").upper().strip()
@@ -130,7 +171,14 @@ class LiteRTChatService:
             self.ready_error = f"Failed to initialize LiteRT-LM engine: {exc}"
             self.engine = None
 
-    def stop(self) -> None:
+    def close_all_sessions(self) -> None:
+        """Close every active conversation but keep the engine loaded.
+
+        LiteRT-LM only supports one conversation per engine — calling this
+        before mem0 ingest / diary compaction frees the engine so those paths
+        can spin up their own throwaway conversations without hitting
+        FAILED_PRECONDITION: A session already exists.
+        """
         for handle in list(self._conversations.values()):
             cm = getattr(handle.conversation, "_litert_context_manager", None)
             if cm:
@@ -139,6 +187,9 @@ class LiteRTChatService:
                 except Exception:
                     pass
         self._conversations.clear()
+
+    def stop(self) -> None:
+        self.close_all_sessions()
         if self._engine_cm is not None:
             try:
                 self._engine_cm.__exit__(None, None, None)
@@ -168,10 +219,10 @@ class LiteRTChatService:
         messages = [
             {
                 "role": "system",
-                "content": [{"type": "text", "text": self.settings.litert_system_prompt}],
+                "content": [{"type": "text", "text": self._build_system_prompt()}],
             }
         ]
-        conversation_cm = self.engine.create_conversation(messages=messages, tools=DEFAULT_TOOLS)
+        conversation_cm = self.engine.create_conversation(messages=messages, tools=DEFAULT_TOOLS, enable_constrained_decoding=True)
         conversation = conversation_cm.__enter__()
         setattr(conversation, "_litert_context_manager", conversation_cm)
         self._conversations[session_id] = ConversationHandle(session_id, conversation, threading.Lock())
@@ -371,9 +422,18 @@ class LiteRTChatService:
     def _run_turn(self, handle: "ConversationHandle", user_label: str, sender) -> Iterator[dict]:
         """Drive one chunk-iterator turn, accumulating the assistant text into
         the handle's history. After the iterator drains, opportunistically
-        compact if the conversation is approaching the token budget."""
+        compact if the conversation is approaching the token budget AND hand
+        the completed turn-pair to the memory layer (journal sync, mem0 in bg)."""
         turn = TurnRecord(user_text=user_label[:2000])  # cap; not persisted
         handle.turns.append(turn)
+
+        # Record user side now (memory is journal-first; mem0 ingestion
+        # happens after assistant text is final).
+        if self._memory is not None:
+            try:
+                self._memory.add_turn("user", turn.user_text)
+            except Exception:
+                log.exception("memory.add_turn(user) failed; non-fatal")
 
         def iterator() -> Iterator[dict]:
             with handle.lock:
@@ -382,6 +442,16 @@ class LiteRTChatService:
                     if txt:
                         turn.assistant_text += txt
                     yield chunk
+            # Memory: persist assistant text to the in-memory journal only.
+            # mem0 fact-extraction is DEFERRED to session close — LiteRT-LM
+            # only allows one conversation per engine, so we can't spin up a
+            # throwaway conversation for mem0 while the user's chat conv is
+            # open. See MemoryLayer.batch_ingest() + close_all_sessions().
+            if self._memory is not None and turn.assistant_text:
+                try:
+                    self._memory.add_turn("assistant", turn.assistant_text)
+                except Exception:
+                    log.exception("memory.add_turn(assistant) failed; non-fatal")
             # After stream drain — check budget, compact if needed.
             try:
                 event = self._maybe_compact(handle)
