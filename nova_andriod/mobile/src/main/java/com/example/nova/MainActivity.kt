@@ -66,7 +66,12 @@ class MainActivity : AppCompatActivity() {
                     // Xclipse 530 GPU produces gibberish in LiteRT-LM 0.12.0 (broken
                     // OpenCL numerics), so force CPU on this device. Flip to true on
                     // SoCs with a correct GPU path (e.g. Snapdragon 8-gen + GPU sampler).
-                    withContext(Dispatchers.Default) { engine.warmUp(preferGpu = false) }
+                    withContext(Dispatchers.Default) {
+                        engine.warmUp(preferGpu = false)
+                        // Pay Kokoro's cold start now (during load), so the first
+                        // spoken turn doesn't stall the ~5-8s onnxruntime graph init.
+                        tts?.warmUp()
+                    }
                     ready = true
                     status.text = "Ready (${engine.activeBackend}). Hold to talk."
                 } catch (t: Throwable) {
