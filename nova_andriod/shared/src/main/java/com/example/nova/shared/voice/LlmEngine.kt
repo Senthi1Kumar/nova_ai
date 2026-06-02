@@ -110,6 +110,6 @@ class LlmEngine(
             "You are Nova, a concise on-device voice assistant. Keep replies short and spoken-friendly."
 
         fun defaultModelPath(context: Context): String =
-            File(context.getExternalFilesDir(null), MODEL_FILE).absolutePath
+            com.example.nova.shared.model.modelManager(context).gemmaModelPath()
     }
 }

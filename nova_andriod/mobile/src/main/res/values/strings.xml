@@ -1,3 +1,8 @@
 <resources>
     <string name="app_name">Nova</string>
+    <string name="setup_title">Download Nova\'s on-device models</string>
+    <string name="setup_e2b">Gemma-4 E2B — 2.6 GB · faster (recommended)</string>
+    <string name="setup_e4b">Gemma-4 E4B — 3.7 GB · smarter, slower</string>
+    <string name="setup_wifi_only">Download over Wi-Fi only</string>
+    <string name="setup_download">Download</string>
 </resources>

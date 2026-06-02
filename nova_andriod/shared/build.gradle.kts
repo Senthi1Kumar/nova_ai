@@ -22,6 +22,7 @@ dependencies {
     // sherpa-onnx v1.13.2 prebuilt AAR (includes JNI libs + compiled Kotlin API classes)
     // Source: https://github.com/k2-fsa/sherpa-onnx/releases/download/v1.13.2/sherpa-onnx-1.13.2.aar
     implementation(files("libs/sherpa-onnx-1.13.2.aar"))
+    implementation(libs.commons.compress)
 
     testImplementation(libs.junit)
     testImplementation(libs.kotlinx.coroutines.test)
