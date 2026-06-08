@@ -25,13 +25,14 @@ from tempfile import NamedTemporaryFile
 from typing import Iterator
 
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
-from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, PlainTextResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field
 
 from app.clause_splitter import maybe_flush_clause
 from app.config import get_settings
+from app.profiling import nvtx_range
 from app.litert_service import (
     LiteRTChatService,
     LiteRTNotReady,
@@ -123,9 +124,12 @@ async def lifespan(app: FastAPI):
     # Postgres/mem0 isn't available the layer logs a warning and runs in
     # journal-only mode.
     global memory
-    if os.environ.get("NOVA_MEMORY", "1") != "0":
+    cfg = get_settings()
+    memory_enabled = cfg.nova_memory and os.environ.get("NOVA_MEMORY", "1") != "0"
+    if memory_enabled:
         try:
-            memory = MemoryLayer(user_id=os.environ.get("NOVA_MEMORY_USER_ID", "user"))
+            user_id = os.environ.get("NOVA_MEMORY_USER_ID") or cfg.nova_memory_user_id
+            memory = MemoryLayer(user_id=user_id)
             chat_service.attach_memory(memory)
         except Exception as exc:
             logging.getLogger("litert_app.startup").warning(
@@ -133,7 +137,22 @@ async def lifespan(app: FastAPI):
             memory = None
     else:
         logging.getLogger("litert_app.startup").info(
-            "MemoryLayer disabled via NOVA_MEMORY=0")
+            "MemoryLayer disabled (NOVA_MEMORY=0)")
+
+    # Pre-warm Pocket TTS so the first voice turn doesn't pay the ~5-7s
+    # cold-load (438 MB safetensors + sentencepiece + voice-state encode).
+    # Runs in a thread to keep startup non-blocking for /api/health probes.
+    import threading
+    def _tts_warmup():
+        t0 = time.perf_counter()
+        try:
+            tts_service.warmup()
+            logging.getLogger("litert_app.startup").info(
+                "Pocket TTS pre-warmed in %.1fs", time.perf_counter() - t0)
+        except Exception as exc:
+            logging.getLogger("litert_app.startup").warning(
+                "Pocket TTS pre-warm failed (non-fatal): %s", exc)
+    threading.Thread(target=_tts_warmup, daemon=True, name="tts-warmup").start()
 
     yield
 
@@ -248,6 +267,10 @@ def _friendly_error(exc: Exception) -> str:
 # tool ourselves, then stream the snippets back as a normal reply.
 
 _SALVAGE_QUERY_RE = re.compile(r'query\s*:\s*<\|"\|>(.+?)<\|"\|>', re.DOTALL)
+# Fallback for the bare-value malformation: {query:current news...}  or
+# {query:"current news..."} — capture everything until the next comma or
+# closing brace, then strip optional surrounding quotes.
+_SALVAGE_BARE_QUERY_RE = re.compile(r'query\s*:\s*([^,}]+?)\s*[,}]', re.IGNORECASE)
 _SALVAGE_TOOL_RE  = re.compile(r'call:(\w+)\s*\{', re.IGNORECASE)
 
 
@@ -256,14 +279,26 @@ def _salvage_from_parse_error(exc_str: str) -> tuple[str, str] | None:
     if "Failed to parse" not in exc_str:
         return None
     tool_m = _SALVAGE_TOOL_RE.search(exc_str)
-    q_m = _SALVAGE_QUERY_RE.search(exc_str)
-    if not (tool_m and q_m):
+    if not tool_m:
         return None
-    return tool_m.group(1).strip(), q_m.group(1).strip()
+    q_m = _SALVAGE_QUERY_RE.search(exc_str) or _SALVAGE_BARE_QUERY_RE.search(exc_str)
+    if not q_m:
+        return None
+    query = q_m.group(1).strip().strip('"').strip("'")
+    # Gemma sometimes emits a doubled {query:query:...} — strip a leaked
+    # leading "query:" so we don't send it on to Brave verbatim.
+    while query.lower().startswith("query:"):
+        query = query[len("query:"):].strip()
+    return tool_m.group(1).strip(), query
 
 
 def _format_search_for_speech(search_json_or_text: str) -> str:
-    """Turn a Brave/Serper JSON result blob into 2-3 spoken sentences."""
+    """Turn a Brave/Serper JSON result blob into 2-3 spoken sentences.
+    Synthesises the FACTS — does NOT paste titles + raw snippets verbatim
+    (that was the old behavior: the model heard the literal article
+    headlines and quoted them whole). Instead, pull the most
+    fact-bearing sub-sentence from each top result and stitch them with
+    light connective tissue."""
     try:
         data = json.loads(search_json_or_text)
     except Exception:
@@ -273,16 +308,31 @@ def _format_search_for_speech(search_json_or_text: str) -> str:
     results = (data.get("results") if isinstance(data, dict) else None) or []
     if not results:
         return "I searched but didn't find anything useful. Try rephrasing the question."
-    parts = ["Here's what I found."]
-    for r in results[:2]:
-        title = (r.get("title") or "").strip()
+
+    # Extract the first fact-shaped sentence from each top result. Brave
+    # descriptions are usually one or two snippets glued with " ... " — the
+    # first half tends to carry the lede.
+    facts: list[str] = []
+    for r in results[:3]:
         desc = (r.get("description") or r.get("snippet") or "").strip()
-        if title and desc:
-            parts.append(f"{title}. {desc}")
-        elif title:
-            parts.append(title)
-        elif desc:
-            parts.append(desc)
+        if not desc:
+            continue
+        # First " ... " separator marks the snippet boundary; keep only
+        # the first clause.
+        head = desc.split("…")[0].split("...")[0].strip()
+        # Cap any individual fact at ~180 chars so TTS doesn't blow the
+        # 50-token chunk limit you saw warn.
+        if len(head) > 180:
+            head = head[:180].rsplit(" ", 1)[0] + "."
+        # Drop trailing punctuation noise + ensure terminator.
+        head = head.rstrip(",;: ")
+        if head and head[-1] not in ".!?":
+            head += "."
+        facts.append(head)
+    if not facts:
+        return "I searched but the results didn't say anything useful. Try rephrasing."
+
+    parts = ["Here's the gist."] + facts[:3]
     return " ".join(parts)
 
 
@@ -332,6 +382,43 @@ def health():
     data = chat_service.health()
     data["tts"] = tts_service.health()
     return data
+
+
+@app.get("/api/debug/system_prompt", response_class=PlainTextResponse)
+def debug_system_prompt():
+    """Return what Gemma actually sees as the system prompt right now.
+    Useful for verifying PRIOR DAYS diary recall is being spliced. Hit it
+    from a browser tab or curl: `curl localhost:8000/api/debug/system_prompt`."""
+    return chat_service._build_system_prompt()
+
+
+class DebugToolReq(BaseModel):
+    name: str
+    args: dict = Field(default_factory=dict)
+
+
+@app.post("/api/debug/tool")
+def debug_tool(req: DebugToolReq):
+    """Invoke a single MCP tool by name with args, bypass the model entirely,
+    return the raw FastMCP response (post truncation cap). Lets you exercise
+    web_search, google_search, geocode, execute_sql_query, add_skill in
+    isolation to see what Gemma would see for a given query.
+
+    Examples:
+      curl -X POST localhost:8000/api/debug/tool -H 'content-type: application/json' \
+        -d '{"name":"web_search","args":{"query":"latest AI news","search_type":"news","num_results":5}}'
+      curl -X POST localhost:8000/api/debug/tool -H 'content-type: application/json' \
+        -d '{"name":"geocode","args":{"location":"Chennai"}}'
+    """
+    from app.mcp_bridge import get_bridge
+    bridge = get_bridge()
+    if bridge is None or not bridge.ready:
+        raise HTTPException(status_code=503, detail="MCP sidecar not connected. Start with: python -m app.tools_v2")
+    try:
+        raw = bridge.call_tool(req.name, req.args, timeout=30.0)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"tool failed: {exc}") from exc
+    return {"name": req.name, "args": req.args, "result_chars": len(raw), "result": raw}
 
 
 class ReconfigRequest(BaseModel):
@@ -423,6 +510,10 @@ async def chat_stream(
             image_path = Path(tmp.name)
             tmp.write(await image.read())
 
+    logging.getLogger("litert_app.http").info(
+        "/api/chat/stream entry: msg_chars=%d image=%s session=%s",
+        len(message or ""), bool(image_path), session_id or "<new>")
+
     try:
         if image_path is not None:
             active_sid, chunk_iterator = chat_service.send_text_with_image_stream(
@@ -491,6 +582,11 @@ async def voice_chat_stream(
             image_path = Path(itmp.name)
             itmp.write(await image.read())
 
+    logging.getLogger("litert_app.http").info(
+        "/api/voice/chat/stream entry: audio=%dB image=%s session=%s",
+        temp_path.stat().st_size if temp_path.exists() else -1,
+        bool(image_path), session_id or "<new>")
+
     cfg = get_settings()
 
     def event_stream():
@@ -505,10 +601,12 @@ async def voice_chat_stream(
 
         try:
             yield sse("status", {"stage": "transcode"})
-            wav_path = _transcode_to_wav16k(temp_path)
+            with nvtx_range("voice.transcode"):
+                wav_path = _transcode_to_wav16k(temp_path)
             yield sse("status", {"stage": "encode"})
-            active_sid, chunk_iter = chat_service.send_audio_stream(
-                wav_path, active_sid, image_path=image_path)
+            with nvtx_range("voice.engine_send"):
+                active_sid, chunk_iter = chat_service.send_audio_stream(
+                    wav_path, active_sid, image_path=image_path)
             yield sse("session", {"session_id": active_sid})
 
             for chunk in chunk_iter:
@@ -533,7 +631,10 @@ async def voice_chat_stream(
                     comma_min_chars=cfg.clause_comma_min_chars,
                 )
                 if clause:
-                    yield from _emit_clause(clause, clause_idx, tts_service)
+                    with nvtx_range(
+                        "voice.tts_first_clause" if clause_idx == 0 else "voice.tts_clause"
+                    ):
+                        yield from _emit_clause(clause, clause_idx, tts_service)
                     if first_audio_ts is None:
                         first_audio_ts = time.perf_counter()
                     clause_idx += 1

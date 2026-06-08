@@ -29,8 +29,12 @@ log = logging.getLogger("litert_app.tools")
 
 # ── Bridge proxies: IResearcher FastMCP sidecar ──────────────────────────────
 
-_MCP_RESULT_CAP = 1500  # chars; ~ 375 tokens — keeps tool result well under
-                        # the 4096-token KV budget even with multi-turn history.
+_MCP_RESULT_CAP = 2500  # chars; ~ 625 tokens. Bumped from 1500 — at the lower
+                        # cap Gemma-4-E2B only saw 2-3 truncated snippets and
+                        # produced hedging "available through various sources"
+                        # replies. Compaction (0.50 ratio + tool weight tally
+                        # via TurnRecord.tool_chars) keeps this safe under the
+                        # 4096-token wall.
 
 
 def _mcp_proxy(tool_name: str, args: dict, label: str) -> str:

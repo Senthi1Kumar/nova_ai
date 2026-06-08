@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Dict, Iterator, Optional
 
 from app.config import Settings
+from app.profiling import nvtx_range
 from app.tools import (
     add_numbers,
     web_search,
@@ -56,10 +57,15 @@ class TurnRecord:
     `user_text` captures whatever entered the prompt (text, audio-hint, etc.);
     audio / image bytes are NOT preserved because we can't replay them — the
     compactor summarizes from text only. `assistant_text` is the full reply
-    accumulated across stream chunks.
+    accumulated across stream chunks. `tool_chars` accumulates the byte length
+    of tool_call args + tool_result content for THIS turn so the compaction
+    estimator sees real budget pressure (without it, search-heavy turns blow
+    the 4096-token wall silently because the engine holds tool messages we
+    don't tally).
     """
     user_text: str
     assistant_text: str = ""
+    tool_chars: int = 0
 
 
 @dataclass
@@ -102,30 +108,55 @@ class LiteRTChatService:
     def _build_system_prompt(self) -> str:
         """Compose the system prompt for a fresh conversation.
 
-        Base persona from settings + optional 'PRIOR CONTEXT' block recalled
-        from mem0. The recall query is intentionally broad ('user context
-        preferences recent') because we don't have a user turn yet at session
-        start — mem0's embedding model surfaces the most relevant durable
-        facts from previous sessions.
+        Base persona + a PRIOR DAYS block recalled from the on-disk diary
+        (`runtime/daily_logs/YYYY-MM-DD.md`). When mem0 is enabled we ALSO
+        splice in its semantic-recall block; when mem0 is off (the default
+        on 4 GB devices), diary recency carries cross-session memory alone.
         """
         base = self.settings.litert_system_prompt
-        if self._memory is None or not getattr(self._memory, "enabled", False):
+        if self._memory is None:
             return base
+
+        parts = [base]
+
+        # Diary recall — always available when MemoryLayer is constructed
+        # (writes happen at session close regardless of mem0 state).
         try:
-            k = int(os.environ.get("NOVA_MEM_RECALL_K", "5"))
-            recall = self._memory.recall_block(
-                "user context preferences recent topics", k=k
-            )
+            diary = self._memory.recall_recent_diary(days=3, max_chars=1600)
         except Exception:
-            log.exception("memory recall at session start failed; using base prompt")
-            return base
-        if not recall:
-            return base
-        return (
-            base
-            + "\n\nPRIOR CONTEXT (durable facts recalled from previous sessions; "
-              "use only if relevant):\n" + recall
-        )
+            log.exception("diary recall failed; continuing without it")
+            diary = ""
+        if diary:
+            parts.append(
+                "PRIOR DAYS — these are YOUR OWN notes from sessions with this "
+                "user over the last 3 days. They are real memory: if the user "
+                "asks 'what did we discuss', 'do you remember', 'what's my "
+                "name', or anything about prior conversations, CONSULT THIS "
+                "BLOCK and answer from it. Do NOT say 'I have no memory' or "
+                "'I can't access previous conversations' — you have these "
+                "notes. Don't bring them up unprompted, but use them whenever "
+                "asked.\n\n" + diary
+            )
+            log.info("system prompt: PRIOR DAYS block included (%d chars)", len(diary))
+        else:
+            log.info("system prompt: no diary content (fresh install or empty logs)")
+
+        # Semantic recall via mem0 — only if it's actually enabled.
+        if getattr(self._memory, "enabled", False):
+            try:
+                k = int(os.environ.get("NOVA_MEM_RECALL_K", "5"))
+                recall = self._memory.recall_block(
+                    "user context preferences recent topics", k=k
+                )
+                if recall:
+                    parts.append(
+                        "PRIOR CONTEXT (durable facts from previous sessions):\n"
+                        + recall
+                    )
+            except Exception:
+                log.exception("mem0 recall at session start failed; skipping")
+
+        return "\n\n".join(parts)
 
     def _backend(self, name: str):
         name = (name or "CPU").upper().strip()
@@ -298,7 +329,12 @@ class LiteRTChatService:
     # ---------- compaction ----------
 
     _KEEP_RECENT_TURNS = 2
-    _COMPACT_RATIO = 0.70   # trigger when token count > this * max_num_tokens
+    # Trigger compaction when token count > this * max_num_tokens. Kept low
+    # (0.50) because each tool-call turn adds ~500-800 tokens (search result +
+    # assistant prose), and we want headroom for the NEXT turn's generation
+    # before we hit the 4096-token wall. Heavy-tool sessions silently stall
+    # mid-stream once the prompt+history exceeds the budget.
+    _COMPACT_RATIO = 0.50
     _SUMMARY_TARGET_TOKENS = 250
 
     def _count_tokens(self, text: str) -> int:
@@ -311,10 +347,18 @@ class LiteRTChatService:
             return len(text) // 4
 
     def _serialize_turns(self, turns: list["TurnRecord"]) -> str:
-        """Render turns to a flat string used for token counting + summarization."""
+        """Render turns to a flat string used for token counting + summarization.
+        Voice-turn user_text is stored as the literal '[voice]' (Gemma-4
+        interprets audio natively, no STT transcript exists), so for the
+        summariser we replace it with a label that signals "user spoke" — the
+        assistant_text below carries the semantic content the summariser uses
+        to extract facts."""
         lines = []
         for t in turns:
-            lines.append(f"User: {t.user_text}")
+            user_repr = t.user_text
+            if user_repr.startswith("[voice]"):
+                user_repr = "(user voice message)"
+            lines.append(f"User: {user_repr}")
             if t.assistant_text:
                 lines.append(f"Assistant: {t.assistant_text}")
         return "\n".join(lines)
@@ -322,7 +366,11 @@ class LiteRTChatService:
     def _conversation_token_count(self, handle: "ConversationHandle") -> int:
         sys_prompt = self.settings.litert_system_prompt
         body = self._serialize_turns(handle.turns)
-        return self._count_tokens(sys_prompt + "\n" + body)
+        # tool_chars (call args + result content) live in the engine's history
+        # but aren't in user/assistant_text. Estimate at ~4 chars/token to
+        # reflect their real budget weight in compaction decisions.
+        tool_tokens = sum(t.tool_chars for t in handle.turns) // 4
+        return self._count_tokens(sys_prompt + "\n" + body) + tool_tokens
 
     def _summarize(self, text: str) -> str:
         """Run a throwaway summarizer conversation. Returns a short summary or
@@ -330,11 +378,15 @@ class LiteRTChatService:
         if self.engine is None:
             return ""
         sys_msg = (
-            "You are a context-compactor. Condense the conversation below into "
-            f"under {self._SUMMARY_TARGET_TOKENS} tokens. Preserve: who the user is, "
-            "key facts established, tool results, the user's goals. Drop pleasantries. "
-            "Output as bullet points, no preamble. Do not narrate the conversation; "
-            "state the facts as the assistant's working memory."
+            "You are a context-compactor for an on-device voice assistant. "
+            f"Condense the conversation below into under {self._SUMMARY_TARGET_TOKENS} tokens. "
+            "Output four labeled sections, in this exact order, no preamble, no closing line:\n"
+            "USER: who the user is + stable preferences (one line, omit if nothing known)\n"
+            "FACTS: established facts, named entities, numbers, decisions (bullets)\n"
+            "TOOLS: tool calls made + the one-line takeaway from each result (bullets)\n"
+            "OPEN: the user's current goal + any unanswered question (one line)\n"
+            "Drop pleasantries, narration, and anything the assistant already said back. "
+            "Write as the assistant's working memory, not as a transcript."
         )
         try:
             cm = self.engine.create_conversation(
@@ -380,8 +432,16 @@ class LiteRTChatService:
                           "text": f"(memory of prior conversation)\n{summary}"}]},
         ]
         for t in recent_turns:
+            # Voice turns store "[voice]" as user_text (Gemma-4 interprets the
+            # audio natively, so there's no transcript). Replaying that literal
+            # string after compaction feeds the model noise. Substitute a brief
+            # placeholder that conveys "user spoke; my reply below carries the
+            # substance" — the assistant_text holds the actual semantic content.
+            user_repr = t.user_text
+            if user_repr.startswith("[voice]"):
+                user_repr = "(voice message from the user — see my reply for context)"
             new_messages.append({"role": "user",
-                                 "content": [{"type": "text", "text": t.user_text}]})
+                                 "content": [{"type": "text", "text": user_repr}]})
             if t.assistant_text:
                 new_messages.append({"role": "assistant",
                                      "content": [{"type": "text", "text": t.assistant_text}]})
@@ -421,9 +481,19 @@ class LiteRTChatService:
 
     def _run_turn(self, handle: "ConversationHandle", user_label: str, sender) -> Iterator[dict]:
         """Drive one chunk-iterator turn, accumulating the assistant text into
-        the handle's history. After the iterator drains, opportunistically
-        compact if the conversation is approaching the token budget AND hand
-        the completed turn-pair to the memory layer (journal sync, mem0 in bg)."""
+        the handle's history. Pre-turn AND post-turn compaction guard the
+        4096-token wall: pre-turn protects this turn's generation, post-turn
+        sets up headroom for the next one."""
+        # Pre-turn compaction: if the conversation is already over the
+        # threshold, the incoming turn will likely overflow the budget
+        # mid-generation and silently stall. Compact first.
+        pre_event = None
+        try:
+            with nvtx_range("engine.pre_compact"):
+                pre_event = self._maybe_compact(handle)
+        except Exception:
+            log.exception("pre-turn compaction failed; continuing without it")
+
         turn = TurnRecord(user_text=user_label[:2000])  # cap; not persisted
         handle.turns.append(turn)
 
@@ -436,11 +506,26 @@ class LiteRTChatService:
                 log.exception("memory.add_turn(user) failed; non-fatal")
 
         def iterator() -> Iterator[dict]:
-            with handle.lock:
+            if pre_event is not None:
+                yield pre_event
+            with handle.lock, nvtx_range("engine.send_and_stream"):
+                first_token_seen = False
                 for chunk in sender(handle.conversation):
                     txt = extract_text(chunk)
                     if txt:
+                        if not first_token_seen:
+                            # Mark TTFT — gap between this range's start and
+                            # engine.send_and_stream's start = prefill time.
+                            with nvtx_range("engine.first_token"):
+                                pass
+                            first_token_seen = True
                         turn.assistant_text += txt
+                    # Accumulate tool weight so compaction sees real budget use.
+                    for kind, payload in extract_tool_events(chunk):
+                        if kind == "tool_call":
+                            turn.tool_chars += len(str(payload.get("args") or "")) + 40
+                        elif kind == "tool_result":
+                            turn.tool_chars += len(str(payload.get("content") or payload.get("result") or "")) + 20
                     yield chunk
             # Memory: persist assistant text to the in-memory journal only.
             # mem0 fact-extraction is DEFERRED to session close — LiteRT-LM
@@ -454,7 +539,8 @@ class LiteRTChatService:
                     log.exception("memory.add_turn(assistant) failed; non-fatal")
             # After stream drain — check budget, compact if needed.
             try:
-                event = self._maybe_compact(handle)
+                with nvtx_range("engine.post_compact"):
+                    event = self._maybe_compact(handle)
                 if event is not None:
                     yield event
             except Exception:

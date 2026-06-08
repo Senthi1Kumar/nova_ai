@@ -1,3 +1,4 @@
+import html
 import logging
 import re
 import json
@@ -6,6 +7,24 @@ import httpx
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
+
+
+_HTML_TAG_RE = re.compile(r"<[^>]+>")
+_WS_RE = re.compile(r"\s+")
+
+
+def clean_search_text(text: str) -> str:
+    """Strip HTML tags + decode entities + collapse whitespace.
+
+    Brave Search descriptions are returned with markup like '<strong>'
+    around matched terms and entities like '&#x27;'. Without cleaning,
+    Gemma echoes the markup verbatim into its reply and Pocket-TTS
+    pronounces 'strong' or 'amp x two seven' aloud."""
+    if not text:
+        return ""
+    no_tags = _HTML_TAG_RE.sub("", text)
+    decoded = html.unescape(no_tags)
+    return _WS_RE.sub(" ", decoded).strip()
 
 # tiktoken is imported lazily inside count_tokens / limit_tokens so that
 # importing this module doesn't fail when tiktoken isn't installed (it's
@@ -35,13 +54,23 @@ def sanitize_llm_input(value: str, param_name: str = "parameter") -> str:
 
 
 def sanitize_search_type(search_type: str, valid_types: list, default: str = "web") -> str:
+    """Coerce a (possibly LLM-generated) search_type to one of `valid_types`.
+
+    Strategy: substring-match the input against each valid type
+    (case-insensitive) — so 'shoppin', 'Shopping', or 'SHOP' all collapse to
+    'shopping' when that's in valid_types. Fall back to `default` if nothing
+    matches.
+
+    Earlier version always returned 'web' or 'news' regardless of valid_types,
+    which broke google_search (valid set ['maps', 'shopping']) — its argument
+    'shopping' was being rewritten to 'web' and then rejected by the tool's
+    own validation.
     """
-    Simplified: If 'news' in search_type (case-insensitive), return 'news'; else return 'web'.
-    """
-    search_type = sanitize_llm_input(search_type, "search_type")
-    if "news" in search_type.lower():
-        return "news"
-    return "web"
+    search_type = sanitize_llm_input(search_type, "search_type").lower()
+    for vt in valid_types:
+        if vt.lower() in search_type or search_type in vt.lower():
+            return vt
+    return default
 
 
 def extract_search_metadata(search_data):

@@ -99,8 +99,19 @@ class MemoryLayer:
         user_id: str = "user",
         runtime_dir: Optional[Path] = None,
     ) -> None:
+        # Read the disabled flag via Settings (which loads .env) — falling
+        # back to os.getenv for shell-only overrides. pydantic-settings does
+        # NOT push .env values into os.environ, so reading os alone misses
+        # anything that lives only in .env. Same pattern as Tavily/Mapbox keys.
+        from app.config import get_settings
+        cfg = get_settings()
+        env_disabled = os.getenv("NOVA_MEM0_DISABLED", "").strip().strip('"').strip("'")
+        if env_disabled:
+            self.disabled = env_disabled == "1"
+        else:
+            self.disabled = bool(getattr(cfg, "nova_mem0_disabled", False))
+
         self.user_id = user_id
-        self.disabled = os.getenv("NOVA_MEM0_DISABLED", "0") == "1"
 
         runtime_dir = runtime_dir or Path(__file__).resolve().parent.parent / "runtime"
         self.session_logs_dir = runtime_dir / "session_logs"
@@ -118,7 +129,7 @@ class MemoryLayer:
         else:
             self._init_mem0()
 
-        status = "on" if self._mem_ready else "off (journal-only)"
+        status = "on" if self._mem_ready else "off (journal + diary recall)"
         logger.info("MemoryLayer ready (user_id=%s, mem0=%s)", user_id, status)
 
     def start_new_session(self) -> None:
@@ -281,6 +292,43 @@ class MemoryLayer:
         lines = self.recall(query, k=k)
         return "\n".join(f"- {ln}" for ln in lines) if lines else ""
 
+    def recall_recent_diary(self, days: int = 3, max_chars: int = 1600) -> str:
+        """Read the last `days` diary files and return a single text block
+        suitable for splicing into a system prompt. Sessions within each day
+        are ordered NEWEST FIRST (the diary file appends chronologically, so
+        we reverse on read). The combined body is truncated from the END so
+        the freshest sessions across all days survive truncation."""
+        from datetime import date, timedelta
+        import re
+        today = date.today()
+        chunks: list[str] = []
+        for delta in range(days):
+            d = today - timedelta(days=delta)
+            path = self.daily_logs_dir / f"{d.isoformat()}.md"
+            if not path.exists():
+                continue
+            try:
+                text = path.read_text().strip()
+            except Exception as exc:
+                logger.warning("diary read failed for %s: %s", path.name, exc)
+                continue
+            if not text:
+                continue
+            # Split on session headers and reverse so newest session in the
+            # day comes first. Header line is "## Session HH:MM → HH:MM UTC".
+            parts = re.split(r"(?m)^(?=## Session )", text)
+            day_header = parts[0].strip()        # e.g. "# 2026-06-05"
+            sessions = [p.strip() for p in parts[1:] if p.strip()]
+            sessions.reverse()
+            day_body = day_header + "\n\n" + "\n\n".join(sessions) if day_header else "\n\n".join(sessions)
+            chunks.append(day_body)
+        if not chunks:
+            return ""
+        body = "\n\n".join(chunks)
+        if len(body) > max_chars:
+            body = body[:max_chars].rsplit("\n", 1)[0] + "\n…(older entries truncated)"
+        return body
+
     # ── session lifecycle ──────────────────────────────────────────────────
 
     def session_summary_json(self) -> dict:
@@ -317,18 +365,40 @@ class MemoryLayer:
         if callable(llm_oneshot):
             try:
                 raw = llm_oneshot(
-                    "Summarise the following voice-agent session in 3-5 short bullet "
-                    "points. Focus on durable facts the user shared (preferences, "
-                    "context, decisions), topics discussed, and any actions Nova took "
-                    "(web searches, refusals). Output bullets only, no preamble.\n\n"
-                    + transcript,
-                    240,
+                    "You are writing Nova's persistent memory of one voice session "
+                    "with this user. This memory will be read back to Nova in future "
+                    "sessions so she can recall what she knows about the user.\n\n"
+                    "Output four labeled sections, in this exact order, NO preamble, "
+                    "NO closing line, NO mention of Nova's actions or refusals:\n"
+                    "USER: who the user is + stable preferences they revealed "
+                    "(one line; omit entirely if nothing new this session)\n"
+                    "FACTS: concrete things established this session — names, "
+                    "numbers, decisions, dates, items the user owns or chose. "
+                    "Bullets. Omit section if empty.\n"
+                    "TOOLS: tool calls + one-line takeaway from each result "
+                    "(bullets; omit section if no tools were used)\n"
+                    "OPEN: the user's current goal + any unanswered question "
+                    "(one line; omit if session was casual chit-chat)\n\n"
+                    "Rules: NEVER write 'Nova said', 'Nova stated', 'Nova "
+                    "refused' — those describe the assistant's behavior, not "
+                    "the user. Write facts as standalone statements the future-"
+                    "Nova can act on. If the user shared NOTHING worth "
+                    "remembering, output the single line: NOTHING NOTABLE.\n\n"
+                    "Transcript:\n" + transcript,
+                    300,
                 )
                 summary = str(raw) if raw else ""
             except Exception as exc:
                 logger.warning("LLM diary summary failed: %s", exc)
 
         summary_text = summary.strip() or self._fallback_summary(snapshot)
+        # Skip writing entries that contain no user-relevant content — they
+        # otherwise pollute PRIOR DAYS recall with self-referential noise like
+        # "Nova said it had no memory", which reinforces denial behavior.
+        if summary_text.strip().upper().startswith("NOTHING NOTABLE"):
+            logger.info("diary skip: session had no notable content (session=%s)",
+                        snapshot['session_id'][:8])
+            return
         diary_path = self.daily_logs_dir / f"{_today_str()}.md"
         diary_path.parent.mkdir(parents=True, exist_ok=True)
         started, ended = snapshot["started_at"], snapshot["ended_at"]

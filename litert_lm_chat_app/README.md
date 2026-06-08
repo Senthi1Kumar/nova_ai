@@ -102,11 +102,13 @@ hf download litert-community/gemma-4-E2B-it-litert-lm \
 LITERT_MODEL_PATH=/absolute/path/to/gemma-4-E2B-it.litertlm
 LITERT_BACKEND=GPU                # or CPU if VRAM-bound
 LITERT_AUDIO_BACKEND=CPU
-LITERT_VISION_BACKEND=GPU         # drop to CPU if VRAM-bound
+LITERT_VISION_BACKEND=CPU         # GPU vision on ≤4 GB cards stalls or OOMs
 LITERT_ENABLE_SPECULATIVE=true    # MTP — set false on CPU backend
+LITERT_MAX_NUM_TOKENS=8192        # 4096 on ≤4 GB GPU, 16384 on ≥8 GB
 TTS_ENABLED=true
 POCKET_TTS_VOICE=alba
 POCKET_TTS_LANGUAGE=english
+NOVA_MEM0_DISABLED=1              # default: journal + diary recall only
 TAVILY_API_KEY=tvly-...           # optional, enables web_search tool
 ```
 
@@ -124,6 +126,8 @@ button, speak, release.
 ## API endpoints
 
 - `GET /api/health` — engine + TTS status
+- `GET /api/debug/system_prompt` — composed system prompt (verify PRIOR DAYS diary splice)
+- `POST /api/debug/tool` — invoke a single MCP tool by name, bypass the model (`{"name":"web_search","args":{"query":"...","search_type":"news","num_results":5}}`)
 - `POST /api/chat/stream` — text chat SSE
 - `POST /api/voice/chat/stream` — native-audio voice pipeline SSE
 - `POST /api/voice/chat` — non-streaming voice (returns one WAV URL)
@@ -274,7 +278,7 @@ NOVA_MEM0_DISABLED=1    # keep journal + diary, skip mem0 / Postgres
 | When | What happens |
 | --- | --- |
 | App startup | `MemoryLayer` initialised, mem0 connects to Postgres + shim |
-| Each user turn ends | `journal.add(user)` + `journal.add(assistant)`; background `mem0.add()` thread |
+| Each user turn ends | `journal.add(user)` + `journal.add(assistant)` (sync, journal-only — no LLM call) |
 | `↻ New chat` click (or `DELETE /api/session/<id>`) | Journal flushed → diary appended → fresh journal started |
 | App shutdown | Final journal flushed + diary appended |
 

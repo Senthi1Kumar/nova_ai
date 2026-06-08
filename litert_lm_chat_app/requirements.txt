@@ -15,7 +15,7 @@ fastmcp
 # mem0 calls a local OpenAI-compatible LLM for fact extraction — we expose one
 # via app/llm_shim.py that wraps LiteRT-LM, so no extra model needed.
 # Postgres + pgvector extension required for semantic recall
-mem0ai>=0.1.0
-sentence-transformers>=3.0
-pgvector>=0.3
-psycopg[c,pool]>=3.3.4
+# mem0ai>=0.1.0
+# sentence-transformers>=3.0
+# pgvector>=0.3
+# psycopg[c,pool]>=3.3.4

@@ -19,6 +19,7 @@ from dotenv import load_dotenv
 from fastmcp import FastMCP
 
 from app.utils import (
+    clean_search_text,
     logger,
     sanitize_llm_input,
     sanitize_search_type,
@@ -125,10 +126,13 @@ async def web_search(
             # hundred tokens — small-model contexts can't afford the full
             # Brave response. Drop extra_snippets and metadata entirely.
             for item in results[: min(num_results, 5)]:
+                # Brave returns HTML markup ('<strong>') and entities ('&#x27;')
+                # in title + description. Strip both before truncating so the
+                # 120/240-char caps don't include now-invisible tag bytes.
                 processed_results.append({
-                    'title': (item.get('title') or '')[:120],
+                    'title': clean_search_text(item.get('title') or '')[:120],
                     'url': item.get('url', ''),
-                    'description': (item.get('description') or '')[:240],
+                    'description': clean_search_text(item.get('description') or '')[:240],
                     'age': item.get('age') or item.get('page_age') or '',
                 })
 

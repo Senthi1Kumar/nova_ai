@@ -54,6 +54,19 @@ class PocketTTSService:
             self.ready_error = str(exc)
             raise VoiceNotReady(f"Failed to load Pocket TTS: {exc}") from exc
 
+    def warmup(self) -> None:
+        """Eager-load the model + voice state so the first user turn doesn't
+        pay the ~5-7s cold-start (HF download + safetensors decode + voice
+        prompt encode). Safe to call repeatedly; subsequent calls are no-ops."""
+        if not self.settings.tts_enabled:
+            return
+        try:
+            self._load()
+        except VoiceNotReady:
+            # Don't block app startup if TTS happens to be misconfigured;
+            # the first synthesize call will re-raise with the same error.
+            pass
+
     def synthesize_stream(self, text: str) -> Iterator[tuple[bytes, int]]:
         """Yield (pcm_s16le_bytes, sample_rate) chunks for `text`."""
         clean = (text or "").strip()
