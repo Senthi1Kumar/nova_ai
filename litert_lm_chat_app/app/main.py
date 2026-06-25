@@ -8,6 +8,7 @@ import os
 import re
 import shutil
 import subprocess
+import tempfile
 import time
 
 logging.basicConfig(
@@ -208,19 +209,25 @@ def _transcode_to_wav16k(src: Path) -> Path:
 
     Gemma-4-E4B's bundled miniaudio decoder only accepts WAV/FLAC/MP3/Vorbis —
     not the webm/opus containers MediaRecorder produces — so we normalise here.
+    Also re-samples already-WAV inputs that aren't 16 kHz mono.
     """
     if _FFMPEG is None:
         raise VoiceNotReady(
             "ffmpeg not found on PATH. Install ffmpeg (sudo pacman -S ffmpeg / "
             "brew install ffmpeg) — required to decode browser audio."
         )
-    out = src.with_suffix(".wav")
+    # Always write to a fresh tempfile so a .wav input doesn't collide with
+    # itself as the output (ffmpeg rc=234 "Output same as input" otherwise).
+    fd, out_str = tempfile.mkstemp(suffix=".16k.wav")
+    os.close(fd)
+    out = Path(out_str)
     proc = subprocess.run(
         [_FFMPEG, "-hide_banner", "-loglevel", "error", "-y",
          "-i", str(src), "-ac", "1", "-ar", "16000", str(out)],
         capture_output=True,
     )
     if proc.returncode != 0:
+        out.unlink(missing_ok=True)
         raise VoiceNotReady(
             f"ffmpeg failed (rc={proc.returncode}): {proc.stderr.decode('utf-8', 'ignore')[:300]}"
         )
@@ -565,10 +572,14 @@ async def voice_chat_stream(
     audio: UploadFile = File(...),
     session_id: str | None = Form(default=None),
     image: UploadFile | None = File(default=None),
+    notts: int = 0,
 ):
     """Native audio -> Gemma-4 -> clause-split -> Pocket-TTS streaming PCM.
 
     Optional `image` multipart field attaches a vision frame to the turn.
+    `?notts=1` query param skips the TTS synthesis step entirely — useful
+    for batch eval where you only care about the text reply + tool calls,
+    not the spoken audio. Cuts wall-clock per turn 3-5x.
     """
     suffix = Path(audio.filename or "rec.webm").suffix or ".webm"
     with NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
@@ -631,17 +642,23 @@ async def voice_chat_stream(
                     comma_min_chars=cfg.clause_comma_min_chars,
                 )
                 if clause:
-                    with nvtx_range(
-                        "voice.tts_first_clause" if clause_idx == 0 else "voice.tts_clause"
-                    ):
-                        yield from _emit_clause(clause, clause_idx, tts_service)
+                    if notts:
+                        yield sse("clause", {"index": clause_idx, "text": clause})
+                    else:
+                        with nvtx_range(
+                            "voice.tts_first_clause" if clause_idx == 0 else "voice.tts_clause"
+                        ):
+                            yield from _emit_clause(clause, clause_idx, tts_service)
                     if first_audio_ts is None:
                         first_audio_ts = time.perf_counter()
                     clause_idx += 1
 
             tail = "".join(buf).strip()
             if tail:
-                yield from _emit_clause(tail, clause_idx, tts_service)
+                if notts:
+                    yield sse("clause", {"index": clause_idx, "text": tail})
+                else:
+                    yield from _emit_clause(tail, clause_idx, tts_service)
                 if first_audio_ts is None:
                     first_audio_ts = time.perf_counter()
 

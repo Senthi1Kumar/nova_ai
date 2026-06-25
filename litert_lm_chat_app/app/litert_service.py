@@ -57,15 +57,24 @@ class TurnRecord:
     `user_text` captures whatever entered the prompt (text, audio-hint, etc.);
     audio / image bytes are NOT preserved because we can't replay them — the
     compactor summarizes from text only. `assistant_text` is the full reply
-    accumulated across stream chunks. `tool_chars` accumulates the byte length
-    of tool_call args + tool_result content for THIS turn so the compaction
-    estimator sees real budget pressure (without it, search-heavy turns blow
-    the 4096-token wall silently because the engine holds tool messages we
-    don't tally).
+    accumulated across stream chunks.
+
+    `tool_chars` accumulates the byte length of tool_call args + tool_result
+    content for THIS turn so the compaction estimator sees real budget
+    pressure (without it, search-heavy turns blow the token wall silently
+    because the engine holds tool messages we don't tally).
+
+    `audio_tokens` is an estimate of how many tokens this turn's audio input
+    occupies in the engine's KV cache. user_text for audio turns is the
+    literal "[voice]" placeholder which is ~1 token, but the engine actually
+    holds 100-300 audio embedding tokens per turn. Without tallying these,
+    compaction massively undercounts on voice-heavy sessions and the engine
+    silently wedges or crashes around turn 10-12 on small GPUs.
     """
     user_text: str
     assistant_text: str = ""
     tool_chars: int = 0
+    audio_tokens: int = 0
 
 
 @dataclass
@@ -242,11 +251,19 @@ class LiteRTChatService:
             "active_conversations": len(self._conversations),
         }
 
-    def new_session(self) -> str:
+    def new_session(self, session_id: Optional[str] = None) -> str:
+        """Create a new conversation. If `session_id` is provided, store the
+        handle under that key; otherwise generate a fresh UUID. Honoring a
+        caller-supplied id is required for clients that reuse a stable
+        session id across multiple POSTs (batch eval scripts, scripted
+        integration tests). Without this, a stable client id like
+        "eval-batch" is silently replaced by a server UUID on every POST,
+        so subsequent POSTs never find the existing conversation and
+        repeatedly try (and fail) to create new ones."""
         if self.engine is None:
             raise LiteRTNotReady(self.ready_error or "LiteRT-LM engine is not loaded")
 
-        session_id = str(uuid.uuid4())
+        sid = session_id or str(uuid.uuid4())
         messages = [
             {
                 "role": "system",
@@ -256,8 +273,8 @@ class LiteRTChatService:
         conversation_cm = self.engine.create_conversation(messages=messages, tools=DEFAULT_TOOLS, enable_constrained_decoding=True)
         conversation = conversation_cm.__enter__()
         setattr(conversation, "_litert_context_manager", conversation_cm)
-        self._conversations[session_id] = ConversationHandle(session_id, conversation, threading.Lock())
-        return session_id
+        self._conversations[sid] = ConversationHandle(sid, conversation, threading.Lock())
+        return sid
 
     def close_session(self, session_id: str) -> None:
         handle = self._conversations.pop(session_id, None)
@@ -270,9 +287,12 @@ class LiteRTChatService:
     def _get_or_create(self, session_id: Optional[str]) -> ConversationHandle:
         if self.engine is None:
             raise LiteRTNotReady(self.ready_error or "LiteRT-LM engine is not loaded")
-        if not session_id or session_id not in self._conversations:
-            session_id = self.new_session()
-        return self._conversations[session_id]
+        if session_id and session_id in self._conversations:
+            return self._conversations[session_id]
+        # Pass the caller's id through so subsequent POSTs with the same id
+        # hit the dict instead of creating duplicate conversations.
+        sid = self.new_session(session_id)
+        return self._conversations[sid]
 
     def send_sync(self, message: str, session_id: Optional[str] = None) -> tuple[str, str]:
         handle = self._get_or_create(session_id)
@@ -295,6 +315,16 @@ class LiteRTChatService:
         hint = prompt_hint or self.settings.audio_prompt_hint
         label = "[voice]" + (" [image]" if image_path else "")
 
+        # Estimate audio token weight from file size. Gemma-4's USM audio
+        # encoder produces roughly 50 tokens per second; 16kHz mono int16
+        # is 32000 bytes/sec, so file_bytes / 640 ≈ tokens. Conservative
+        # rather than precise — undercounting is what crashes the engine.
+        try:
+            audio_bytes = Path(audio_path).stat().st_size
+            audio_tok_estimate = max(50, audio_bytes // 640)
+        except Exception:
+            audio_tok_estimate = 200
+
         def _send(conv):
             parts: list = [hint]
             if image_path:
@@ -304,7 +334,10 @@ class LiteRTChatService:
                 absolute_path=str(Path(audio_path).resolve())))
             return conv.send_message_async(litert_lm.Contents.of(*parts))
 
-        return handle.session_id, self._run_turn(handle, user_label=label, sender=_send)
+        return handle.session_id, self._run_turn(
+            handle, user_label=label, sender=_send,
+            audio_tokens=audio_tok_estimate,
+        )
 
     def send_text_with_image_stream(
         self,
@@ -370,7 +403,12 @@ class LiteRTChatService:
         # but aren't in user/assistant_text. Estimate at ~4 chars/token to
         # reflect their real budget weight in compaction decisions.
         tool_tokens = sum(t.tool_chars for t in handle.turns) // 4
-        return self._count_tokens(sys_prompt + "\n" + body) + tool_tokens
+        # audio_tokens are the engine-side audio embedding cost (each voice
+        # turn's input is ~50 tok/sec). Without this, voice-heavy sessions
+        # silently exceed max_num_tokens and crash the engine.
+        audio_tokens = sum(t.audio_tokens for t in handle.turns)
+        return (self._count_tokens(sys_prompt + "\n" + body)
+                + tool_tokens + audio_tokens)
 
     def _summarize(self, text: str) -> str:
         """Run a throwaway summarizer conversation. Returns a short summary or
@@ -479,11 +517,13 @@ class LiteRTChatService:
             "summary_preview": summary[:160] + ("…" if len(summary) > 160 else ""),
         }
 
-    def _run_turn(self, handle: "ConversationHandle", user_label: str, sender) -> Iterator[dict]:
+    def _run_turn(self, handle: "ConversationHandle", user_label: str, sender,
+                  audio_tokens: int = 0) -> Iterator[dict]:
         """Drive one chunk-iterator turn, accumulating the assistant text into
         the handle's history. Pre-turn AND post-turn compaction guard the
-        4096-token wall: pre-turn protects this turn's generation, post-turn
-        sets up headroom for the next one."""
+        token wall: pre-turn protects this turn's generation, post-turn
+        sets up headroom for the next one. `audio_tokens` is an estimate
+        of the audio embedding cost for this turn — see TurnRecord docstring."""
         # Pre-turn compaction: if the conversation is already over the
         # threshold, the incoming turn will likely overflow the budget
         # mid-generation and silently stall. Compact first.
@@ -494,7 +534,8 @@ class LiteRTChatService:
         except Exception:
             log.exception("pre-turn compaction failed; continuing without it")
 
-        turn = TurnRecord(user_text=user_label[:2000])  # cap; not persisted
+        turn = TurnRecord(user_text=user_label[:2000],
+                          audio_tokens=audio_tokens)
         handle.turns.append(turn)
 
         # Record user side now (memory is journal-first; mem0 ingestion

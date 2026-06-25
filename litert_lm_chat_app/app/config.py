@@ -21,7 +21,7 @@ class Settings(BaseSettings):
     litert_cache_dir: str | None = 'runtime/litert_cache'
     litert_system_prompt: str = (
         "CRITICAL RULES:\n"
-        "1. Your name is Nova. The user's name is NOT Nova. Address the user as 'you' or by their actual name.\n"
+        "1. Your name is Nova. Address the user as 'you' or by their actual name.\n"
         "2. NEVER start a reply with 'Nova' or 'Nova,'. NEVER call the user Nova.\n"
         "3. You DO have live web access via the tools listed below. NEVER say 'I don't have access to the "
         "internet', 'I can't search the web', or 'I don't have real-time information'. If a question needs "
@@ -85,7 +85,7 @@ class Settings(BaseSettings):
     # turns; too large (e.g. 16384) OOMs a 4 GB GPU at startup. 4096 is the
     # safe sweet spot for E2B on a 4 GB card (~6-8 tool turns of headroom).
     # Bump to 8192-16384 if you have ≥8 GB VRAM.
-    litert_max_num_tokens: int = 4096
+    litert_max_num_tokens: int = 2048
     audio_prompt_hint: str = (
         'Respond conversationally to what the user just said. If they asked about anything '
         'time-sensitive (news, sports, weather, prices, schedules, current events), call the '

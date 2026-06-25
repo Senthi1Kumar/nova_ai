@@ -23,3 +23,8 @@ runtime/
 # IDE
 .vscode/
 .idea/
+
+# Misc
+e2b_peek/
+*.sqlite
+*.nsys-rep
