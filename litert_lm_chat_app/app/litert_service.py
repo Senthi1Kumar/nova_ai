@@ -4,7 +4,7 @@ import logging
 import os
 import threading
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Iterator, Optional
 
@@ -75,6 +75,12 @@ class TurnRecord:
     assistant_text: str = ""
     tool_chars: int = 0
     audio_tokens: int = 0
+    # Captured per-turn so (a) the in-process compaction summariser can render
+    # them inline in the transcript it feeds the model, and (b) they get
+    # forwarded to memory.add_turn(... tool_calls=) so the daily diary records
+    # them. Without this the diary always says "no tools used" on tool-heavy
+    # sessions because neither summariser ever sees the calls.
+    tool_events: list[dict] = field(default_factory=list)
 
 
 @dataclass
@@ -385,13 +391,22 @@ class LiteRTChatService:
         interprets audio natively, no STT transcript exists), so for the
         summariser we replace it with a label that signals "user spoke" — the
         assistant_text below carries the semantic content the summariser uses
-        to extract facts."""
+        to extract facts. Tool calls are inlined between User and Assistant
+        lines so the summariser can populate a TOOLS section accurately."""
         lines = []
         for t in turns:
             user_repr = t.user_text
             if user_repr.startswith("[voice]"):
                 user_repr = "(user voice message)"
             lines.append(f"User: {user_repr}")
+            for ev in t.tool_events:
+                if ev.get("kind") == "tool_call":
+                    args_repr = str(ev.get("args", ""))[:200]
+                    lines.append(f"Tool call: {ev.get('name','')}({args_repr})")
+                elif ev.get("kind") == "tool_result":
+                    summary = (ev.get("summary") or "")[:200]
+                    ok = ev.get("ok", True)
+                    lines.append(f"Tool result: {ev.get('name','')} ok={ok} → {summary}")
             if t.assistant_text:
                 lines.append(f"Assistant: {t.assistant_text}")
         return "\n".join(lines)
@@ -441,10 +456,60 @@ class LiteRTChatService:
             log.warning("summarizer failed: %s", exc)
             return ""
 
+    def _build_messages_from_turns(self, turns: list["TurnRecord"],
+                                   summary_prefix: Optional[str] = None) -> list[dict]:
+        """Reconstruct a `messages=[...]` payload from in-memory turn records.
+        If `summary_prefix` is given, insert it as a pseudo-assistant turn
+        right after the system prompt (used to fold compacted history back
+        in). Voice turns get a textual placeholder since original audio
+        bytes weren't retained."""
+        msgs: list[dict] = [
+            {"role": "system",
+             "content": [{"type": "text", "text": self._build_system_prompt()}]},
+        ]
+        if summary_prefix:
+            msgs.append({"role": "assistant",
+                         "content": [{"type": "text",
+                                      "text": f"(memory of prior conversation)\n{summary_prefix}"}]})
+        for t in turns:
+            user_repr = t.user_text
+            if user_repr.startswith("[voice]"):
+                user_repr = "(voice message from the user — see my reply for context)"
+            msgs.append({"role": "user",
+                         "content": [{"type": "text", "text": user_repr}]})
+            if t.assistant_text:
+                msgs.append({"role": "assistant",
+                             "content": [{"type": "text", "text": t.assistant_text}]})
+        return msgs
+
+    def _open_conversation(self, messages: list[dict]) -> object:
+        """Open a fresh LiteRT conversation with the given message history.
+        Caller is responsible for having already closed any prior conv on
+        this engine (LiteRT-LM allows only one conversation at a time)."""
+        cm = self.engine.create_conversation(
+            messages=messages, tools=DEFAULT_TOOLS,
+            enable_constrained_decoding=True)
+        conv = cm.__enter__()
+        setattr(conv, "_litert_context_manager", cm)
+        return conv
+
     def _maybe_compact(self, handle: "ConversationHandle") -> Optional[dict]:
-        """Check usage; if over threshold, summarize old turns and rebuild the
+        """Check usage; if over threshold, summarise old turns and rebuild the
         conversation. Returns a synthetic SSE-shaped chunk describing the
-        compaction so the caller can pass it through to the client, or None."""
+        compaction so the caller can pass it through to the client, or None.
+
+        LiteRT-LM allows ONE conversation per engine at any time. The user's
+        main conv MUST be closed before the summariser spins up its
+        throwaway conv — otherwise the engine returns FAILED_PRECONDITION or
+        (worse, with MTP on) corrupts state and the next allocation aborts
+        with `double free or corruption`. Ordering is therefore:
+
+            1. close the user's conv (engine becomes single-tenant)
+            2. run the summariser    (opens + closes its own throwaway conv)
+            3. open rebuilt conv     (summary + recent turns)
+            4. on any failure in 2/3, fail-open: reopen with full history
+               from `handle.turns` so the session isn't lost.
+        """
         if self.engine is None or len(handle.turns) <= self._KEEP_RECENT_TURNS + 1:
             return None
         budget = int(self.settings.litert_max_num_tokens)
@@ -456,50 +521,48 @@ class LiteRTChatService:
                  used, budget, 100 * used / budget)
         old_turns = handle.turns[:-self._KEEP_RECENT_TURNS]
         recent_turns = handle.turns[-self._KEEP_RECENT_TURNS:]
-        summary = self._summarize(self._serialize_turns(old_turns))
-        if not summary:
-            log.warning("compaction: summarizer returned empty; aborting")
-            return None
+        all_turns_snapshot = list(handle.turns)  # for fail-open restore
 
-        # Rebuild conversation with the summary as a pseudo-assistant turn.
-        new_messages = [
-            {"role": "system",
-             "content": [{"type": "text", "text": self.settings.litert_system_prompt}]},
-            {"role": "assistant",
-             "content": [{"type": "text",
-                          "text": f"(memory of prior conversation)\n{summary}"}]},
-        ]
-        for t in recent_turns:
-            # Voice turns store "[voice]" as user_text (Gemma-4 interprets the
-            # audio natively, so there's no transcript). Replaying that literal
-            # string after compaction feeds the model noise. Substitute a brief
-            # placeholder that conveys "user spoke; my reply below carries the
-            # substance" — the assistant_text holds the actual semantic content.
-            user_repr = t.user_text
-            if user_repr.startswith("[voice]"):
-                user_repr = "(voice message from the user — see my reply for context)"
-            new_messages.append({"role": "user",
-                                 "content": [{"type": "text", "text": user_repr}]})
-            if t.assistant_text:
-                new_messages.append({"role": "assistant",
-                                     "content": [{"type": "text", "text": t.assistant_text}]})
-
+        # Step 1: close the user's conv so the engine is single-tenant.
         old_cm = getattr(handle.conversation, "_litert_context_manager", None)
-        try:
-            new_cm = self.engine.create_conversation(messages=new_messages, tools=DEFAULT_TOOLS)
-            new_conv = new_cm.__enter__()
-            setattr(new_conv, "_litert_context_manager", new_cm)
-        except Exception:
-            log.exception("compaction: failed to build new conversation; keeping old one")
-            return None
-
         if old_cm is not None:
             try:
                 old_cm.__exit__(None, None, None)
             except Exception:
-                pass
+                log.exception("compaction: old conv close raised; proceeding")
+        handle.conversation = None  # explicit teardown marker
 
-        handle.conversation = new_conv
+        # Step 2: summariser — now safe (engine has no open conv).
+        summary = ""
+        try:
+            summary = self._summarize(self._serialize_turns(old_turns))
+        except Exception:
+            log.exception("compaction: summariser raised; will fail-open")
+
+        if not summary:
+            log.warning("compaction: summary empty; restoring full history (no compaction this turn)")
+            try:
+                handle.conversation = self._open_conversation(
+                    self._build_messages_from_turns(all_turns_snapshot))
+            except Exception:
+                log.exception("compaction: fail-open rebuild ALSO failed; conversation lost")
+                # handle.conversation stays None; next send raises and the
+                # caller surfaces the error to the client.
+            return None
+
+        # Step 3: open rebuilt conv with summary + recent turns.
+        try:
+            handle.conversation = self._open_conversation(
+                self._build_messages_from_turns(recent_turns, summary_prefix=summary))
+        except Exception:
+            log.exception("compaction: rebuilt conv creation failed; restoring full history")
+            try:
+                handle.conversation = self._open_conversation(
+                    self._build_messages_from_turns(all_turns_snapshot))
+            except Exception:
+                log.exception("compaction: fail-open rebuild ALSO failed; conversation lost")
+            return None
+
         compacted_count = len(old_turns)
         handle.turns = list(recent_turns)
         new_used = self._conversation_token_count(handle)
@@ -520,10 +583,14 @@ class LiteRTChatService:
     def _run_turn(self, handle: "ConversationHandle", user_label: str, sender,
                   audio_tokens: int = 0) -> Iterator[dict]:
         """Drive one chunk-iterator turn, accumulating the assistant text into
-        the handle's history. Pre-turn AND post-turn compaction guard the
-        token wall: pre-turn protects this turn's generation, post-turn
-        sets up headroom for the next one. `audio_tokens` is an estimate
-        of the audio embedding cost for this turn — see TurnRecord docstring."""
+        the handle's history. Compaction runs PRE-TURN only — post-turn
+        compaction (previously here) races against in-flight engine state
+        because LiteRT-LM doesn't guarantee the C++ stream iterator is
+        fully torn down the instant the Python for-loop exits. Deferring
+        the budget check to the next turn's pre-compact is safe because
+        the engine is quiescent at that point. `audio_tokens` is an
+        estimate of the audio embedding cost for this turn — see
+        TurnRecord docstring."""
         # Pre-turn compaction: if the conversation is already over the
         # threshold, the incoming turn will likely overflow the budget
         # mid-generation and silently stall. Compact first.
@@ -561,12 +628,32 @@ class LiteRTChatService:
                                 pass
                             first_token_seen = True
                         turn.assistant_text += txt
-                    # Accumulate tool weight so compaction sees real budget use.
+                    # Capture tool events: (a) accumulate `tool_chars` so
+                    # compaction sees real budget use; (b) append a structured
+                    # record to `turn.tool_events` so the diary + in-process
+                    # summariser can see what tools fired.
                     for kind, payload in extract_tool_events(chunk):
                         if kind == "tool_call":
-                            turn.tool_chars += len(str(payload.get("args") or "")) + 40
+                            args_str = str(payload.get("args") or "")
+                            turn.tool_chars += len(args_str) + 40
+                            turn.tool_events.append({
+                                "kind": "tool_call",
+                                "name": payload.get("name", ""),
+                                "args": payload.get("args", {}),
+                            })
                         elif kind == "tool_result":
-                            turn.tool_chars += len(str(payload.get("content") or payload.get("result") or "")) + 20
+                            # extract_tool_events normalises the result payload
+                            # to {name, ok, summary} — use 'summary' (was a
+                            # latent bug: the old code looked for 'content'/
+                            # 'result' which aren't present after extraction).
+                            summary_str = str(payload.get("summary") or "")
+                            turn.tool_chars += len(summary_str) + 20
+                            turn.tool_events.append({
+                                "kind": "tool_result",
+                                "name": payload.get("name", ""),
+                                "ok": payload.get("ok", True),
+                                "summary": summary_str[:400],
+                            })
                     yield chunk
             # Memory: persist assistant text to the in-memory journal only.
             # mem0 fact-extraction is DEFERRED to session close — LiteRT-LM
@@ -575,17 +662,18 @@ class LiteRTChatService:
             # open. See MemoryLayer.batch_ingest() + close_all_sessions().
             if self._memory is not None and turn.assistant_text:
                 try:
-                    self._memory.add_turn("assistant", turn.assistant_text)
+                    # Forward tool_events so the journal records them and the
+                    # diary summariser can populate its TOOLS: section instead
+                    # of always saying 'no tools used'.
+                    self._memory.add_turn(
+                        "assistant", turn.assistant_text,
+                        tool_calls=list(turn.tool_events) or None,
+                    )
                 except Exception:
                     log.exception("memory.add_turn(assistant) failed; non-fatal")
-            # After stream drain — check budget, compact if needed.
-            try:
-                with nvtx_range("engine.post_compact"):
-                    event = self._maybe_compact(handle)
-                if event is not None:
-                    yield event
-            except Exception:
-                log.exception("compaction failed; leaving conversation as-is")
+            # Post-turn compaction deliberately removed — see _run_turn
+            # docstring. Pre-turn compaction at the start of turn N+1
+            # handles the budget check after this turn is fully drained.
 
         return iterator()
 

@@ -29,12 +29,73 @@ log = logging.getLogger("litert_app.tools")
 
 # ── Bridge proxies: IResearcher FastMCP sidecar ──────────────────────────────
 
-_MCP_RESULT_CAP = 2500  # chars; ~ 625 tokens. Bumped from 1500 — at the lower
-                        # cap Gemma-4-E2B only saw 2-3 truncated snippets and
-                        # produced hedging "available through various sources"
-                        # replies. Compaction (0.50 ratio + tool weight tally
-                        # via TurnRecord.tool_chars) keeps this safe under the
-                        # 4096-token wall.
+# Outer safety net — applied AFTER per-search compaction. Hit only when the
+# tool's payload isn't a parseable search-result shape and falls through the
+# compactor unchanged. 2500 chars ≈ 625 tokens; compaction (0.50 ratio + tool
+# weight tally via TurnRecord.tool_chars) keeps it safe under the 4096-token
+# wall.
+_MCP_RESULT_CAP = 2500
+
+# Per-search-result caps used by _compact_search_results. Gemma-4-E2B is small
+# enough (2.3B effective params) that a richer payload becomes regurgitation
+# material — the model copy-pastes titles/dates/URLs verbatim instead of
+# synthesising. Capping the model's view to 3 short description fragments
+# forces it to compose its own sentences (mechanical, not instruction-based).
+# Brave is still called with the user-requested num_results; the sidecar
+# pre-trims to its own limit; we trim further on receive to what the model
+# sees. The proper fix is constrained-decoding + per-intent fine-tune in v0.2.
+_MAX_RESULTS_TO_MODEL = 3
+_MAX_DESC_CHARS = 150
+
+
+def _compact_search_results(raw: str) -> str:
+    """Distill a Brave/Serper-style JSON results blob down to just descriptions.
+
+    Returns the original `raw` unchanged on any parse failure or shape it
+    doesn't recognise — safe to use on every tool result (including
+    add_numbers, error strings, etc.) without breaking them.
+    """
+    try:
+        data = json.loads(raw)
+    except (json.JSONDecodeError, ValueError):
+        return raw
+
+    candidates: list = []
+    if isinstance(data, list):
+        candidates = data
+    elif isinstance(data, dict):
+        for key in ("results", "web", "news", "organic", "items", "shopping_results"):
+            v = data.get(key)
+            if isinstance(v, list) and v:
+                candidates = v
+                break
+
+    if not candidates or not any(
+        isinstance(r, dict) and (r.get("description") or r.get("snippet") or r.get("content"))
+        for r in candidates
+    ):
+        return raw
+
+    compact: list[dict] = []
+    for r in candidates[:_MAX_RESULTS_TO_MODEL]:
+        if not isinstance(r, dict):
+            continue
+        snippet = (r.get("description") or r.get("snippet") or r.get("content") or "").strip()
+        if not snippet:
+            continue
+        compact.append({"snippet": snippet[:_MAX_DESC_CHARS]})
+
+    if not compact:
+        return raw
+
+    out = {
+        "_hint": ("Synthesise these snippets into 2-3 short spoken sentences. "
+                  "Don't quote titles, URLs, dates, or any verbatim phrases."),
+        "snippets": compact,
+    }
+    log.info("compacted search result: %d candidates → %d snippets (was %d chars)",
+             len(candidates), len(compact), len(raw))
+    return json.dumps(out, ensure_ascii=False)
 
 
 def _mcp_proxy(tool_name: str, args: dict, label: str) -> str:
@@ -49,6 +110,12 @@ def _mcp_proxy(tool_name: str, args: dict, label: str) -> str:
     except Exception as exc:
         log.exception("MCP %s failed", tool_name)
         return f"{label} failed: {exc}"
+
+    # Per-search compaction first (drops titles/URLs/dates, caps to N snippets),
+    # then the outer char cap as a safety net for any non-search shape that
+    # falls through unchanged.
+    raw = _compact_search_results(raw)
+
     if len(raw) > _MCP_RESULT_CAP:
         log.warning("MCP %s result truncated: %d → %d chars (~%d tokens saved)",
                     tool_name, len(raw), _MCP_RESULT_CAP,

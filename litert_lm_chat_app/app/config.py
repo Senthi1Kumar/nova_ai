@@ -85,7 +85,7 @@ class Settings(BaseSettings):
     # turns; too large (e.g. 16384) OOMs a 4 GB GPU at startup. 4096 is the
     # safe sweet spot for E2B on a 4 GB card (~6-8 tool turns of headroom).
     # Bump to 8192-16384 if you have ≥8 GB VRAM.
-    litert_max_num_tokens: int = 2048
+    litert_max_num_tokens: int = 4096
     audio_prompt_hint: str = (
         'Respond conversationally to what the user just said. If they asked about anything '
         'time-sensitive (news, sports, weather, prices, schedules, current events), call the '

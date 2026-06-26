@@ -359,6 +359,23 @@ class MemoryLayer:
         for t in snapshot["turns"]:
             who = "User" if t["role"] == "user" else "Nova"
             lines.append(f"- {who}: {t['text']}")
+            # Render any tool calls attached to this turn so the LLM
+            # summariser can populate the TOOLS: section accurately.
+            # Without this it sees only user/assistant text and reports
+            # "no tools used" even on tool-heavy sessions.
+            for ev in (t.get("tool_calls") or []):
+                kind = ev.get("kind", "")
+                name = ev.get("name", "")
+                if kind == "tool_call":
+                    args_repr = str(ev.get("args", ""))[:180]
+                    lines.append(f"  - tool_call: {name}({args_repr})")
+                elif kind == "tool_result":
+                    summary = (ev.get("summary") or "")[:180]
+                    ok = ev.get("ok", True)
+                    lines.append(f"  - tool_result: {name} ok={ok} → {summary}")
+                else:
+                    # Forward-compat for legacy/alternate event shapes.
+                    lines.append(f"  - tool: {name} {str(ev)[:160]}")
         transcript = "\n".join(lines)[-3000:]
 
         summary: str = ""
