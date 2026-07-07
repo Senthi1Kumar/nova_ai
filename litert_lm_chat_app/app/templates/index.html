@@ -7,7 +7,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Geist:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="/static/styles.css" />
+  <link rel="stylesheet" href="/static/styles.css?v=20260706e" />
 </head>
 <body>
   <div class="ambient" aria-hidden="true">
@@ -23,6 +23,10 @@
     </div>
     <div class="brand-line" aria-hidden="true"></div>
     <div class="hud-meta">
+      <span class="kv"><span class="k">CPU</span><span id="rv-cpu">—</span></span>
+      <span class="kv"><span class="k">RAM</span><span id="rv-ram">—</span></span>
+      <span class="kv"><span class="k">GPU</span><span id="rv-gpu">—</span></span>
+      <span class="kv"><span class="k">VRAM</span><span id="rv-vram">—</span></span>
       <span class="kv"><span class="k">SESSION</span><span id="sessionTag">—</span></span>
       <span class="kv"><span class="k">CLOCK</span><span id="hudClock">--:--</span></span>
       <button id="settingsBtn" class="settings-btn" type="button" aria-label="Engine settings">⚙</button>
@@ -68,6 +72,18 @@
           <span class="tile-sub">Reset context</span>
         </span>
       </button>
+
+      <div class="panel panel-metrics" id="metricsPanel" hidden>
+        <div class="panel-title">LAST TURN</div>
+        <dl class="metrics-grid">
+          <div><dt>TTFT</dt><dd id="m-ttft">—</dd></div>
+          <div><dt>TTFB</dt><dd id="m-total">—</dd></div>
+          <div><dt>Audio</dt><dd id="m-audio">—</dd></div>
+          <div><dt>TTS</dt><dd id="m-tts">—</dd></div>
+          <div><dt>Tokens</dt><dd id="m-tokens">—</dd></div>
+          <div><dt>tok/s</dt><dd id="m-tps">—</dd></div>
+        </dl>
+      </div>
     </aside>
 
     <section class="stage">
@@ -111,17 +127,26 @@
         <div class="model-name" id="statusModel"></div>
       </div>
 
-      <div class="panel panel-metrics" id="metricsPanel" hidden>
-        <div class="panel-title">LAST TURN</div>
-        <dl class="metrics-grid">
-          <div><dt>TTFT</dt><dd id="m-ttft">—</dd></div>
-          <div><dt>TTFB</dt><dd id="m-total">—</dd></div>
-          <div><dt>Audio</dt><dd id="m-audio">—</dd></div>
-          <div><dt>TTS</dt><dd id="m-tts">—</dd></div>
-          <div><dt>Tokens</dt><dd id="m-tokens">—</dd></div>
-          <div><dt>tok/s</dt><dd id="m-tps">—</dd></div>
+      <div class="panel" id="vehiclePanel">
+        <div class="panel-title">VEHICLE</div>
+        <dl class="metrics-grid veh-grid">
+          <div><dt>Cabin</dt><dd id="v-temp">—</dd></div>
+          <div><dt>HVAC</dt><dd id="v-hvac">—</dd></div>
+          <div><dt>Sunroof</dt><dd id="v-sunroof">—</dd></div>
+          <div><dt>Windows</dt><dd id="v-windows">—</dd></div>
+          <div><dt>Fuel</dt><dd id="v-fuel">—</dd></div>
+          <div><dt>Range</dt><dd id="v-range">—</dd></div>
+          <div><dt>Battery</dt><dd id="v-batt">—</dd></div>
+          <div><dt>Media</dt><dd id="v-media">—</dd></div>
         </dl>
+        <div class="veh-lists">
+          <div class="veh-list-title">REMINDERS</div>
+          <ul id="v-reminders" class="veh-list"><li class="veh-empty">none</li></ul>
+          <div class="veh-list-title">CALENDAR</div>
+          <ul id="v-events" class="veh-list"><li class="veh-empty">none</li></ul>
+        </div>
       </div>
+
     </aside>
   </main>
 
@@ -200,6 +225,6 @@
     </div>
   </div>
 
-  <script src="/static/app.js"></script>
+  <script src="/static/app.js?v=20260706e"></script>
 </body>
 </html>

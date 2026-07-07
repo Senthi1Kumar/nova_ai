@@ -888,3 +888,46 @@ button { font-family: inherit; }
   .rail { display: none; }
   .modal-grid { grid-template-columns: 1fr; }
 }
+
+/* ── Vehicle panel (simulated CAN/OBD) ─────────────────────────────────── */
+.veh-grid dd { text-transform: lowercase; }
+.veh-lists { margin-top: 10px; }
+.veh-list-title {
+  font-size: 10px; letter-spacing: 0.12em; opacity: 0.55;
+  margin: 8px 0 4px;
+}
+.veh-list {
+  list-style: none; margin: 0; padding: 0;
+  font-size: 12px; line-height: 1.5;
+}
+.veh-list li {
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  opacity: 0.85;
+}
+.veh-empty { opacity: 0.35; font-style: italic; }
+
+/* ── Top-bar system rings (CPU/RAM/GPU/VRAM, --p = 0..100) ─────────────── */
+.sys-rings { display: flex; gap: 8px; align-items: center; margin-right: 14px; }
+.sysring { position: relative; width: 40px; height: 40px; }
+.sysring .ring-arc {
+  position: absolute; inset: 0; border-radius: 50%;
+  background: conic-gradient(#7ee0c0 calc(var(--p, 0) * 1%),
+                              rgba(255, 255, 255, 0.09) 0);
+  -webkit-mask: radial-gradient(farthest-side, transparent 68%, #000 70%);
+  mask: radial-gradient(farthest-side, transparent 68%, #000 70%);
+  transition: background 0.6s ease;
+}
+.sysring.ring-hot .ring-arc {
+  background: conic-gradient(#ff7a6e calc(var(--p, 0) * 1%),
+                              rgba(255, 255, 255, 0.09) 0);
+}
+.sysring .ring-txt {
+  position: absolute; inset: 0; display: flex; flex-direction: column;
+  align-items: center; justify-content: center; line-height: 1.1;
+}
+.sysring .ring-k { font-size: 6.5px; letter-spacing: 0.08em; opacity: 0.55; }
+.sysring .ring-v { font-size: 10px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.sysring .ring-v::after { content: '%'; font-size: 7px; opacity: 0.6; }
+
+/* LAST TURN now lives in the left rail */
+.rail-left .panel-metrics { margin-top: 12px; }

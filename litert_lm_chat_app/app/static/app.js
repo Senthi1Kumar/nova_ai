@@ -692,3 +692,71 @@ setInterval(tickClock, 30_000);
 })();
 
 setInterval(checkHealth, 5000);
+
+// ── Vehicle state panel (simulated CAN/OBD via /api/vehicle/state) ────────
+
+async function pollVehicle() {
+  try {
+    const res = await fetch('/api/vehicle/state');
+    if (!res.ok) return;
+    const { state, reminders, events } = await res.json();
+    const set = (id, v) => {
+      const el = document.getElementById(id);
+      if (el && v !== undefined && v !== null && v !== '') el.textContent = v;
+    };
+    set('v-temp', `${state.cabin_temp_c}°C`);
+    // Per-zone climate: "D:on 21° · P:off · R:on 20°"
+    if (state.hvac_zones) {
+      const zt = state.zone_temp_c || {};
+      set('v-hvac', ['driver', 'passenger', 'rear'].map(z => {
+        const on = state.hvac_zones[z] === 'on';
+        return `${z[0].toUpperCase()}:${on ? `on ${Math.round(zt[z] ?? 0)}°` : 'off'}`;
+      }).join(' · '));
+    } else {
+      set('v-hvac', state.hvac_mode);
+    }
+    set('v-sunroof', state.sunroof);
+    set('v-windows', state.windows);
+    set('v-fuel', `${state.fuel_level_pct}%`);
+    set('v-range', `${state.range_km} km`);
+    set('v-batt', `${state.battery_soc_pct}%`);
+    set('v-media', state.media === 'off' ? 'off'
+      : `${state.media}${state.media_content ? ': ' + state.media_content : ''}`);
+    const esc = (s) => String(s).replace(/[<>&]/g, c =>
+      ({ '<': '&lt;', '>': '&gt;', '&': '&amp;' }[c]));
+    const fill = (id, rows, fmt) => {
+      const ul = document.getElementById(id);
+      if (!ul) return;
+      ul.innerHTML = rows.length
+        ? rows.slice(0, 4).map(r => `<li>${fmt(r)}</li>`).join('')
+        : '<li class="veh-empty">none</li>';
+    };
+    fill('v-reminders', reminders, r =>
+      `${esc(r.text)}${r.trigger ? ' · ' + esc(r.trigger) : ''}`);
+    fill('v-events', events, e => `${esc(e.title)} · ${esc(e.start_ts)}`);
+  } catch { /* app may still be starting; next poll retries */ }
+}
+pollVehicle();
+setInterval(pollVehicle, 3000);
+
+// ── System stats panel (CPU / RAM / GPU via /api/system/stats) ───────────
+
+async function pollSystem() {
+  try {
+    const res = await fetch('/api/system/stats');
+    if (!res.ok) return;
+    const s = await res.json();
+    const set = (id, v) => {
+      const el = document.getElementById(`rv-${id}`);
+      if (el) el.textContent = v == null ? '—' : v;
+    };
+    set('cpu', s.cpu_pct == null ? null : `${Math.round(s.cpu_pct)}%`);
+    set('ram', s.ram_used_gb == null ? null
+      : `${s.ram_used_gb}/${s.ram_total_gb}G`);
+    set('gpu', s.gpu.util_pct == null ? null : `${s.gpu.util_pct}%`);
+    set('vram', s.gpu.used_mb == null ? null
+      : `${(s.gpu.used_mb / 1024).toFixed(1)}/${(s.gpu.total_mb / 1024).toFixed(1)}G`);
+  } catch { /* retried on next poll */ }
+}
+pollSystem();
+setInterval(pollSystem, 3000);

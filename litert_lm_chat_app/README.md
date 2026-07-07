@@ -132,6 +132,10 @@ button, speak, release.
 - `POST /api/voice/chat/stream` — native-audio voice pipeline SSE
 - `POST /api/voice/chat` — non-streaming voice (returns one WAV URL)
 - `POST /api/tts` — synthesize text to a WAV file
+- `GET /api/vehicle/state` — simulated CAN/OBD state (HVAC zones, sunroof/windows,
+  battery, fuel, media) + reminders + calendar events, from `app/vehicle_db.py`
+- `GET /api/system/stats` — host CPU%, RAM used/total, GPU util%/VRAM (via
+  `psutil` + `nvidia-smi`), polled by the top-bar HUD every 3s
 
 ## Voice streaming event order
 
@@ -190,6 +194,31 @@ connect to the same endpoint — the sidecar exposes the full tool set:
 
 The chat app registers only `web_search` + `google_search` in
 `DEFAULT_TOOLS`; the rest are available for other clients.
+
+## In-vehicle demo layer (vehicle store + tool router)
+
+`app/vehicle_db.py` is a small SQLite-backed simulated CAN/OBD store
+(`runtime/vehicle.db`) backing the 12-tool IVA toolbox: HVAC per-zone
+on/off + temp with sunroof/window interlocks (both auto-close whenever any
+HVAC zone is on), reminders and calendar events resolved against the host
+clock. `app/vehicle_tools.py` routes each tool call through it first,
+falling back to an acknowledge-only stub for unhandled tools. Poll current
+state at `GET /api/vehicle/state`; it's rendered in the right-rail VEHICLE
+panel and refreshed every 3s.
+
+`NOVA_TOOL_ROUTER` (see `.env.example`) enables a lightweight per-turn
+lexical tool router (SkillWeaver-style): instead of binding all 12 tools on
+every prefill, it scores tools by name/param/description token overlap
+against the current turn and rebinds only the top-k, rebuilding the
+conversation when the routed set changes. It currently only fires on text
+turns — Gemma-4 ingests voice natively with no transcript to route on, so
+voice turns keep the full toolbox bound.
+
+`NOVA_MAX_REPLY_CHARS` caps a single assistant reply; past that length (or
+on detecting leaked template markers / short-tail repetition from an
+unterminated tool-call arg) the stream is drained-and-discarded rather than
+broken off, since abandoning the LiteRT-LM generator mid-decode corrupts
+the engine.
 
 ## Persistent memory layer (mem0 + pgvector)
 
@@ -343,3 +372,14 @@ LITERT_MAX_NUM_TOKENS=16384     # ≥ 8 GB GPU
 weights + KV cache). Set `LITERT_VISION_BACKEND=CPU` in `.env` — the
 vision encoder is small (~100 MB), CPU runs it in well under a second,
 and it stops competing for VRAM.
+
+**`Fatal glibc error: malloc.c:4241 (_int_malloc): assertion failed` /
+`free(): invalid next size` crashes the whole process (not just the
+turn).** Heap corruption inside the LiteRT-LM C++ engine, typically
+surfacing after a degenerate decode (unterminated tool-call arg → runaway
+generation) even though the app-level runaway guard (`NOVA_MAX_REPLY_CHARS`)
+contains the visible symptom. Not fixable from Python — this is the
+open item in `docs/app-audit-2026-07-06.md` priority queue #4. If it's
+frequent on your model/build, worth evaluating an alternative on-device
+runtime (e.g. Cactus) for the affected model rather than chasing it
+further inside LiteRT-LM.

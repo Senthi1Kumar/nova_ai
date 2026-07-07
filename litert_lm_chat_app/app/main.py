@@ -391,6 +391,53 @@ def health():
     return data
 
 
+@app.get("/api/system/stats")
+def system_stats():
+    """Host CPU / RAM / GPU usage for the UI SYSTEM panel. GPU comes from
+    nvidia-smi (the LiteRT OpenCL backend runs on the NVIDIA card); fields
+    are null when a source is unavailable so the UI can show em-dashes."""
+    out = {"cpu_pct": None, "ram_used_gb": None, "ram_total_gb": None,
+           "gpu": {"used_mb": None, "total_mb": None, "util_pct": None}}
+    try:
+        import psutil
+        out["cpu_pct"] = psutil.cpu_percent(interval=None)
+        vm = psutil.virtual_memory()
+        out["ram_used_gb"] = round((vm.total - vm.available) / 1e9, 1)
+        out["ram_total_gb"] = round(vm.total / 1e9, 1)
+    except Exception:
+        try:  # stdlib fallback
+            out["cpu_pct"] = round(os.getloadavg()[0] / (os.cpu_count() or 1) * 100, 1)
+            mem = {l.split(":")[0]: int(l.split()[1])
+                   for l in open("/proc/meminfo") if ":" in l}
+            out["ram_total_gb"] = round(mem["MemTotal"] * 1024 / 1e9, 1)
+            out["ram_used_gb"] = round(
+                (mem["MemTotal"] - mem["MemAvailable"]) * 1024 / 1e9, 1)
+        except Exception:
+            pass
+    try:
+        import subprocess
+        q = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.used,memory.total,utilization.gpu",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=2)
+        used, total, util = (int(x) for x in q.stdout.split("\n")[0].split(","))
+        out["gpu"] = {"used_mb": used, "total_mb": total, "util_pct": util}
+    except Exception:
+        pass
+    return out
+
+
+@app.get("/api/vehicle/state")
+def vehicle_state():
+    """Simulated CAN/OBD snapshot + reminders + calendar from the SQLite
+    store the IVA tools read/write (app/vehicle_db.py). Backs the upcoming
+    dashboard strip in the UI; also handy for curl during voice testing."""
+    from app.vehicle_db import get_events, get_reminders, get_state, init_db
+    init_db()
+    return {"state": get_state(), "reminders": get_reminders(),
+            "events": get_events()}
+
+
 @app.get("/api/debug/system_prompt", response_class=PlainTextResponse)
 def debug_system_prompt():
     """Return what Gemma actually sees as the system prompt right now.
@@ -426,6 +473,26 @@ def debug_tool(req: DebugToolReq):
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"tool failed: {exc}") from exc
     return {"name": req.name, "args": req.args, "result_chars": len(raw), "result": raw}
+
+
+class EvalRawRequest(BaseModel):
+    prompt: str
+    max_new_tokens: int = 256
+
+
+@app.post("/api/eval/raw")
+async def eval_raw(req: EvalRawRequest):
+    """Eval-harness only: raw first-turn generation, bypassing Nova's system
+    prompt/memory/tools wrapper entirely (spec §5). The device receives the
+    final host-rendered prompt string verbatim via a raw litert_lm Session
+    (apply_prompt_template=False) — see LiteRTChatService.generate_raw_text.
+    Closes any active chat session first (single-tenant engine)."""
+    try:
+        result = await asyncio.to_thread(
+            chat_service.generate_raw_text, req.prompt, req.max_new_tokens)
+        return result
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
 
 
 class ReconfigRequest(BaseModel):

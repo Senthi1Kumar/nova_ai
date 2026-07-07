@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import os
 import threading
+import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -13,6 +14,11 @@ from app.profiling import nvtx_range
 from app.tools import (
     add_numbers,
     web_search,
+)
+from app.vehicle_tools import (
+    build_vehicle_tools,
+    ToolCallCapture,
+    synthesize_confirmation,
 )
 # Dormant fallbacks — re-import + add to DEFAULT_TOOLS to re-enable.
 # Small models (Gemma-4-E2B) tool-call more reliably with ONE web tool than
@@ -30,6 +36,7 @@ log = logging.getLogger("litert_app.service")
 _DEBUG_CHUNKS = os.environ.get("LITERT_DEBUG_CHUNKS", "").lower() in ("1", "true", "yes")
 
 try:
+    # pyrefly: ignore [missing-import]
     import litert_lm
 except Exception:
     litert_lm = None  # type: ignore
@@ -37,6 +44,27 @@ except Exception:
 
 class LiteRTNotReady(RuntimeError):
     pass
+
+
+# Runaway-generation guard thresholds (see stream() in _run_turn).
+_RUNAWAY_MAX_CHARS = int(os.environ.get("NOVA_MAX_REPLY_CHARS", "1500"))
+_RUNAWAY_KEEP_CHARS = 600  # what survives into history/TTS after a cut
+
+
+def _looks_runaway(text: str) -> bool:
+    """Detect degenerate generation mid-stream: hard length cap, leaked
+    tool-call template markers (only appear as *text* when a call was
+    malformed — well-formed calls are swallowed by the engine), or a short
+    tail repeating itself (greedy-decode loops)."""
+    if len(text) >= _RUNAWAY_MAX_CHARS:
+        return True
+    if "<|tool_call>" in text or '<|"|>' in text:
+        return True
+    if len(text) > 400:
+        probe = text[-60:]
+        if probe.strip() and text[-1200:].count(probe) >= 3:
+            return True
+    return False
 
 
 DEFAULT_TOOLS = [
@@ -89,6 +117,12 @@ class ConversationHandle:
     conversation: object
     lock: threading.Lock
     turns: list[TurnRecord] = None   # type: ignore[assignment]
+    # Latest compaction summary — kept here so a tool-router rebind can
+    # rebuild the conversation without losing compacted memory.
+    summary: str = ""
+    # Tool names currently bound to the live conversation (router rebinds
+    # only when the routed set differs — a rebuild costs a full re-prefill).
+    bound_tool_names: frozenset = frozenset()
 
     def __post_init__(self):
         if self.turns is None:
@@ -109,6 +143,10 @@ class LiteRTChatService:
         self._conversations: Dict[str, ConversationHandle] = {}
         self._global_lock = threading.Lock()
         self.ready_error: Optional[str] = None
+        # Tools offered to every conversation. Web tools always; the trained IVA
+        # toolbox is appended at start() once the engine is up. Without the IVA
+        # tools the fine-tuned model refuses in-cabin commands (nothing to call).
+        self._chat_tools: list = list(DEFAULT_TOOLS)
         # Optional memory layer (SessionJournal + mem0). Wired by main.py
         # after the engine + shim are ready. None = memory disabled.
         self._memory = None
@@ -130,6 +168,11 @@ class LiteRTChatService:
         """
         base = self.settings.litert_system_prompt
         if self._memory is None:
+            return base
+        # Kill-switch for A/B-testing model quality without diary recall:
+        # a bad ASR turn journaled yesterday gets re-injected into EVERY
+        # system prompt via PRIOR DAYS and can anchor the model on garbage.
+        if os.environ.get("NOVA_DIARY_DISABLED") == "1":
             return base
 
         parts = [base]
@@ -213,6 +256,35 @@ class LiteRTChatService:
             self._engine_cm = litert_lm.Engine(self.settings.litert_model_path, **kwargs)
             self.engine = self._engine_cm.__enter__()
             self.ready_error = None
+            # Append the trained IVA toolbox so the fine-tuned model actually has
+            # its vehicle tools to call. Failure here degrades to web-only tools
+            # rather than blocking engine startup.
+            try:
+                # Dedupe by tool name so the real callables (e.g. web_search)
+                # win over any same-named IVA stub — otherwise the model sees a
+                # duplicate tool in its toolbox.
+                default_names = {getattr(t, "__name__", None) for t in DEFAULT_TOOLS}
+                iva = [t for t in build_vehicle_tools() if t._name not in default_names]
+                self._chat_tools = list(DEFAULT_TOOLS) + iva
+                # NOVA_TOOLS_SUBSET=vehicle_command,web_search,... keeps only
+                # the named tools. The full 12-schema toolbox renders to ~3.1k
+                # tokens under the runtime jinja template — over 75% of the
+                # 4096-token window — which starves history/generation and
+                # collapses reply quality. Training rendered system+tools to
+                # ~1100 tokens, so a 4-tool subset also better matches the
+                # prompt shape the model was fine-tuned on.
+                subset = os.environ.get("NOVA_TOOLS_SUBSET", "").strip()
+                if subset:
+                    keep = {n.strip() for n in subset.split(",") if n.strip()}
+                    def _tname(t):
+                        return getattr(t, "_name", None) or getattr(t, "__name__", "")
+                    self._chat_tools = [t for t in self._chat_tools if _tname(t) in keep]
+                    log.info("NOVA_TOOLS_SUBSET active: %d tools (%s)",
+                             len(self._chat_tools),
+                             ", ".join(_tname(t) for t in self._chat_tools))
+            except Exception:
+                log.exception("vehicle tool load failed; using web tools only")
+                self._chat_tools = list(DEFAULT_TOOLS)
         except Exception as exc:
             self.ready_error = f"Failed to initialize LiteRT-LM engine: {exc}"
             self.engine = None
@@ -269,6 +341,17 @@ class LiteRTChatService:
         if self.engine is None:
             raise LiteRTNotReady(self.ready_error or "LiteRT-LM engine is not loaded")
 
+        # LiteRT-LM is single-tenant: one conversation per engine. A turn that
+        # died mid-flight can leak its C++ session and wedge every later
+        # create_conversation ("A session already exists"). "New chat" is the
+        # user's recovery gesture, so evict whatever still holds the slot.
+        for stale_sid in list(self._conversations):
+            if stale_sid != session_id:
+                try:
+                    self.close_session(stale_sid)
+                except Exception:
+                    log.exception("new_session: failed closing stale session %s", stale_sid)
+
         sid = session_id or str(uuid.uuid4())
         messages = [
             {
@@ -276,19 +359,28 @@ class LiteRTChatService:
                 "content": [{"type": "text", "text": self._build_system_prompt()}],
             }
         ]
-        conversation_cm = self.engine.create_conversation(messages=messages, tools=DEFAULT_TOOLS, enable_constrained_decoding=True)
+        capture = ToolCallCapture()
+        conversation_cm = self.engine.create_conversation(messages=messages, tools=self._chat_tools, tool_event_handler=capture, enable_constrained_decoding=True)
         conversation = conversation_cm.__enter__()
         setattr(conversation, "_litert_context_manager", conversation_cm)
-        self._conversations[sid] = ConversationHandle(sid, conversation, threading.Lock())
+        setattr(conversation, "_tool_capture", capture)
+        # RLock: the turn iterator holds it across pre-compaction AND the
+        # stream (nested acquire in the stream body), so a concurrent POST or
+        # DELETE can never touch the single-tenant engine mid-turn.
+        self._conversations[sid] = ConversationHandle(sid, conversation, threading.RLock())
         return sid
 
     def close_session(self, session_id: str) -> None:
         handle = self._conversations.pop(session_id, None)
         if not handle:
             return
-        cm = getattr(handle.conversation, "_litert_context_manager", None)
-        if cm:
-            cm.__exit__(None, None, None)
+        # Wait for any in-flight turn/compaction: tearing the conversation
+        # down under a live stream corrupts engine state.
+        with handle.lock:
+            cm = getattr(handle.conversation, "_litert_context_manager", None)
+            if cm:
+                cm.__exit__(None, None, None)
+            handle.conversation = None
 
     def _get_or_create(self, session_id: Optional[str]) -> ConversationHandle:
         if self.engine is None:
@@ -363,6 +455,43 @@ class LiteRTChatService:
 
         return handle.session_id, self._run_turn(handle, user_label=label, sender=_send)
 
+    def generate_raw_text(self, prompt: str, max_new_tokens: int = 256) -> dict:
+        """Eval-only raw generation (POST /api/eval/raw). Closes all chat
+        sessions first (single-tenant engine), then opens a bare Session with
+        `apply_prompt_template=False` — this bypasses Nova's chat template,
+        system prompt, and tool wiring entirely, so `prompt` is fed to the
+        engine byte-for-byte via `run_prefill`. `max_output_tokens` is
+        enforced by the engine itself, and `run_decode_async` terminates on
+        EOS/cap, so no manual truncation is needed. Verified against the
+        litert_lm engine module: `Engine.create_session` maps
+        `apply_prompt_template` straight to the C API's
+        `litert_lm_session_config_set_apply_prompt_template`, and
+        `Session.run_decode_async` yields `interfaces.Responses(texts=[chunk])`
+        per streamed piece (not the dict-shaped chunks `extract_text` expects
+        from the Conversation streaming path — hence the manual `"".join`
+        here instead of reusing `extract_text`)."""
+        if self.engine is None:
+            raise LiteRTNotReady(self.ready_error or "engine not loaded")
+        self.close_all_sessions()
+        t0 = time.time()
+        ttft_ms = None
+        session = self.engine.create_session(
+            apply_prompt_template=False, max_output_tokens=max_new_tokens)
+        try:
+            session.run_prefill([prompt])
+            pieces = []
+            for resp in session.run_decode_async():
+                txt = "".join(resp.texts)
+                if txt:
+                    if ttft_ms is None:
+                        ttft_ms = (time.time() - t0) * 1000
+                    pieces.append(txt)
+            return {"text": "".join(pieces), "ttft_ms": ttft_ms,
+                    "total_ms": (time.time() - t0) * 1000,
+                    "render_mode": "raw"}
+        finally:
+            session.close()
+
     # ---------- shared streaming + history tracking ----------
 
     # ---------- compaction ----------
@@ -373,7 +502,16 @@ class LiteRTChatService:
     # assistant prose), and we want headroom for the NEXT turn's generation
     # before we hit the 4096-token wall. Heavy-tool sessions silently stall
     # mid-stream once the prompt+history exceeds the budget.
-    _COMPACT_RATIO = 0.50
+    # 0.50 was tuned for the 4096-token bundle, where the fixed prompt floor
+    # (tool schemas + diary/system, ~4.2k) barely fit at all. On the 8192
+    # bundle that floor alone crosses 0.50*8192, so compaction fired nearly
+    # EVERY turn, freeing ~300 tokens at the cost of a full summarizer
+    # generation + ~4k re-prefill before the user's turn (felt like a stall).
+    # 0.75 → trigger at ~6.1k used, i.e. only when history genuinely grows.
+    _COMPACT_RATIO = 0.75
+    # Minimum free tokens the NEXT turn needs (voice input + generation).
+    # If free headroom drops below this, compact even under the ratio.
+    _TURN_HEADROOM_TOKENS = 1280
     _SUMMARY_TARGET_TOKENS = 250
 
     def _count_tokens(self, text: str) -> int:
@@ -423,7 +561,28 @@ class LiteRTChatService:
         # silently exceed max_num_tokens and crash the engine.
         audio_tokens = sum(t.audio_tokens for t in handle.turns)
         return (self._count_tokens(sys_prompt + "\n" + body)
-                + tool_tokens + audio_tokens)
+                + tool_tokens + audio_tokens
+                + self._prompt_overhead_tokens())
+
+    def _prompt_overhead_tokens(self) -> int:
+        """Fixed engine-side prompt cost that never appears in turn history:
+        the jinja-rendered tool schemas plus template scaffolding. The engine
+        counts these against max_num_tokens on every prefill, so compaction
+        must too — without this the app sits at "50% used" while the engine
+        rejects the turn ("Input token ids are too long: 4316 >= 4096")."""
+        cached = getattr(self, "_tool_overhead_cache", None)
+        if cached is None:
+            chars = 0
+            for t in self._chat_tools:
+                try:
+                    chars += len(str(t.get_tool_description()))
+                except Exception:
+                    chars += 600  # plain callables: runtime derives the schema
+            cached = chars // 4 + 400  # + turn markers / template scaffolding
+            self._tool_overhead_cache = cached
+            log.info("prompt overhead estimate: %d tokens (%d tools)",
+                     cached, len(self._chat_tools))
+        return cached
 
     def _summarize(self, text: str) -> str:
         """Run a throwaway summarizer conversation. Returns a short summary or
@@ -482,15 +641,21 @@ class LiteRTChatService:
                              "content": [{"type": "text", "text": t.assistant_text}]})
         return msgs
 
-    def _open_conversation(self, messages: list[dict]) -> object:
+    def _open_conversation(self, messages: list[dict],
+                           tools: Optional[list] = None) -> object:
         """Open a fresh LiteRT conversation with the given message history.
         Caller is responsible for having already closed any prior conv on
-        this engine (LiteRT-LM allows only one conversation at a time)."""
+        this engine (LiteRT-LM allows only one conversation at a time).
+        `tools` overrides the default full toolbox (tool-router rebinds)."""
+        capture = ToolCallCapture()
         cm = self.engine.create_conversation(
-            messages=messages, tools=DEFAULT_TOOLS,
+            messages=messages,
+            tools=self._chat_tools if tools is None else tools,
+            tool_event_handler=capture,
             enable_constrained_decoding=True)
         conv = cm.__enter__()
         setattr(conv, "_litert_context_manager", cm)
+        setattr(conv, "_tool_capture", capture)
         return conv
 
     def _maybe_compact(self, handle: "ConversationHandle") -> Optional[dict]:
@@ -514,7 +679,12 @@ class LiteRTChatService:
             return None
         budget = int(self.settings.litert_max_num_tokens)
         used = self._conversation_token_count(handle)
-        if used < int(budget * self._COMPACT_RATIO):
+        # `used` now includes the fixed prompt overhead (tool schemas +
+        # template scaffolding), so the ratio test is against REAL engine
+        # occupancy — additionally require enough headroom for the incoming
+        # turn's input + generation before skipping compaction.
+        if (used < int(budget * self._COMPACT_RATIO)
+                and used < budget - self._TURN_HEADROOM_TOKENS):
             return None
 
         log.info("compaction triggered: used=%d / budget=%d (%.0f%%)",
@@ -565,6 +735,7 @@ class LiteRTChatService:
 
         compacted_count = len(old_turns)
         handle.turns = list(recent_turns)
+        handle.summary = summary  # router rebinds rebuild with this prefix
         new_used = self._conversation_token_count(handle)
         log.info("compaction done: %d turns -> summary (%d -> %d tokens, freed %d)",
                  compacted_count, used, new_used, used - new_used)
@@ -580,6 +751,62 @@ class LiteRTChatService:
             "summary_preview": summary[:160] + ("…" if len(summary) > 160 else ""),
         }
 
+    # ---------- per-turn tool router (SkillWeaver-style, NOVA_TOOL_ROUTER) ----------
+
+    def _router_k(self) -> int:
+        """0 = router off. NOVA_TOOL_ROUTER=1 → default top-4; >1 → that k."""
+        try:
+            v = int(os.getenv("NOVA_TOOL_ROUTER", "0"))
+        except ValueError:
+            return 0
+        return 4 if v == 1 else max(v, 0)
+
+    def _maybe_rebind_tools(self, handle: "ConversationHandle",
+                            user_label: str) -> None:
+        """Route the toolbox for this turn and rebuild the conversation if
+        the routed set changed. Tools bind at create_conversation in
+        LiteRT-LM, so a set change costs a full re-prefill of tracked
+        history — same-topic follow-ups keep the KV cache. Voice turns
+        carry no transcript (Gemma-4 ingests audio natively), so they keep
+        whatever set is currently bound. Fail-open: any error rebinds the
+        full toolbox."""
+        k = self._router_k()
+        if (k <= 0 or self.engine is None or len(self._chat_tools) <= k
+                or user_label.startswith("[voice]")):
+            return
+        from eval.tool_router import route_tools
+        def _tname(t):
+            return getattr(t, "_name", getattr(t, "__name__", str(t)))
+        descs = []
+        for t in self._chat_tools:
+            try:
+                desc = str(t.get_tool_description())
+            except Exception:
+                desc = ""
+            descs.append({"function": {"name": _tname(t), "description": desc}})
+        picked = {d["function"]["name"]
+                  for d in route_tools(user_label, descs, k=k)}
+        if picked == handle.bound_tool_names:
+            return
+        routed = [t for t in self._chat_tools if _tname(t) in picked]
+        log.info("tool router rebind: %s", ", ".join(sorted(picked)))
+        old_cm = getattr(handle.conversation, "_litert_context_manager", None)
+        if old_cm is not None:
+            try:
+                old_cm.__exit__(None, None, None)
+            except Exception:
+                log.exception("router rebind: old conv close raised; proceeding")
+        handle.conversation = None
+        msgs = self._build_messages_from_turns(
+            handle.turns, summary_prefix=handle.summary or None)
+        try:
+            handle.conversation = self._open_conversation(msgs, tools=routed)
+            handle.bound_tool_names = frozenset(picked)
+        except Exception:
+            log.exception("router rebind failed; restoring full toolbox")
+            handle.conversation = self._open_conversation(msgs)
+            handle.bound_tool_names = frozenset()
+
     def _run_turn(self, handle: "ConversationHandle", user_label: str, sender,
                   audio_tokens: int = 0) -> Iterator[dict]:
         """Drive one chunk-iterator turn, accumulating the assistant text into
@@ -591,36 +818,49 @@ class LiteRTChatService:
         the engine is quiescent at that point. `audio_tokens` is an
         estimate of the audio embedding cost for this turn — see
         TurnRecord docstring."""
-        # Pre-turn compaction: if the conversation is already over the
-        # threshold, the incoming turn will likely overflow the budget
-        # mid-generation and silently stall. Compact first.
-        pre_event = None
-        try:
-            with nvtx_range("engine.pre_compact"):
-                pre_event = self._maybe_compact(handle)
-        except Exception:
-            log.exception("pre-turn compaction failed; continuing without it")
-
         turn = TurnRecord(user_text=user_label[:2000],
                           audio_tokens=audio_tokens)
-        handle.turns.append(turn)
-
-        # Record user side now (memory is journal-first; mem0 ingestion
-        # happens after assistant text is final).
-        if self._memory is not None:
-            try:
-                self._memory.add_turn("user", turn.user_text)
-            except Exception:
-                log.exception("memory.add_turn(user) failed; non-fatal")
 
         def iterator() -> Iterator[dict]:
-            if pre_event is not None:
-                yield pre_event
+            # ONE lock held from pre-compaction through the full stream
+            # (handle.lock is an RLock; the stream body re-acquires it).
+            # Compaction outside this lock was the "A session already exists"
+            # wedge: a concurrent POST ran _maybe_compact while another turn's
+            # summariser conversation was open on the single-tenant engine.
+            with handle.lock:
+                pre_event = None
+                try:
+                    with nvtx_range("engine.pre_compact"):
+                        pre_event = self._maybe_compact(handle)
+                except Exception:
+                    log.exception("pre-turn compaction failed; continuing without it")
+                if pre_event is not None:
+                    yield pre_event
+                try:
+                    with nvtx_range("engine.tool_router"):
+                        self._maybe_rebind_tools(handle, user_label)
+                except Exception:
+                    log.exception("tool router failed; continuing with bound tools")
+                handle.turns.append(turn)
+                # Record user side now (memory is journal-first; mem0
+                # ingestion happens after assistant text is final).
+                if self._memory is not None:
+                    try:
+                        self._memory.add_turn("user", turn.user_text)
+                    except Exception:
+                        log.exception("memory.add_turn(user) failed; non-fatal")
+                yield from stream()
+
+        def stream() -> Iterator[dict]:
             with handle.lock, nvtx_range("engine.send_and_stream"):
                 first_token_seen = False
+                capture = getattr(handle.conversation, "_tool_capture", None)
+                if capture is not None:
+                    capture.calls = []
+                discarding = False
                 for chunk in sender(handle.conversation):
                     txt = extract_text(chunk)
-                    if txt:
+                    if txt and not discarding:
                         if not first_token_seen:
                             # Mark TTFT — gap between this range's start and
                             # engine.send_and_stream's start = prefill time.
@@ -628,6 +868,26 @@ class LiteRTChatService:
                                 pass
                             first_token_seen = True
                         turn.assistant_text += txt
+                        # Runaway guard: a malformed tool call (unterminated
+                        # string arg) turns the rest of generation into
+                        # "text" and greedy decode degenerates ("I found. I
+                        # found." / "user user user" — seen live, 3k+ tokens
+                        # into TTS). The engine won't stop it, and BREAKING
+                        # out of this iterator mid-stream corrupts the C++
+                        # session (engine got evicted in testing) — so we
+                        # keep DRAINING chunks but stop keeping/yielding
+                        # them, letting the engine finish cleanly.
+                        if _looks_runaway(turn.assistant_text):
+                            log.warning(
+                                "runaway generation cut at %d chars (tail: %r)",
+                                len(turn.assistant_text),
+                                turn.assistant_text[-120:])
+                            turn.assistant_text = (
+                                turn.assistant_text[:_RUNAWAY_KEEP_CHARS]
+                                .rsplit(" ", 1)[0])
+                            discarding = True
+                    if discarding:
+                        continue
                     # Capture tool events: (a) accumulate `tool_chars` so
                     # compaction sees real budget use; (b) append a structured
                     # record to `turn.tool_events` so the diary + in-process
@@ -655,6 +915,19 @@ class LiteRTChatService:
                                 "summary": summary_str[:400],
                             })
                     yield chunk
+            # If the model emitted a tool call but streamed no text, its spoken
+            # confirmation was swallowed by litert_lm's automatic tool-calling
+            # (Nova speaks + calls in one assistant turn). Synthesize + speak a
+            # confirmation so the voice path isn't silent. See app.vehicle_tools.
+            capture = getattr(handle.conversation, "_tool_capture", None)
+            if not turn.assistant_text and capture and capture.calls:
+                call = capture.calls[-1]
+                phrase = synthesize_confirmation(call["name"], call["args"])
+                turn.assistant_text = phrase
+                turn.tool_events.append({"kind": "tool_call",
+                                         "name": call["name"], "args": call["args"]})
+                log.info("synthesized confirmation for %s: %s", call["name"], phrase)
+                yield {"content": [{"type": "text", "text": phrase}]}
             # Memory: persist assistant text to the in-memory journal only.
             # mem0 fact-extraction is DEFERRED to session close — LiteRT-LM
             # only allows one conversation per engine, so we can't spin up a
