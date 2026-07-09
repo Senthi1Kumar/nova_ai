@@ -1,0 +1,159 @@
+"""
+PATCH: nova/backend/pipeline_mp/llm_worker.py
+=============================================
+Extends the existing _needs_tools() regex to detect payment intents
+and call the gate's require_auth() before allowing LLM tool use.
+
+DriveAuth migration: the gate is now pipeline.driveauth.gate.DriveAuthGate
+(drop-in for the old BiometricGate). It returns a Decision enum; this file uses
+`.legacy_decision` for the old pass/step_up/deny comparison so the control flow
+is unchanged.
+
+This handles the case where the DM routes a command to the LLM for
+tool execution (e.g. placing an order via a payment API) rather than
+the pure-voice-command path. It is COMPLEMENTARY to the stt_worker
+intercept — together they cover all paths:
+
+  STT→gate (in stt_worker) : catches payment commands before LLM sees them
+  LLM tool hook (here)      : second layer — even if a payment intent
+                              slips through (e.g. multi-intent utterance
+                              where the DM decomposes and dispatches
+                              individually), the tool call is still gated.
+
+CHANGE 1 — Extend _needs_tools() to classify payment intents
+CHANGE 2 — Add gate check in the tool-use path inside generate_response()
+"""
+
+import re
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CHANGE 1
+# Replace the existing _needs_tools() function (line ~100 in llm_worker.py)
+# ─────────────────────────────────────────────────────────────────────────────
+
+BEFORE_CHANGE_1 = '''def _needs_tools(prompt: str) -> bool:
+    """Return False if the prompt is clearly conversational and should never trigger a tool call."""
+    stripped = prompt.strip()
+    # Short single-word or very short phrases never need search
+    if len(stripped.split()) <= 3 and not any(c in stripped for c in "?"):
+        return False
+    if _CONVERSATIONAL_RE.match(stripped):
+        return False
+    return True'''
+
+AFTER_CHANGE_1 = '''# Payment intent — triggers biometric gate before tool use
+_PAYMENT_INTENT_RE = re.compile(
+    r"\\b(order|buy|purchase|pay|send money|transfer|checkout"
+    r"|coffee|burger|pizza|food|latte|cappuccino"
+    r"|add to cart|top.?up|recharge)\\b",
+    re.IGNORECASE,
+)
+
+
+def _needs_tools(prompt: str) -> bool:
+    """Return False if the prompt is clearly conversational and should never trigger a tool call."""
+    stripped = prompt.strip()
+    # Short single-word or very short phrases never need search
+    if len(stripped.split()) <= 3 and not any(c in stripped for c in "?"):
+        return False
+    if _CONVERSATIONAL_RE.match(stripped):
+        return False
+    return True
+
+
+def _is_payment_intent(prompt: str) -> bool:
+    """True when the utterance looks like a payment / purchase command."""
+    return bool(_PAYMENT_INTENT_RE.search(prompt))'''
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CHANGE 2
+# Location: inside generate_response(), at the point where tools are triggered
+# (~line 760 in llm_worker.py):
+#
+#   if use_local_tools and _needs_tools(prompt):
+#       ...tool execution...
+#
+# Wrap it to gate payment intents.
+# ─────────────────────────────────────────────────────────────────────────────
+
+BEFORE_CHANGE_2 = '''                    if use_local_tools and _needs_tools(prompt):'''
+
+AFTER_CHANGE_2 = '''                    # ── Payment biometric gate (Layer 7 tool-trigger hook) ───
+                    if use_local_tools and _needs_tools(prompt) and _is_payment_intent(prompt):
+                        # Import lazily — gate is instantiated in stt_worker;
+                        # here we re-use the stored template for a re-verify
+                        # (covers multi-intent paths where the gate in stt_worker
+                        # may have passed on a general utterance that the DM then
+                        # decomposed into a payment sub-intent).
+                        try:
+                            import os as _os
+                            # DriveAuthGate: drop-in for BiometricGate, same
+                            # require_auth(tier=...) signature. Returns a Decision
+                            # enum; use .legacy_decision for the old pass/step_up/
+                            # deny strings so this branch stays unchanged in shape.
+                            from pipeline.driveauth.gate import DriveAuthGate
+                            _l3  = _os.path.join(_os.path.dirname(__file__), "..", "nova-l7", "L-3")
+                            _st  = _os.path.join(_os.path.dirname(__file__), "..", "..", "..", "models", "biometric_store")
+                            _gbl = generate_response.__globals__
+                            _gate = _gbl.get("_payment_gate")
+                            if _gate is None:
+                                _gate = DriveAuthGate.load(l3_dir=_l3, store_dir=_st,
+                                                           driver_id=_os.getenv("NOVA_DRIVER_ID", "driver1"))
+                                _gbl["_payment_gate"] = _gate
+                            _auth = _gate.require_auth(tier="payment")
+                            if _auth.legacy_decision != "pass":
+                                ws_out_queue.put({
+                                    "type": "tts_speak",
+                                    "text": (
+                                        "I need to verify your identity before processing "
+                                        "this payment. I've sent a one-time code to your "
+                                        "registered mobile number — please read it out."
+                                        if _auth.legacy_decision == "step_up" else
+                                        "I couldn't verify your identity. Payment cancelled."
+                                    ),
+                                })
+                                ws_out_queue.put({"type": "recording_stopped"})
+                                logger.warning(
+                                    f"Payment blocked by DriveAuth gate: "
+                                    f"decision={_auth.decision.value} trust={_auth.trust_score:.3f} "
+                                    f"risk={_auth.risk_score:.3f} rule={_auth.policy_rule}")
+                                return   # abort LLM generation for this turn
+                        except Exception as _gate_exc:
+                            logger.error(f"Payment gate error (failing open): {_gate_exc}")
+                        # Gate passed (or errored-open) — proceed to tool execution
+
+                    if use_local_tools and _needs_tools(prompt):'''
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Apply script
+# ─────────────────────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    import sys
+    worker_path = sys.argv[1] if len(sys.argv) > 1 else \
+        "nova/backend/pipeline_mp/llm_worker.py"
+
+    with open(worker_path, "r") as f:
+        src = f.read()
+
+    # Also add `import re` if not already present
+    if "import re" not in src:
+        src = "import re\n" + src
+
+    changed = 0
+    for before, after in [
+        (BEFORE_CHANGE_1, AFTER_CHANGE_1),
+        (BEFORE_CHANGE_2, AFTER_CHANGE_2),
+    ]:
+        if before in src:
+            src = src.replace(before, after, 1)
+            changed += 1
+        else:
+            print(f"WARNING: patch target not found:\n{before[:100]}...")
+
+    with open(worker_path, "w") as f:
+        f.write(src)
+
+    print(f"Applied {changed}/2 patches to {worker_path}")

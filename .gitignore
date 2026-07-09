@@ -9,14 +9,33 @@ wheels/
 # Virtual environments
 .venv
 
-# Audio
+# KWS
 nova/backend/kws/refs/*.wav
 
 # Logs
 *.log
+logs/
 
 # Notebooks
 *.ipynb
 
-# Misc
-*.html
+# Env vars
+.env
+
+# Gemini
+.gemini/
+
+# IDE
+.vscode/
+
+# Pretrained models (large binaries)
+pretrained_models/
+nova/backend/pretrained_models/
+
+# Voice reference audio (user-specific, keep SETUP.md only)
+nova/backend/voices/*.wav
+
+# External repos / experiments
+# moonshine/
+# speech-to-speech/
+sparknet/
