@@ -98,6 +98,22 @@ def run_stt_worker(
 
     from stt_config import STT_SETTINGS, STT_VARIANT_REGISTRY
 
+    # ── DriveAuth gate (first layer — intercepts before LLM dispatch) ──────
+    _driver_id = os.getenv("NOVA_DRIVER_ID", "driver1")
+    _gate_enabled = os.getenv("NOVA_BIO_GATE_ENABLED", "1") == "1"
+    bio_gate = None
+    if _gate_enabled:
+        try:
+            from driveauth.gate import DriveAuthGate
+            bio_gate = DriveAuthGate.load(driver_id=_driver_id)
+            logger.info(f"Qwen3 STT worker: DriveAuthGate loaded (driver={_driver_id})")
+        except Exception as exc:
+            logger.error(
+                f"Qwen3 STT worker: DriveAuthGate load failed ({exc}) — "
+                "running WITHOUT payment gating at this layer."
+            )
+            bio_gate = None
+
     # ── Config ────────────────────────────────────────────────────────────────
     device = os.getenv("NOVA_QWEN3_DEVICE", "cuda" if torch.cuda.is_available() else "cpu")
     dtype_name = os.getenv("NOVA_QWEN3_DTYPE", "bfloat16")
@@ -360,12 +376,24 @@ def run_stt_worker(
             "latency": {"stt_ttfb": dt, "stt_rtf": rtf},
         })
         if text:
-            payload: dict = {"type": "text", "text": text}
+            audio_np_f32 = None
             if utter_raw_f32:
-                raw_concat = np.concatenate(utter_raw_f32, dtype=np.float32)
-                payload["audio_data"] = raw_concat.tolist()
-            llm_in_queue.put(payload)
-            ws_out_queue.put({"type": "generation_start"})
+                audio_np_f32 = np.concatenate(utter_raw_f32, dtype=np.float32)
+            if bio_gate is not None:
+                # gate.intercept() dispatches to llm_in_queue and sends
+                # "generation_start" itself on pass/step_up — don't duplicate it.
+                bio_gate.intercept(
+                    transcript=text,
+                    audio_np=audio_np_f32 if audio_np_f32 is not None else np.array([], dtype=np.float32),
+                    ws_out_queue=ws_out_queue,
+                    llm_in_queue=llm_in_queue,
+                )
+            else:
+                payload: dict = {"type": "text", "text": text}
+                if audio_np_f32 is not None:
+                    payload["audio_data"] = audio_np_f32.tolist()
+                llm_in_queue.put(payload)
+                ws_out_queue.put({"type": "generation_start"})
         else:
             ws_out_queue.put({"type": "recording_stopped"})
         last_partial_text = ""

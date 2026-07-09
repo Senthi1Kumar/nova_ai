@@ -63,6 +63,22 @@ def run_stt_worker(
     if pipeline_mp_dir not in sys.path:
         sys.path.insert(0, pipeline_mp_dir)
 
+    # ── DriveAuth gate (first layer — intercepts before LLM dispatch) ──────
+    _driver_id = os.getenv("NOVA_DRIVER_ID", "driver1")
+    _gate_enabled = os.getenv("NOVA_BIO_GATE_ENABLED", "1") == "1"
+    bio_gate = None
+    if _gate_enabled:
+        try:
+            from driveauth.gate import DriveAuthGate
+            bio_gate = DriveAuthGate.load(driver_id=_driver_id)
+            logger.info(f"Kyutai STT worker: DriveAuthGate loaded (driver={_driver_id})")
+        except Exception as exc:
+            logger.error(
+                f"Kyutai STT worker: DriveAuthGate load failed ({exc}) — "
+                "running WITHOUT payment gating at this layer."
+            )
+            bio_gate = None
+
     try:
         import numpy as np
         import torch
@@ -267,6 +283,7 @@ def run_stt_worker(
                 audio_concat = np.concatenate(inf_state["audio_buf"])
                 audio_list = audio_concat.tolist()
         logger.info(f"Kyutai Final [{reason}]: '{transcript}' | lat={latency_s:.2f}s | RTF={rtf:.2f}")
+        import numpy as np  # safe re-import: the earlier import above is conditional
         ws_out_queue.put({
             "type": "transcript",
             "data": transcript,
@@ -276,8 +293,16 @@ def run_stt_worker(
             payload = {"type": "text", "text": transcript}
             if audio_list is not None:
                 payload["audio_data"] = audio_list
-            llm_in_queue.put(payload)
-            ws_out_queue.put({"type": "generation_start"})
+            if bio_gate is not None:
+                bio_gate.intercept(
+                    transcript=transcript,
+                    audio_np=np.array(audio_list, dtype=np.float32) if audio_list is not None else np.array([], dtype=np.float32),
+                    ws_out_queue=ws_out_queue,
+                    llm_in_queue=llm_in_queue,
+                )
+            else:
+                llm_in_queue.put(payload)
+                ws_out_queue.put({"type": "generation_start"})
         else:
             ws_out_queue.put({"type": "recording_stopped"})
 

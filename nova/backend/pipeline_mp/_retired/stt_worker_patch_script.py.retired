@@ -1,0 +1,145 @@
+"""
+PATCH: nova/backend/pipeline_mp/stt_worker.py
+=============================================
+Two surgical changes to intercept stt.finalize() before LLM dispatch.
+
+CHANGE 1 — Add gate import + lazy initialisation (top of run_stt_worker)
+CHANGE 2 — Replace the bare llm_in_queue.put() with gate.intercept()
+
+DriveAuth migration: the gate is now pipeline.driveauth.gate.DriveAuthGate,
+which is a drop-in for the old BiometricGate (identical load/intercept/
+require_auth signatures) but separates Trust from Risk (proposal §4.3) and
+uses OTP step-up with an on-device fallback (§4.3a).
+
+Apply with:
+    cd nova/backend
+    patch -p0 < patches/stt_worker_biometric_gate.patch
+"""
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CHANGE 1
+# Location: run_stt_worker(), after the model initialisation block (~line 40)
+# ─────────────────────────────────────────────────────────────────────────────
+
+BEFORE_CHANGE_1 = '''        logger.info("HF Moonshine STT & VAD initialized and waiting for commands.")
+    except Exception as e:
+        logger.error(f"Failed to load HF Moonshine STT or VAD: {e}")
+        return'''
+
+AFTER_CHANGE_1 = '''        logger.info("HF Moonshine STT & VAD initialized and waiting for commands.")
+    except Exception as e:
+        logger.error(f"Failed to load HF Moonshine STT or VAD: {e}")
+        return
+
+    # ── DriveAuth gate (lazy — only loads if models/biometric_store exists) ──
+    # DriveAuthGate keeps the exact BiometricGate.load()/.intercept() signatures,
+    # so nothing below this line changes. It fixes the §4.3 Trust/Risk conflation
+    # (behaviour/GPS no longer touch Trust) and returns ACCEPT/STEP_UP/REJECT
+    # mapped to the same pass/step_up/deny strings this worker already handles.
+    from pipeline.driveauth.gate import DriveAuthGate  # noqa: E402
+
+    _l3_dir    = os.path.join(os.path.dirname(__file__), "..", "nova-l7", "L-3")
+    _store_dir = os.path.join(os.path.dirname(__file__), "..", "..", "..", "models", "biometric_store")
+    _driver_id = os.getenv("NOVA_DRIVER_ID", "driver1")
+    _gate_enabled = os.getenv("NOVA_BIO_GATE_ENABLED", "1") == "1"
+
+    bio_gate = DriveAuthGate.load(
+        l3_dir    = _l3_dir,
+        store_dir = _store_dir,
+        driver_id = _driver_id,
+        enabled   = _gate_enabled,
+    )
+    logger.info(f"DriveAuthGate loaded (enabled={_gate_enabled}, driver={_driver_id})")'''
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CHANGE 2
+# Location: inside the "stop" message handler, after transcript inference
+# Replaces the 4-line llm dispatch block (~lines 111-117)
+# ─────────────────────────────────────────────────────────────────────────────
+
+BEFORE_CHANGE_2 = '''                            if transcript:
+                                llm_in_queue.put({
+                                    "type": "text",
+                                    "text": transcript,
+                                    "audio_data": audio_np.tolist(),
+                                })
+                                ws_out_queue.put({"type": "generation_start"})
+                            else:
+                                ws_out_queue.put({"type": "recording_stopped"})'''
+
+AFTER_CHANGE_2 = '''                            if transcript:
+                                # ── Biometric gate intercepts here ────────────
+                                # gate.intercept() handles all three paths:
+                                #   "pass"     → dispatches to llm_in_queue internally
+                                #   "step_up"  → sends TTS challenge via ws_out_queue,
+                                #                stores original transcript for re-auth
+                                #   "deny"     → sends TTS rejection + rate-limits
+                                bio_gate.intercept(
+                                    transcript   = transcript,
+                                    audio_np     = audio_np,
+                                    ws_out_queue = ws_out_queue,
+                                    llm_in_queue = llm_in_queue,
+                                )
+                                # NOTE: do NOT put ws_out_queue.put({"type": "generation_start"})
+                                # here — the gate sends it on "pass" and "step_up" as appropriate.
+                            else:
+                                ws_out_queue.put({"type": "recording_stopped"})'''
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CHANGE 3 (optional — expose behavioral feed for vehicle sensor thread)
+# Location: bottom of run_stt_worker(), inside the while loop, after msg routing
+# ─────────────────────────────────────────────────────────────────────────────
+
+BEFORE_CHANGE_3 = '''        elif isinstance(msg, bytes):
+            if session_active:
+                audio_buffer.append(msg)'''
+
+AFTER_CHANGE_3 = '''        elif isinstance(msg, dict) and msg.get("type") == "sensor_update":
+            # Vehicle sensor data for behavioral scoring.
+            # Send from your CAN-bus / seat-sensor thread:
+            #   stt_in_queue.put({"type": "sensor_update", "data": {...}})
+            bio_gate.update_behavioral(msg.get("data", {}))
+
+        elif isinstance(msg, bytes):
+            if session_active:
+                audio_buffer.append(msg)'''
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# The import line needed at the top of stt_worker.py
+# ─────────────────────────────────────────────────────────────────────────────
+
+BEFORE_IMPORTS = '''import multiprocessing as mp'''
+
+AFTER_IMPORTS  = '''import multiprocessing as mp
+import os'''
+
+
+if __name__ == "__main__":
+    """Apply patches directly when run as a script."""
+    import sys
+    worker_path = sys.argv[1] if len(sys.argv) > 1 else \
+        "nova/backend/pipeline_mp/stt_worker.py"
+
+    with open(worker_path, "r") as f:
+        src = f.read()
+
+    changed = 0
+    for before, after in [
+        (BEFORE_IMPORTS,  AFTER_IMPORTS),
+        (BEFORE_CHANGE_1, AFTER_CHANGE_1),
+        (BEFORE_CHANGE_2, AFTER_CHANGE_2),
+        (BEFORE_CHANGE_3, AFTER_CHANGE_3),
+    ]:
+        if before in src:
+            src = src.replace(before, after, 1)
+            changed += 1
+        else:
+            print(f"WARNING: patch target not found:\n{before[:80]}...")
+
+    with open(worker_path, "w") as f:
+        f.write(src)
+
+    print(f"Applied {changed}/4 patches to {worker_path}")

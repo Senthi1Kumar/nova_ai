@@ -54,6 +54,22 @@ def run_stt_worker(
 
     from stt_config import STT_SETTINGS, STT_VARIANT_REGISTRY
 
+    # ── DriveAuth gate (first layer — intercepts before LLM dispatch) ──────
+    _driver_id = os.getenv("NOVA_DRIVER_ID", "driver1")
+    _gate_enabled = os.getenv("NOVA_BIO_GATE_ENABLED", "1") == "1"
+    bio_gate = None
+    if _gate_enabled:
+        try:
+            from driveauth.gate import DriveAuthGate
+            bio_gate = DriveAuthGate.load(driver_id=_driver_id)
+            logger.info(f"Moonshine STT worker: DriveAuthGate loaded (driver={_driver_id})")
+        except Exception as exc:
+            logger.error(
+                f"Moonshine STT worker: DriveAuthGate load failed ({exc}) — "
+                "running WITHOUT payment gating at this layer."
+            )
+            bio_gate = None
+
     # ── Device detection ──────────────────────────────────────────────────────
     has_cuda = torch.cuda.is_available()
     device_label = "CUDA" if has_cuda else "CPU"
@@ -304,12 +320,22 @@ def run_stt_worker(
                 "type": "text",
                 "text": transcript,
             }
+            audio_np_f32 = None
             if event.line.audio_data:
                 llm_payload["audio_data"] = event.line.audio_data
+                audio_np_f32 = np.array(event.line.audio_data, dtype=np.float32)
 
             if transcript:
-                llm_in_queue.put(llm_payload)
-                ws_out_queue.put({"type": "generation_start"})
+                if bio_gate is not None:
+                    bio_gate.intercept(
+                        transcript=transcript,
+                        audio_np=audio_np_f32 if audio_np_f32 is not None else np.array([], dtype=np.float32),
+                        ws_out_queue=ws_out_queue,
+                        llm_in_queue=llm_in_queue,
+                    )
+                else:
+                    llm_in_queue.put(llm_payload)
+                    ws_out_queue.put({"type": "generation_start"})
             else:
                 logger.warning("Empty transcript from STT — sending recording_stopped")
                 ws_out_queue.put({"type": "recording_stopped"})
@@ -437,8 +463,16 @@ def run_stt_worker(
                     )
                     if audio_concat is not None:
                         payload["audio_data"] = audio_concat
-                    llm_in_queue.put(payload)
-                    ws_out_queue.put({"type": "generation_start"})
+                    if bio_gate is not None:
+                        bio_gate.intercept(
+                            transcript=flushed,
+                            audio_np=np.array(audio_concat, dtype=np.float32) if audio_concat is not None else np.array([], dtype=np.float32),
+                            ws_out_queue=ws_out_queue,
+                            llm_in_queue=llm_in_queue,
+                        )
+                    else:
+                        llm_in_queue.put(payload)
+                        ws_out_queue.put({"type": "generation_start"})
                     _held["lines"].clear()
                     _held["audio"].clear()
                     _held["pending_since"] = 0.0
